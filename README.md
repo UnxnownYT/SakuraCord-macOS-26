@@ -4,9 +4,9 @@
   <p>A fast, native Discord client shaped around SwiftUI, macOS, and the way desktop chat should feel.</p>
 
   <p>
-    <a href="https://github.com/SakuraCordApp/SakuraCord/releases/latest"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/release/SakuraCordApp/SakuraCord.svg?label=Release&amp;mode=dark&amp;size=sm"><img alt="Latest release" src="https://shieldcn.dev/github/release/SakuraCordApp/SakuraCord.svg?label=Release&amp;mode=light&amp;size=sm"></picture></a>
+    <a href="https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/latest"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/release/SakuraCordApp/SakuraCord.svg?label=Release&amp;mode=dark&amp;size=sm"><img alt="Latest release (The OS 26 Fork)" src="https://shieldcn.dev/github/release/SakuraCordApp/SakuraCord.svg?label=Release&amp;mode=light&amp;size=sm"></picture></a>
     <a href="https://discord.gg/hWNwFXkUTP"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/discord/online-members/hWNwFXkUTP.svg?variant=branded&amp;mode=dark&amp;size=sm"><img alt="Discord online members" src="https://shieldcn.dev/discord/online-members/hWNwFXkUTP.svg?variant=branded&amp;mode=light&amp;size=sm"></picture></a>
-    <a href="https://roadmap.sakuracord.app"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/Roadmap-D9578B.svg?logo=ri%3AFaMap&amp;logoColor=white&amp;mode=dark&amp;size=sm"><img alt="Roadmap" src="https://shieldcn.dev/badge/Roadmap-D9578B.svg?logo=ri%3AFaMap&amp;logoColor=white&amp;mode=light&amp;size=sm"></picture></a>
+    <a href="https://roadmap.sakuracord.app"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/Roadmap-D9578B.svg?logo=ri%3AFaMap&amp;logoColor=white&amp;mode=dark&amp;size=sm"><img alt="The SakuraCord Roadmap" src="https://shieldcn.dev/badge/Roadmap-D9578B.svg?logo=ri%3AFaMap&amp;logoColor=white&amp;mode=light&amp;size=sm"></picture></a>
   </p>
 
   <p>
@@ -14,7 +14,7 @@
   </p>
 
   <p>
-    <a href="https://github.com/SakuraCordApp/SakuraCord/releases/latest">Download DMG</a>
+    <a href="https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/latest">Download DMG</a>
     ·
     <a href="#build-from-source">Build from source</a>
     ·
@@ -26,9 +26,9 @@
 
 ## A Discord client that belongs on macOS
 
-SakuraCord preserves the visual language and familiar rhythm of Discord, then
-reimagines the experience through Liquid Glass and native macOS design instead
-of wrapping the web app in an Electron runtime.
+The SakuraCord for macOS 26 fork preserves the visual language and familiar 
+rhythm of Discord, then reimagines the experience through Liquid Glass and 
+native macOS design instead of wrapping the web app in an Electron runtime.
 
 The result keeps Discord's familiarity while looking and behaving like a native
 Mac app.
@@ -60,25 +60,19 @@ Mac app.
   </tr>
 </table>
 
-## Download (ONLY FOR OS 27 VERSION)
+## Download
 
-Download the [latest SakuraCord DMG](https://github.com/SakuraCordApp/SakuraCord/releases/latest)
-for macOS 27 or newer, open it, and move SakuraCord into Applications.
-
-On Apple Silicon, install with [Homebrew](https://brew.sh):
-
-```sh
-brew install --cask SakuraCordApp/tap/sakuracord
-```
-
-Run `brew update` followed by `brew upgrade --cask sakuracord` to update.
+Download the [latest SakuraCord DMG](https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/latest)
+for macOS 26 or newer, open it, and move SakuraCord into Applications.
 
 Current releases are ad-hoc signed rather than notarized, so macOS may require
 approval from **System Settings → Privacy & Security** on first launch.
 
 SakuraCord is an independent project and is not affiliated with Discord.
 Discord does not provide a supported third-party platform for normal-account
-clients, so compatibility can change as Discord evolves.
+clients, so compatibility can change as Discord evolves. Please note that
+using an external client from discord is breaking ToS and can get you banned,
+though it is very rare for this occurance. **Use at your own risk.**
 
 ## Build from source
 
@@ -96,9 +90,9 @@ git config --local --get core.hooksPath
 ```
 
 The hooks command must print `.githooks`. The offline demo does not contact
-Discord and is the safest way to explore the app from source. Developers can
-find authenticated launch modes, focused fixtures, validation commands, and
-local credential guidance in the [development guide](docs/DEVELOPMENT.md).
+Discord and is the most safest way to explore the app from source. Developers 
+can find authenticated launch modes, focused fixtures, validation commands, 
+and local credential guidance in the [development guide](docs/DEVELOPMENT.md).
 
 ## Contributing and support (Official SakuraCord)
 
@@ -129,18 +123,7 @@ SwiftPM manifests are the build source of truth;
 [architecture guide](docs/ARCHITECTURE.md) or
 [protocol baseline](docs/PROTOCOL_BASELINE.md) for deeper work.
 
-## Sponsors (Official SakuraCord)
-
-Thank you to the sponsors supporting SakuraCord's development.
-
-<p align="center">
-  <a href="https://github.com/charlie-hotel">
-    <img src="Brand/Sponsors/charlie-hotel.svg" width="80" height="80" alt="charlie-hotel's avatar"><br>
-    <strong>charlie-hotel</strong>
-  </a>
-</p>
-
-## Follow along (Official SakuraCord)
+## Follow along with the Official SakuraCord
 
 <table>
   <tr>
@@ -148,7 +131,7 @@ Thank you to the sponsors supporting SakuraCord's development.
       <h3>Discord</h3>
       Talk with the community, share feedback, and follow day-to-day project
       conversation.<br><br>
-      <a href="https://discord.gg/hWNwFXkUTP"><strong>Join the server →</strong></a>
+      <a href="https://discord.gg/hWNwFXkUTP"><strong>Join their server →</strong></a>
     </td>
     <td align="center" width="33%">
       <h3>Roadmap</h3>
@@ -165,5 +148,5 @@ Thank you to the sponsors supporting SakuraCord's development.
 </table>
 
 <div align="center">
-  <sub>Made for macOS with Swift, SwiftUI, and a little sakura pink.</sub>
+  <sub>Made for macOS with Swift, SwiftUI, and a little sakura pink. (This is a forked version for macOS 26.4+</sub>
 </div>
