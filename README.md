@@ -62,7 +62,7 @@ Mac app.
   </tr>
 </table>
 
-## Download
+## Download (ONLY FOR OS 27 VERSION)
 
 Download the [latest SakuraCord DMG](https://github.com/SakuraCordApp/SakuraCord/releases/latest)
 for macOS 27 or newer, open it, and move SakuraCord into Applications.
@@ -84,13 +84,13 @@ clients, so compatibility can change as Discord evolves.
 
 ## Build from source
 
-Building SakuraCord requires macOS 27, Xcode 27 with Swift 6.4 and its Metal
+Building SakuraCord requires macOS 26.5, Xcode 26.6 with Swift 6.3.3 and its Metal
 Toolchain, and Git. Install the shader compiler if needed with
 `xcodebuild -downloadComponent MetalToolchain`.
 
 ```sh
-git clone https://github.com/SakuraCordApp/SakuraCord.git
-cd SakuraCord
+git clone https://github.com/UnxnownYT/SakuraCord-macOS-26.git
+cd SakuraCord-macOS-26
 ./script/install_git_hooks.sh
 git config --local --get core.hooksPath
 ./script/setup_local_signing_identity.sh
@@ -102,7 +102,7 @@ Discord and is the safest way to explore the app from source. Developers can
 find authenticated launch modes, focused fixtures, validation commands, and
 local credential guidance in the [development guide](docs/DEVELOPMENT.md).
 
-## Contributing and support
+## Contributing and support (Official SakuraCord)
 
 Start with the [documentation task index](docs/README.md) to find the owner and
 verification for a change. Development pull requests target `nightly`; install
@@ -131,7 +131,7 @@ SwiftPM manifests are the build source of truth;
 [architecture guide](docs/ARCHITECTURE.md) or
 [protocol baseline](docs/PROTOCOL_BASELINE.md) for deeper work.
 
-## Sponsors
+## Sponsors (Official SakuraCord)
 
 Thank you to the sponsors supporting SakuraCord's development.
 
@@ -142,7 +142,7 @@ Thank you to the sponsors supporting SakuraCord's development.
   </a>
 </p>
 
-## Follow along
+## Follow along (Official SakuraCord)
 
 <table>
   <tr>
