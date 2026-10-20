@@ -26,9 +26,15 @@ let package = Package(
         )
     ],
     targets: [
+        .target(
+            name: "ResourceBundleRedirect",
+            path: "Sources/ResourceBundleRedirect",
+            cSettings: [.unsafeFlags(["-fno-objc-arc"])]
+        ),
         .executableTarget(
             name: "SakuraCord",
             dependencies: [
+                "ResourceBundleRedirect",
                 "SakuraCordModels", "DiscordProtocol", "SakuraCordPersistence",
                 "MessageRendering", "MediaPipeline", "SakuraCordPluginSDK",
                 .product(name: "Lottie", package: "lottie-ios"),
