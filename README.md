@@ -14,7 +14,7 @@
   </p>
 
   <p>
-    <a href="https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/latest">Download DMG</a>
+    <a href="https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/latest">Download the Latest DMG</a>
     ·
     <a href="#build-from-source">Build from source</a>
     ·
@@ -63,7 +63,7 @@ Mac app.
 ## Download
 
 Download the [latest SakuraCord DMG](https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/latest)
-for macOS 26 or newer, open it, and move SakuraCord into Applications.
+for macOS 26.4 or newer, open it, and move SakuraCord into Applications.
 
 Current releases are ad-hoc signed rather than notarized, so macOS may require
 approval from **System Settings → Privacy & Security** on first launch.
@@ -76,11 +76,12 @@ though it is very rare for this occurance. **Use at your own risk.**
 
 ## Build from source
 
-Building SakuraCord requires macOS 26.5, Xcode 26.6 with Swift 6.3.3 and its Metal
-Toolchain, and Git. Install the shader compiler if needed with
+Building SakuraCord requires macOS 26.4+, Xcode 26.6+ with Swift 6.3.3+ and its Metal
+Toolchain, and Git. Install the shader compiler if you haven't already with
 `xcodebuild -downloadComponent MetalToolchain`.
 
-```sh
+sh
+```
 git clone https://github.com/UnxnownYT/SakuraCord-macOS-26.git
 cd SakuraCord-macOS-26
 ./script/install_git_hooks.sh
@@ -94,7 +95,7 @@ Discord and is the most safest way to explore the app from source. Developers
 can find authenticated launch modes, focused fixtures, validation commands, 
 and local credential guidance in the [development guide](docs/DEVELOPMENT.md).
 
-## Contributing and support (Official SakuraCord)
+## Contributing and support
 
 Start with the [documentation task index](docs/README.md) to find the owner and
 verification for a change. Development pull requests target `nightly`; install
@@ -103,8 +104,8 @@ the repository hooks before committing or pushing.
 For a bug report, include reproduction steps, expected and actual behaviour, and
 the app version/release track. The [support recipe](docs/DEVELOPMENT.md#report-a-problem)
 explains how to collect a support summary and sanitized diagnostics. Use the
-[issue tracker](https://github.com/SakuraCordApp/SakuraCord/issues) or the
-[Discord community](https://discord.gg/hWNwFXkUTP).
+[issue tracker](https://github.com/UnxnownYT/SakuraCord-macOS-26/issues) or the
+[Official Sakuracord Discord community](https://discord.gg/hWNwFXkUTP).
 
 ## Repository guide
 
@@ -148,5 +149,5 @@ SwiftPM manifests are the build source of truth;
 </table>
 
 <div align="center">
-  <sub>Made for macOS with Swift, SwiftUI, and a little sakura pink. (This is a forked version for macOS 26.4+</sub>
+  <sub>Made for macOS with Swift, SwiftUI, and a little sakura pink. (a forked version for macOS 26.4 and above)</sub>
 </div>
