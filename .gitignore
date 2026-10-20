@@ -25,3 +25,4 @@ Package.resolved
 !App/Package.resolved
 __pycache__/
 *.pyc
+build.log
