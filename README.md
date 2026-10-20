@@ -76,12 +76,12 @@ banned, though it is very rare for this occurance. **Use at your own risk.**
 
 ## Build from source
 
-Building SakuraCord requires at least macOS 26.4+, Xcode 26.6+ with Swift 6.3.3+ and its Metal
-Toolchain, and Git. Install the shader compiler if you haven't already with
+Building this SakuraCord fork requires at least macOS 26.4+, Xcode 
+26.6+ with Swift 6.3.3+ and its Metal Toolchain, and Git. Install the shader
+compiler if you haven't already with:
 `xcodebuild -downloadComponent MetalToolchain`.
 
-sh
-```
+```sh
 git clone https://github.com/UnxnownYT/SakuraCord-macOS-26.git
 cd SakuraCord-macOS-26
 ./script/install_git_hooks.sh
@@ -130,19 +130,19 @@ SwiftPM manifests are the build source of truth;
   <tr>
     <td align="center" width="33%">
       <h3>Discord</h3>
-      Talk with the community, share feedback, and follow day-to-day project
+      Talk with the official community, share feedback, and follow day-to-day project
       conversation.<br><br>
-      <a href="https://discord.gg/hWNwFXkUTP"><strong>Join their server →</strong></a>
+      <a href="https://discord.gg/hWNwFXkUTP"><strong>Join the Offical SakuraCord server →</strong></a>
     </td>
     <td align="center" width="33%">
       <h3>Roadmap</h3>
-      Browse planned work, active development, completed features, and community
+      Browse the official SakuraCord's planned work, active development, completed features, and community
       requests.<br><br>
       <a href="https://roadmap.sakuracord.app"><strong>Explore the roadmap →</strong></a>
     </td>
     <td align="center" width="33%">
       <h3>Releases</h3>
-      Read release notes and download the newest packaged build for macOS.<br><br>
+      Read SakuraCord's release notes and download the newest packaged build for macOS 27.<br><br>
       <a href="https://github.com/SakuraCordApp/SakuraCord/releases/latest"><strong>Get the latest build →</strong></a>
     </td>
   </tr>
