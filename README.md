@@ -62,7 +62,7 @@ Mac app.
 
 ## Download
 
-Download the [latest SakuraCord DMG](https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/latest)
+Download the [latest SakuraCord Forked DMG](https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/latest)
 for macOS 26.4 or newer, open it, and move SakuraCord into Applications.
 
 Current releases are ad-hoc signed rather than notarized, so macOS may require
