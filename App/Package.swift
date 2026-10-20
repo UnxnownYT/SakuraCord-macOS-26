@@ -1,14 +1,14 @@
-// swift-tools-version: 6.4
+// swift-tools-version: 6.3
 import PackageDescription
 import Foundation
 
 let sparkleDependency: Package.Dependency = ProcessInfo.processInfo.environment["SAKURACORD_SPARKLE_PACKAGE_PATH"]
     .map { .package(path: $0) }
-    ?? .package(url: "https://github.com/SakuraCordApp/Sparkle", exact: "2.10.0-sakuracord.1")
+    ?? .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.9.6")
 
 let package = Package(
     name: "SakuraCordApp",
-    platforms: [.macOS(.v27)],
+    platforms: [.macOS("26.4")],
     products: [
         .executable(name: "SakuraCord", targets: ["SakuraCordLauncher"]),
         .executable(name: "SakuraCordPluginHost", targets: ["SakuraCordPluginHost"])
@@ -29,8 +29,14 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "ResourceBundleRedirect",
+            path: "Sources/ResourceBundleRedirect",
+            cSettings: [.unsafeFlags(["-fno-objc-arc"])]
+        ),
+        .target(
             name: "SakuraCord",
             dependencies: [
+                "ResourceBundleRedirect",
                 "SakuraCordModels", "DiscordProtocol", "SakuraCordPersistence",
                 "MessageRendering", "MediaPipeline", "SakuraCordPluginSDK",
                 .product(name: "Lottie", package: "lottie-ios"),

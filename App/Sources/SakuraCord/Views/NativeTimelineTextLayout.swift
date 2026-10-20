@@ -737,7 +737,7 @@ enum NativeTimelineEmbedLayout {
             let naturalTopWidth = naturalTextWidth + thumbnailAllowance
             let mainMedia = self.mainMedia
             let naturalMediaSize = mainMedia.map {
-                mediaSize(
+                self.mediaSize(
                     $0,
                     maximumWidth: maximumContentWidth,
                     maximumHeight: InterfaceScale.metric(350)

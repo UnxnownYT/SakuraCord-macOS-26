@@ -4,7 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "DaveKit",
-    platforms: [.macOS("27.0")],
+    platforms: [.macOS(.v26)],
     products: [
         .library(
             name: "DaveKit",

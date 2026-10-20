@@ -79,8 +79,11 @@ private struct ComposerIconEditor: View {
                         ComposerIconView(icon: icon, appearance: appearance)
                             .drawingGroup()
                     }
+#if compiler(>=6.4)
                     .reorderable()
+#endif
                 }
+#if compiler(>=6.4)
                 .reorderContainer(for: ComposerIcon.self) { difference in
                     let before: ComposerIcon?
                     switch difference.destination.position {
@@ -89,6 +92,7 @@ private struct ComposerIconEditor: View {
                     }
                     layout.move(difference.sources, before: before)
                 }
+#endif
                 .frame(height: ChatChromeMetrics.composerControlHeight)
             },
             send: {
