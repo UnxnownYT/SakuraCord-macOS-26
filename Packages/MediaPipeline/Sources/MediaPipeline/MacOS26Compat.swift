@@ -39,3 +39,12 @@ extension SCContentSharingPicker {
     // The macOS 26 picker has no availability flag; it's always present.
     var isAvailable: Bool { true }
 }
+
+#if !compiler(>=6.4)
+extension AVAudioPlayerNode {
+    func playAudio(at when: AVAudioTime?) throws {
+        guard let engine, engine.isRunning else { throw MacOS26CompatError.engineNotRunning }
+        play(at: when)
+    }
+}
+#endif
