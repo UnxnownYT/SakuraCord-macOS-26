@@ -68,15 +68,15 @@ for macOS 26.4 or newer, open it, and move SakuraCord into Applications.
 Current releases are ad-hoc signed rather than notarized, so macOS may require
 approval from **System Settings → Privacy & Security** on first launch.
 
-SakuraCord is an independent project and is not affiliated with Discord.
-Discord does not provide a supported third-party platform for normal-account
-clients, so compatibility can change as Discord evolves. Please note that
-using an external client from discord is breaking ToS and can get you banned,
-though it is very rare for this occurance. **Use at your own risk.**
+This current SakuraCord fork is an independent project and is not affiliated 
+with Discord. Discord does not provide a supported third-party platform for 
+normal-account clients, so compatibility can change as Discord evolves. Please 
+note that using an external client from discord is breaking ToS and can get you 
+banned, though it is very rare for this occurance. **Use at your own risk.**
 
 ## Build from source
 
-Building SakuraCord requires macOS 26.4+, Xcode 26.6+ with Swift 6.3.3+ and its Metal
+Building SakuraCord requires at least macOS 26.4+, Xcode 26.6+ with Swift 6.3.3+ and its Metal
 Toolchain, and Git. Install the shader compiler if you haven't already with
 `xcodebuild -downloadComponent MetalToolchain`.
 
