@@ -6,6 +6,13 @@ let sparkleDependency: Package.Dependency = ProcessInfo.processInfo.environment[
     .map { .package(path: $0) }
     ?? .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.9.6")
 
+// Opt-in developer tooling: `SAKURACORD_MOTION_BENCHMARK=1` compiles the side
+// chat motion benchmark into the app and the mock provider's fixture for it.
+// Normal Debug and Release builds compile none of it.
+let motionBenchmarkSettings: [SwiftSetting] =
+    ProcessInfo.processInfo.environment["SAKURACORD_MOTION_BENCHMARK"] == "1"
+    ? [.define("SAKURACORD_MOTION_BENCHMARK")] : []
+
 let package = Package(
     name: "SakuraCordApp",
     platforms: [.macOS("26.4")],
@@ -48,7 +55,7 @@ let package = Package(
                 .enableUpcomingFeature("StrictConcurrency"),
                 .defaultIsolation(MainActor.self),
                 .interoperabilityMode(.Cxx)
-            ]
+            ] + motionBenchmarkSettings
         ),
         .executableTarget(
             name: "SakuraCordLauncher",
