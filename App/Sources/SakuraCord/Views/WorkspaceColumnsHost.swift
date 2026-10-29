@@ -676,7 +676,7 @@ final class WorkspaceColumnsView: NSView {
     private func publishGeometry(at time: CFTimeInterval) {
         guard window != nil else { return }
         // Where the conversation rests: its items do not recede with it.
-        let conversationFrame = conversation.map { _ in convert(conversationFrame, to: nil) }
+        let conversationFrame = conversation.map { _ in convert(self.conversationFrame, to: nil) }
         let widening = widening?.value(at: time) ?? 1
         WorkspaceColumnsGeometry.shared.update(
             conversation: conversationFrame.map { $0.minX ... $0.maxX },
