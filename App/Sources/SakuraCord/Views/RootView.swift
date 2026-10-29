@@ -415,6 +415,7 @@ private struct ChatRootView: View {
     var body: some View {
         @Bindable var model = model
         workspace
+        .task { RichPresenceServer.shared.attach(model) }
         .onGeometryChange(for: CGRect.self) { proxy in
             proxy.frame(in: .global)
         } action: { frame in

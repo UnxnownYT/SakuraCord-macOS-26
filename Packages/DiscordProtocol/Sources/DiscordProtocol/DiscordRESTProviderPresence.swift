@@ -1,3 +1,4 @@
+import os
 import Foundation
 import SakuraCordModels
 
@@ -71,7 +72,9 @@ extension DiscordRESTProvider {
     func sendPresenceIfChanged() async {
         deferredPresenceTask?.cancel()
         deferredPresenceTask = nil
-        guard gatewayReady, presenceStatus != lastSentPresenceStatus else { return }
+        guard gatewayReady,
+              presenceStatus != lastSentPresenceStatus || richPresenceActivity != lastSentRichPresenceActivity
+        else { return }
         let now = Date.now
         presenceSendWindowEnds.removeAll { $0 <= now }
         let budgetReopens = presenceSendWindowEnds.count >= 5 ? presenceSendWindowEnds.first ?? now : now
@@ -99,16 +102,21 @@ extension DiscordRESTProvider {
 
     func sendPresence() async throws {
         let status = presenceStatus
+        let activity = richPresenceActivity
+        let activities: [[String: Any]] = activity.map { [$0.gatewayPayload] } ?? []
+        Logger(subsystem: "dev.sakuracord.SakuraCord", category: "RichPresence").notice("Gateway presence: \(String(describing: activities), privacy: .public)")
         presenceSendWindowEnds.append(Date.now.addingTimeInterval(20))
         lastSentPresenceStatus = status
+        lastSentRichPresenceActivity = activity
         do {
             try await sendGateway([
                 "op": 3,
-                "d": ["since": 0, "activities": [], "status": status.rawValue, "afk": false]
+                "d": ["since": 0, "activities": activities, "status": status.rawValue, "afk": false]
                     as [String: Any],
             ])
         } catch {
             if lastSentPresenceStatus == status { lastSentPresenceStatus = nil }
+            lastSentRichPresenceActivity = nil
             throw error
         }
     }

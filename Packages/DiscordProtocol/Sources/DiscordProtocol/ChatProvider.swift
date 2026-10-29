@@ -124,6 +124,7 @@ public protocol ChatProvider: Sendable {
     func sendSoundboardSound(_ sound: SoundboardSound, in channelID: ChannelID) async throws
     func currentStatus() async -> PresenceStatus
     func updateStatus(_ status: PresenceStatus) async throws
+    func setRichPresenceActivity(_ activity: RichPresenceActivity?) async
     func updateProfileCustomStatus(_ status: ProfileCustomStatus?) async throws -> ProfileCustomStatus?
     func messages(in channelID: ChannelID, before: MessageID?, limit: Int) async throws -> MessagePage
     func messages(
