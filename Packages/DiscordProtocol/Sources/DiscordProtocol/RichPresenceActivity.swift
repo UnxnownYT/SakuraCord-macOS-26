@@ -92,7 +92,6 @@ public extension DiscordRESTProvider {
     func setRichPresenceActivity(_ activity: RichPresenceActivity?) async {
         guard richPresenceActivity != activity else { return }
         richPresenceActivity = activity
-        Logger(subsystem: "dev.sakuracord.SakuraCord", category: "RichPresence").notice("Provider received activity, gateway ready: \(self.gatewayReady, privacy: .public)")
         await sendPresenceIfChanged()
     }
 }

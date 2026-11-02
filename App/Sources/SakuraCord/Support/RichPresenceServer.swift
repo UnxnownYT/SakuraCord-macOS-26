@@ -125,6 +125,7 @@ nonisolated final class RichPresenceServer: @unchecked Sendable {
         case 0: // Handshake
             guard let clientID = json["client_id"] as? String ?? (json["client_id"] as? NSNumber)?.stringValue
             else { closeClient(fd); return }
+            guard !clientID.isEmpty, clientID.allSatisfy(\.isNumber) else { closeClient(fd); return }
             clients[fd]?.clientID = clientID
             let user: [String: Any] = [
                 "id": "0", "username": "SakuraCord", "discriminator": "0",
@@ -281,7 +282,6 @@ nonisolated final class RichPresenceServer: @unchecked Sendable {
     private func publish(_ activity: RichPresenceActivity?) {
         guard activity != lastPublished else { return }
         lastPublished = activity
-        logger.notice("Rich Presence activity: \(activity?.name ?? "none", privacy: .public) / \(activity?.details ?? "", privacy: .public)")
         sink?(activity)
     }
 

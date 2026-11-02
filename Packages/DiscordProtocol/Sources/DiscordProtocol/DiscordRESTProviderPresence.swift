@@ -104,7 +104,6 @@ extension DiscordRESTProvider {
         let status = presenceStatus
         let activity = richPresenceActivity
         let activities: [[String: Any]] = activity.map { [$0.gatewayPayload] } ?? []
-        Logger(subsystem: "dev.sakuracord.SakuraCord", category: "RichPresence").notice("Gateway presence: \(String(describing: activities), privacy: .public)")
         presenceSendWindowEnds.append(Date.now.addingTimeInterval(20))
         lastSentPresenceStatus = status
         lastSentRichPresenceActivity = activity
