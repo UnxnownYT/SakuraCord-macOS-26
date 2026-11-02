@@ -1433,7 +1433,7 @@ private extension ComposerView {
         Color.clear
             .onChange(of: commandComposer.mentionedCommand, startMentionedCommand)
             .onChange(of: commandComposer.isLoading, startMentionedCommand)
-            .alert("Clear message?", item: $commandAwaitingClear) { command in
+            .alert("Clear message?", isPresented: Binding(get: { commandAwaitingClear != nil }, set: { if !$0 { commandAwaitingClear = nil } }), presenting: commandAwaitingClear) { command in
                 Button("Clear", role: .destructive) {
                     if isVoiceMessageActive { voiceMessage.discard(playback: model.voiceMessagePlayback) }
                     activateCommand(command)

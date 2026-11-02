@@ -250,7 +250,7 @@ private struct MediaViewerAudioVolume: View {
 
     var body: some View {
         Slider(
-            value: Binding(get: { playback.audioFileVolume }, set: playback.setAudioFileVolume),
+            value: Binding(get: { playback.audioFileVolume }, set: { playback.setAudioFileVolume($0) }),
             in: 0 ... 1
         ) {
             Text("Volume")
