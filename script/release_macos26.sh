@@ -64,6 +64,7 @@ else
   [[ -f "dist/$DMG_NAME" ]] || { echo "The DMG was not created; see the errors above." >&2; exit 1; }
 fi
 
+rm -f "dist/$FEED"
 echo "==> Signing the $CHANNEL feed"
 SPARKLE_ED_PRIVATE_KEY="$(cat "$KEY_FILE")" \
   "$ROOT_DIR/script/generate_appcast.sh" "dist/$DMG_NAME" "dist/$FEED" "$NOTES"
