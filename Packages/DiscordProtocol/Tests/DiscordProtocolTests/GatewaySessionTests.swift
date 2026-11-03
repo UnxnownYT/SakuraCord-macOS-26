@@ -1,0 +1,909 @@
+@testable import DiscordProtocol
+import Foundation
+import Testing
+
+@Test func `hello identifies once and repeated connect does not duplicate socket or heartbeat`() async throws {
+    let socket = FakeGatewaySocket()
+    let transport = FakeGatewayTransport(sockets: [socket])
+    let clock = ManualGatewayClock()
+    let session = makeGatewaySession(transport: transport, clock: clock, randomValues: [0.25])
+
+    await session.connect()
+    await session.connect()
+    #expect(await eventually { await transport.connectionCount == 1 })
+
+    await socket.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(40000)])))
+    #expect(await eventually { await socket.sentCount == 1 })
+    #expect(try await sentEnvelope(socket, at: 0).op == 2)
+    #expect(await eventually { await clock.activeWaitCount == 1 })
+    #expect(await clock.recordedDurations.first.map(seconds) == 10)
+
+    await socket.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(40000)])))
+    await Task.yield()
+    #expect(await socket.sentCount == 1)
+    #expect(await clock.activeWaitCount == 1)
+    await session.stop()
+}
+
+@Test func `ready captures session and next hello resumes with latest sequence`() async throws {
+    let first = FakeGatewaySocket()
+    let second = FakeGatewaySocket()
+    let transport = FakeGatewayTransport(sockets: [first, second])
+    let clock = ManualGatewayClock()
+    let session = makeGatewaySession(transport: transport, clock: clock, randomValues: [0, 0.5, 0])
+
+    await session.connect()
+    #expect(await eventually { await transport.connectionCount == 1 })
+    await first.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(30000)])))
+    await first.push(envelope(
+        op: 0,
+        data: .object([
+            "session_id": .string("session-one"),
+            "resume_gateway_url": .string("wss://resume.discord.gg")
+        ]),
+        sequence: 42,
+        eventName: "READY"
+    ))
+    #expect(await eventually { await session.snapshot().state == .ready })
+    let ready = await session.snapshot()
+    #expect(ready.sessionID == "session-one")
+    #expect(ready.resumeGatewayURL == "wss://resume.discord.gg")
+    #expect(ready.sequence == 42)
+
+    await first.terminate(code: nil)
+    #expect(await eventually { await session.snapshot().state == .backingOff(attempt: 1) })
+    // Backoff state precedes the asynchronous jitter lookup and clock registration.
+    let backoffReady = await eventually { await clock.activeDurations.contains(where: { seconds($0) == 1 }) }
+    if !backoffReady {
+        await session.stop()
+        await clock.advanceAll()
+    }
+    try #require(backoffReady)
+    await clock.advance(durationMatching: 1)
+    #expect(await eventually { await transport.connectionCount == 2 })
+    let secondURL = await transport.connectedURLs.last
+    #expect(secondURL?.host == "resume.discord.gg")
+    #expect(try URLComponents(url: #require(secondURL), resolvingAgainstBaseURL: false)?.queryItems?.contains(
+        URLQueryItem(name: "compress", value: "zlib-stream")
+    ) == true)
+
+    await second.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(30000)])))
+    #expect(await eventually { await second.sentCount == 1 })
+    let resume = try await sentEnvelope(second, at: 0)
+    #expect(resume.op == 6)
+    #expect(resume.data == .object([
+        "token": .string("test-token"),
+        "session_id": .string("session-one"),
+        "seq": .number(42)
+    ]))
+
+    await second.push(envelope(op: 0, data: .object([:]), sequence: 43, eventName: "RESUMED"))
+    #expect(await eventually { await session.snapshot().state == .ready })
+    #expect(await session.snapshot().reconnectAttempts == 0)
+    await session.stop()
+}
+
+@Test func `heartbeat uses latest sequence ACK and missed ACK recovers exactly once`() async throws {
+    let first = FakeGatewaySocket()
+    let second = FakeGatewaySocket()
+    let transport = FakeGatewayTransport(sockets: [first, second])
+    let clock = ManualGatewayClock()
+    let session = makeGatewaySession(transport: transport, clock: clock, randomValues: [0.5, 0.5, 0])
+
+    await session.connect()
+    #expect(await eventually { await transport.connectionCount == 1 })
+    await first.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(20000)])))
+    await first.push(envelope(op: 0, data: .object(["value": .bool(true)]), sequence: 99, eventName: "TEST"))
+    #expect(await eventually { await clock.activeWaitCount == 1 })
+    #expect(await clock.recordedDurations.first.map(seconds) == 10)
+
+    await clock.advanceNext()
+    #expect(await eventually { await first.sentCount == 2 })
+    let heartbeat = try await sentEnvelope(first, at: 1)
+    #expect(heartbeat.op == 1)
+    #expect(heartbeat.data == .number(99))
+    #expect(await session.snapshot().awaitingHeartbeatACK)
+
+    await first.push(envelope(op: 11, data: .null))
+    #expect(await eventually { await !(session.snapshot().awaitingHeartbeatACK) })
+    #expect(await eventually { await clock.activeWaitCount == 1 })
+    await clock.advanceNext()
+    #expect(await eventually { await first.sentCount == 3 })
+
+    #expect(await eventually { await clock.activeWaitCount == 1 })
+    await clock.advanceNext()
+    #expect(await eventually { await first.closeCodes.count == 1 })
+    #expect(await first.closeCodes == [4000])
+    #expect(await eventually { await session.snapshot().state == .backingOff(attempt: 1) })
+    await Task.yield()
+    #expect(await first.closeCodes.count == 1)
+    await session.stop()
+}
+
+@Test func `server requested heartbeat is immediate and restarts cadence`() async throws {
+    let socket = FakeGatewaySocket()
+    let transport = FakeGatewayTransport(sockets: [socket])
+    let clock = ManualGatewayClock()
+    let session = makeGatewaySession(transport: transport, clock: clock, randomValues: [0.75])
+
+    await session.connect()
+    #expect(await eventually { await transport.connectionCount == 1 })
+    await socket.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(12000)])))
+    #expect(await eventually { await socket.sentCount == 1 })
+    await socket.push(envelope(op: 1, data: .null))
+    #expect(await eventually { await socket.sentCount == 2 })
+    #expect(try await sentEnvelope(socket, at: 1).op == 1)
+    #expect(await eventually { await clock.activeDurations.contains(where: { seconds($0) == 12 }) })
+    await session.stop()
+}
+
+@Test func `reconnect and invalid session choose immediate resume or delayed identify`() async throws {
+    let one = FakeGatewaySocket()
+    let two = FakeGatewaySocket()
+    let three = FakeGatewaySocket()
+    let four = FakeGatewaySocket()
+    let transport = FakeGatewayTransport(sockets: [one, two, three, four])
+    let clock = ManualGatewayClock()
+    let session = makeGatewaySession(transport: transport, clock: clock, randomValues: [0, 0, 0, 0.5, 0])
+
+    await session.connect()
+    #expect(await eventually { await transport.connectionCount == 1 })
+    await one.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(30000)])))
+    await one.push(envelope(
+        op: 0,
+        data: .object([
+            "session_id": .string("s"),
+            "resume_gateway_url": .string("wss://resume.discord.gg")
+        ]),
+        sequence: 7,
+        eventName: "READY"
+    ))
+    #expect(await eventually { await session.snapshot().state == .ready })
+    await one.push(envelope(op: 7, data: .null))
+    #expect(await eventually { await transport.connectionCount == 2 })
+    await two.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(30000)])))
+    #expect(await eventually { await two.sentCount == 1 })
+    #expect(try await sentEnvelope(two, at: 0).op == 6)
+
+    await two.push(envelope(op: 9, data: .bool(true)))
+    #expect(await eventually { await transport.connectionCount == 3 })
+    await three.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(30000)])))
+    #expect(await eventually { await three.sentCount == 1 })
+    #expect(try await sentEnvelope(three, at: 0).op == 6)
+
+    await three.push(envelope(op: 9, data: .bool(false)))
+    #expect(await eventually { await session.snapshot().state == .backingOff(attempt: 3) })
+    #expect(await eventually { await clock.activeDurations.contains(where: { seconds($0) == 3 }) })
+    await clock.advance(durationMatching: 3)
+    #expect(await eventually { await transport.connectionCount == 4 })
+    await four.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(30000)])))
+    #expect(await eventually { await four.sentCount == 1 })
+    #expect(try await sentEnvelope(four, at: 0).op == 2)
+    #expect(await session.snapshot().sessionID == nil)
+    await session.stop()
+}
+
+@Test func `terminal close stops and explicit stop never reconnects`() async {
+    let terminalSocket = FakeGatewaySocket()
+    let terminalTransport = FakeGatewayTransport(sockets: [terminalSocket])
+    let terminalClock = ManualGatewayClock()
+    let terminal = makeGatewaySession(transport: terminalTransport, clock: terminalClock, randomValues: [])
+    await terminal.connect()
+    #expect(await eventually { await terminalTransport.connectionCount == 1 })
+    await terminalSocket.terminate(code: 4004)
+    #expect(await eventually { await terminal.snapshot().state == .stopped })
+    #expect(await terminalTransport.connectionCount == 1)
+
+    let socket = FakeGatewaySocket()
+    let spare = FakeGatewaySocket()
+    let transport = FakeGatewayTransport(sockets: [socket, spare])
+    let clock = ManualGatewayClock()
+    let session = makeGatewaySession(transport: transport, clock: clock, randomValues: [])
+    await session.connect()
+    #expect(await eventually { await transport.connectionCount == 1 })
+    await session.stop()
+    await clock.advanceAll()
+    for _ in 0 ..< 20 {
+        await Task.yield()
+    }
+    #expect(await transport.connectionCount == 1)
+    #expect(await session.snapshot().state == .stopped)
+}
+
+@Test func `invalid sequence close discards resume state before reconnect`() async throws {
+    let first = FakeGatewaySocket()
+    let second = FakeGatewaySocket()
+    let transport = FakeGatewayTransport(sockets: [first, second])
+    let clock = ManualGatewayClock()
+    let session = makeGatewaySession(transport: transport, clock: clock, randomValues: [0, 0.5, 0])
+    await session.connect()
+    #expect(await eventually { await transport.connectionCount == 1 })
+    await first.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(30000)])))
+    await first.push(envelope(
+        op: 0,
+        data: .object([
+            "session_id": .string("discard-me"),
+            "resume_gateway_url": .string("wss://resume.discord.gg")
+        ]),
+        sequence: 55,
+        eventName: "READY"
+    ))
+    #expect(await eventually { await session.snapshot().state == .ready })
+    await first.terminate(code: 4007)
+    #expect(await eventually { await session.snapshot().state == .backingOff(attempt: 1) })
+    // Backoff state precedes the asynchronous jitter lookup and clock registration.
+    let backoffReady = await eventually { await clock.activeDurations.contains(where: { seconds($0) == 1 }) }
+    if !backoffReady {
+        await session.stop()
+        await clock.advanceAll()
+    }
+    try #require(backoffReady)
+    await clock.advance(durationMatching: 1)
+    #expect(await eventually { await transport.connectionCount == 2 })
+    await second.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(30000)])))
+    #expect(await eventually { await second.sentCount == 1 })
+    #expect(try await sentEnvelope(second, at: 0).op == 2)
+    #expect(await session.snapshot().sessionID == nil)
+    await session.stop()
+}
+
+@Test func `backoff is exponential capped attempt bounded and cancellation safe`() async {
+    let transport = FakeGatewayTransport(sockets: [])
+    let clock = ManualGatewayClock()
+    let session = makeGatewaySession(
+        transport: transport,
+        clock: clock,
+        randomValues: [0.5, 0.5, 0.5],
+        maximumReconnectAttempts: 2,
+        backoffCap: .seconds(2)
+    )
+    await session.connect()
+    #expect(await eventually { await clock.activeWaitCount == 1 })
+    #expect(await seconds(clock.activeDurations[0]) == 1)
+    await clock.advanceNext()
+    #expect(await eventually {
+        let waits = await clock.activeWaitCount
+        let connections = await transport.connectionCount
+        return waits == 1 && connections == 2
+    })
+    #expect(await seconds(clock.activeDurations[0]) == 2)
+    await clock.advanceNext()
+    #expect(await eventually { await session.snapshot().state == .disconnected })
+    #expect(await transport.connectionCount == 3)
+
+    let cancellationTransport = FakeGatewayTransport(sockets: [])
+    let cancellationClock = ManualGatewayClock()
+    let cancelled = makeGatewaySession(transport: cancellationTransport, clock: cancellationClock, randomValues: [0.5])
+    await cancelled.connect()
+    #expect(await eventually { await cancellationClock.activeWaitCount == 1 })
+    await cancelled.stop()
+    await cancellationClock.advanceAll()
+    #expect(await cancellationTransport.connectionCount == 1)
+}
+
+@Test func `cancellation during connect closes late socket without reconnect`() async throws {
+    let transport = BlockingGatewayTransport()
+    let clock = ManualGatewayClock()
+    let session = try GatewaySession(
+        configuration: GatewaySession.Configuration(
+            gatewayURL: #require(URL(string: "wss://gateway.discord.gg")),
+            identifyPayload: Data(#"{"op":2,"d":{}}"#.utf8),
+            token: "test-token"
+        ),
+        transport: transport,
+        clock: clock,
+        random: SequenceGatewayRandom(values: [])
+    )
+    let socket = FakeGatewaySocket()
+    await session.connect()
+    #expect(await eventually { await transport.connectionCount == 1 })
+    await session.stop()
+    await transport.release(socket)
+    #expect(await eventually { await socket.closeCodes == [1000] })
+    #expect(await transport.connectionCount == 1)
+    #expect(await session.snapshot().state == .stopped)
+}
+
+@Test func `zlib framer handles fragmentation multiple payloads and bounds`() throws {
+    let first = try #require(Data(base64Encoded: "eJyqVsovULIyNNRRSlGyyivNyakFAAAA//8="))
+    let second = try #require(Data(base64Encoded: "qoaIIAQAAAAA//8="))
+    var framer = try GatewayPayloadFramer(
+        maximumCompressedBufferSize: 1024,
+        maximumDecompressedPayloadSize: 1024
+    )
+    let split = first.count / 2
+    #expect(try framer.append(.data(first.prefix(split))) == [])
+    let firstPayload = try framer.append(.data(first.suffix(from: split)))
+    #expect(firstPayload == [Data(#"{"op":11,"d":null}"#.utf8)])
+    let secondPayload = try framer.append(.data(second))
+    #expect(secondPayload == [Data(#"{"op":1,"d":null}"#.utf8)])
+
+    let combined = try #require(Data(base64Encoded: "eJyqVsovULIyNNRRSlGyyivNyakFAAAA//+qhoggBAAAAAD//w=="))
+    var combinedFramer = try GatewayPayloadFramer(
+        maximumCompressedBufferSize: 1024,
+        maximumDecompressedPayloadSize: 1024
+    )
+    #expect(try combinedFramer.append(.data(combined)).count == 2)
+
+    var bounded = try GatewayPayloadFramer(
+        maximumCompressedBufferSize: 2,
+        maximumDecompressedPayloadSize: 1024
+    )
+    #expect(throws: GatewaySessionError.compressedBufferLimitExceeded(limit: 2, observed: 3)) {
+        try bounded.append(.data(Data([1, 2, 3])))
+    }
+}
+
+@Test func `zstd framer decodes the desktop stream and enforces input bounds`() throws {
+    let compressed = try #require(Data(base64Encoded: "KLUv/QRYkQAAeyJvcCI6MTEsImQiOm51bGx9Bb/X5w=="))
+    var framer = try GatewayPayloadFramer(
+        compression: .zstdStream,
+        maximumCompressedBufferSize: 1024,
+        maximumDecompressedPayloadSize: 1024
+    )
+    #expect(try framer.append(.data(compressed)) == [Data(#"{"op":11,"d":null}"#.utf8)])
+
+    var bounded = try GatewayPayloadFramer(
+        compression: .zstdStream,
+        maximumCompressedBufferSize: 2,
+        maximumDecompressedPayloadSize: 1024
+    )
+    #expect(throws: GatewaySessionError.compressedBufferLimitExceeded(limit: 2, observed: compressed.count)) {
+        try bounded.append(.data(compressed))
+    }
+
+    // 70,000 repeated bytes compress to this fixture. It deliberately expands
+    // beyond the decoder's 64 KiB output chunk so consuming all compressed
+    // input is not mistaken for consuming all decompressed output.
+    let largeCompressed = try #require(
+        Data(base64Encoded: "KLUv/QRYVQAAEEFBAQBrETnAAt7Is3c=")
+    )
+    var largeFramer = try GatewayPayloadFramer(
+        compression: .zstdStream,
+        maximumCompressedBufferSize: 1024,
+        maximumDecompressedPayloadSize: 128 * 1024
+    )
+    #expect(
+        try largeFramer.append(.data(largeCompressed))
+            == [Data(repeating: 0x41, count: 70_000)]
+    )
+
+    var decompressedBounded = try GatewayPayloadFramer(
+        compression: .zstdStream,
+        maximumCompressedBufferSize: 1024,
+        maximumDecompressedPayloadSize: 64 * 1024
+    )
+    #expect(throws: GatewaySessionError.decompressedPayloadLimitExceeded(limit: 64 * 1024, observed: 70_000)) {
+        try decompressedBounded.append(.data(largeCompressed))
+    }
+}
+
+@Test func `large desktop ready preserves stream dictionary live dispatch and resume`() async throws {
+    let first = FakeGatewaySocket()
+    let second = FakeGatewaySocket()
+    let transport = FakeGatewayTransport(sockets: [first, second])
+    let clock = ManualGatewayClock()
+    let codec = ETFGatewayCodec()
+    let ready = largeGatewayReadyEnvelope()
+    let readyBytes = try codec.encode(ready)
+    #expect(readyBytes.count > 16 * 1024 * 1024)
+    let session = try GatewaySession(
+        configuration: .init(
+            gatewayURL: #require(URL(string: "wss://gateway.discord.gg")),
+            identifyPayload: codec.encode(GatewayEnvelope(op: 2, data: .object(["token": .string("fixture-token")]))),
+            token: "fixture-token", gatewayEncoding: "etf", gatewayCompression: .zstdStream
+        ),
+        transport: transport, clock: clock, random: SequenceGatewayRandom(values: [0.5, 0.5, 0.5]),
+        codec: codec, apiDiagnostics: DiscordAPIDiagnosticStore(maximumEntries: 10)
+    )
+    let recorder = GatewayEventRecorder()
+    let events = Task {
+        for await event in session.events { await recorder.append(event) }
+    }
+    defer { events.cancel() }
+    let compressor = try GatewayTestZstdStream()
+    let hello = GatewayEnvelope(op: 10, data: .object(["heartbeat_interval": .number(40_000)]))
+    await session.connect()
+    await first.push(.data(try compressor.compress(codec.encode(hello))))
+    await first.push(.data(try compressor.compress(readyBytes)))
+    // Reuse the same zstd frame/dictionary, just as Discord does. A second
+    // large message must not inherit buffered output from READY.
+    await first.push(.data(try compressor.compress(codec.encode(GatewayEnvelope(
+        op: 0, data: ready.data, sequence: 2, eventName: "READY_SUPPLEMENTAL"
+    )))))
+    await first.push(.data(try compressor.compress(codec.encode(GatewayEnvelope(
+        op: 0, data: .object(["id": .string("42")]), sequence: 3, eventName: "MESSAGE_CREATE"
+    )))))
+    #expect(await eventually { await session.snapshot().sequence == 3 })
+    #expect(await eventually { await recorder.dispatchNames == ["READY", "READY_SUPPLEMENTAL", "MESSAGE_CREATE"] })
+    #expect(await session.snapshot().state == .ready)
+    #expect(await first.closeCodes.isEmpty)
+
+    await first.terminate(code: nil)
+    #expect(await eventually { await clock.activeDurations.contains(where: { seconds($0) == 1 }) })
+    await clock.advance(durationMatching: 1)
+    #expect(await eventually { await transport.connectionCount == 2 })
+    let resumedCompressor = try GatewayTestZstdStream()
+    await second.push(.data(try resumedCompressor.compress(codec.encode(hello))))
+    #expect(await eventually { await second.sentCount == 1 })
+    let resume = try codec.decode(#require(await second.sentData(at: 0)))
+    #expect(resume.op == 6)
+    #expect(resume.data == .object([
+        "token": .string("fixture-token"), "session_id": .string("large-ready-session"), "seq": .number(3)
+    ]))
+    await second.push(.data(try resumedCompressor.compress(codec.encode(GatewayEnvelope(
+        op: 0, data: .object([:]), sequence: 4, eventName: "RESUMED"
+    )))))
+    #expect(await eventually { await session.snapshot().state == .ready })
+    await session.stop()
+}
+
+@Test(arguments: [false, true])
+func `oversized gateway payload reports size and stops without retry`(textMessage: Bool) async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let diagnostics = DiscordAPIDiagnosticStore(maximumEntries: 10, diskDirectoryURL: directory)
+    diagnostics.enablesPanicSave = true
+    let socket = FakeGatewaySocket()
+    let transport = FakeGatewayTransport(sockets: [socket, FakeGatewaySocket()])
+    let session = try GatewaySession(
+        configuration: .init(
+            gatewayURL: #require(URL(string: "wss://gateway.discord.gg")),
+            identifyPayload: Data(#"{"op":2,"d":{}}"#.utf8), token: "fixture-token",
+            gatewayCompression: .zstdStream, maximumDecompressedPayloadSize: 1024
+        ),
+        transport: transport, clock: ManualGatewayClock(), random: SequenceGatewayRandom(values: []),
+        apiDiagnostics: diagnostics
+    )
+    let failure = GatewaySessionError.decompressedPayloadLimitExceeded(limit: 1024, observed: 1025)
+    let received = Task { () -> [GatewaySessionEvent] in
+        var result: [GatewaySessionEvent] = []
+        for await event in session.events {
+            result.append(event)
+            if event == .stateChanged(.disconnected) { break }
+        }
+        return result
+    }
+    defer { received.cancel() }
+    await session.connect()
+    let content = String(repeating: "x", count: 1025)
+    let message: GatewaySocketMessage = textMessage ? .text(content)
+        : .data(try GatewayTestZstdStream().compress(Data(content.utf8)))
+    await socket.push(message)
+    let events = await received.value
+    let expected: [GatewaySessionEvent] = [
+        .payloadRejected(try #require(failure.payloadLimitMessage)), .stateChanged(.disconnected)
+    ]
+    #expect(Array(events.suffix(2)) == expected)
+    #expect(await session.snapshot().state == .stopped)
+    #expect(await transport.connectionCount == 1)
+    #expect(await socket.closeCodes == [4002])
+    let exported = try String(contentsOf: diagnostics.panicSaveURL, encoding: .utf8)
+    #expect(exported.contains(#""errorCode":3"#))
+    #expect(exported.contains(#""payload_limit_bytes":1024"#))
+    #expect(exported.contains(#""observed_payload_bytes":1025"#))
+    #expect(!exported.contains(content))
+    await session.stop()
+}
+
+@Test func `desktop session announces time spent then uses QoS heartbeats`() async throws {
+    let socket = FakeGatewaySocket()
+    let transport = FakeGatewayTransport(sockets: [socket])
+    let clock = ManualGatewayClock()
+    let heartbeat = DiscordHeartbeatSession(
+        initializationTimestamp: 1_785_773_429_000,
+        sessionID: "heartbeat-session"
+    )
+    let identify = encodedGatewayData(GatewayEnvelope(op: 2, data: .object([:])))
+    let session = GatewaySession(
+        configuration: GatewaySession.Configuration(
+            gatewayURL: URL(string: "wss://gateway.discord.gg")!,
+            identifyPayload: identify,
+            token: "test-token",
+            heartbeatSession: heartbeat,
+            clientLaunchID: "client-launch",
+            qosActive: false,
+            qosVersion: 29
+        ),
+        transport: transport,
+        clock: clock,
+        random: SequenceGatewayRandom(values: [0.5])
+    )
+
+    await session.connect()
+    await socket.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(60_000)])))
+    #expect(await eventually { await socket.sentCount == 1 })
+    await socket.push(envelope(
+        op: 0,
+        data: .object([
+            "session_id": .string("ready-session"),
+            "resume_gateway_url": .string("wss://gateway.discord.gg"),
+        ]),
+        sequence: 7,
+        eventName: "READY"
+    ))
+    #expect(await eventually { await session.snapshot().state == .ready })
+    try await session.announceDesktopSession()
+    #expect(await eventually { await socket.sentCount == 3 })
+
+    let timeSpent = try await sentEnvelope(socket, at: 1)
+    #expect(timeSpent.op == 41)
+    #expect(timeSpent.data == .object([
+        "initialization_timestamp": .number(1_785_773_429_000),
+        "session_id": .string("heartbeat-session"),
+        "client_launch_id": .string("client-launch"),
+    ]))
+    let heartbeatEnvelope = try await sentEnvelope(socket, at: 2)
+    #expect(heartbeatEnvelope.op == 40)
+    #expect(heartbeatEnvelope.data == .object([
+        "seq": .number(7),
+        "qos": .object([
+            "ver": .number(29),
+            "active": .bool(false),
+            "reasons": .array([]),
+        ]),
+    ]))
+
+    await session.updateQOS(active: true, heartbeatSession: heartbeat)
+    #expect(await eventually { await socket.sentCount == 4 })
+    let foregroundHeartbeat = try await sentEnvelope(socket, at: 3)
+    #expect(foregroundHeartbeat.op == 40)
+    guard case let .object(data)? = foregroundHeartbeat.data,
+          case let .object(qos)? = data["qos"]
+    else {
+        Issue.record("QoS heartbeat body was missing")
+        await session.stop()
+        return
+    }
+    #expect(qos["active"] == .bool(true))
+    #expect(qos["reasons"] == .array([.string("foregrounded")]))
+    await session.stop()
+}
+
+@Test func `desktop connection URL requests ETF and zstd`() async throws {
+    let socket = FakeGatewaySocket()
+    let transport = FakeGatewayTransport(sockets: [socket])
+    let codec = ETFGatewayCodec()
+    let session = GatewaySession(
+        configuration: GatewaySession.Configuration(
+            gatewayURL: URL(string: "wss://gateway.discord.gg")!,
+            identifyPayload: try codec.encode(GatewayEnvelope(op: 2, data: .object([:]))),
+            token: "test-token",
+            gatewayEncoding: "etf",
+            gatewayCompression: .zstdStream
+        ),
+        transport: transport,
+        codec: codec
+    )
+    await session.connect()
+    #expect(await eventually { await transport.connectionCount == 1 })
+    let url = try #require(await transport.connectedURLs.first)
+    let query = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems)
+    #expect(query.contains(URLQueryItem(name: "encoding", value: "etf")))
+    #expect(query.contains(URLQueryItem(name: "compress", value: "zstd-stream")))
+    await session.stop()
+}
+
+@Test func `malformed payload fails closed without reconnect storm`() async {
+    let socket = FakeGatewaySocket()
+    let spare = FakeGatewaySocket()
+    let transport = FakeGatewayTransport(sockets: [socket, spare])
+    let clock = ManualGatewayClock()
+    let diagnostics = DiscordAPIDiagnosticStore(maximumEntries: 10)
+    let session = makeGatewaySession(
+        transport: transport,
+        clock: clock,
+        randomValues: [],
+        apiDiagnostics: diagnostics
+    )
+    await session.connect()
+    #expect(await eventually { await transport.connectionCount == 1 })
+    await socket.push(.text("not-json"))
+    #expect(await eventually { await session.snapshot().state == .stopped })
+    #expect(await transport.connectionCount == 1)
+    #expect(await socket.closeCodes == [4002])
+    let diagnosticText = (try? diagnostics.exportData())
+        .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+    #expect(diagnosticText.contains("unparsed_payload"))
+    #expect(diagnosticText.contains("response_failure"))
+}
+
+@Test func `malformed ready is rejected before dispatch`() async {
+    let socket = FakeGatewaySocket()
+    let transport = FakeGatewayTransport(sockets: [socket])
+    let clock = ManualGatewayClock()
+    let session = makeGatewaySession(transport: transport, clock: clock, randomValues: [])
+    let recorder = GatewayEventRecorder()
+    let eventTask = Task {
+        for await event in session.events {
+            await recorder.append(event)
+        }
+    }
+
+    await session.connect()
+    #expect(await eventually { await transport.connectionCount == 1 })
+    await socket.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(30_000)])))
+    await socket.push(envelope(
+        op: 0,
+        data: .object(["guilds": .array([])]),
+        sequence: 1,
+        eventName: "READY"
+    ))
+
+    #expect(await eventually { await session.snapshot().state == .stopped })
+    #expect(await recorder.dispatchNames.contains("READY") == false)
+    eventTask.cancel()
+    await session.stop()
+}
+
+@Test func `existing message member presence and voice dispatches remain lossless`() async {
+    let socket = FakeGatewaySocket()
+    let transport = FakeGatewayTransport(sockets: [socket])
+    let clock = ManualGatewayClock()
+    let session = makeGatewaySession(transport: transport, clock: clock, randomValues: [0])
+    let recorder = GatewayEventRecorder()
+    let eventTask = Task {
+        for await event in session.events {
+            await recorder.append(event)
+        }
+    }
+    await session.connect()
+    #expect(await eventually { await transport.connectionCount == 1 })
+    await socket.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(30000)])))
+    let names = ["MESSAGE_CREATE", "GUILD_MEMBER_LIST_UPDATE", "PRESENCE_UPDATE", "VOICE_STATE_UPDATE"]
+    for (index, name) in names.enumerated() {
+        await socket.push(envelope(
+            op: 0,
+            data: .object(["fixture": .string(name)]),
+            sequence: index + 1,
+            eventName: name
+        ))
+    }
+    #expect(await eventually { await recorder.dispatchNames == names })
+    #expect(await session.snapshot().sequence == 4)
+    eventTask.cancel()
+    await session.stop()
+}
+
+@Test func `remote unknown Gateway closure saves diagnostics before reconnecting`() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appending(path: "SakuraCordGatewayPanicTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let diagnostics = DiscordAPIDiagnosticStore(diskDirectoryURL: directory)
+    diagnostics.enablesPanicSave = true
+    let socket = FakeGatewaySocket()
+    let session = makeGatewaySession(
+        transport: FakeGatewayTransport(sockets: [socket]),
+        clock: ManualGatewayClock(), randomValues: [0.5], apiDiagnostics: diagnostics
+    )
+    await session.connect()
+    await socket.push(envelope(op: 10, data: .object(["heartbeat_interval": .number(40000)])))
+    #expect(await eventually { await socket.sentCount == 1 })
+    await socket.terminate(code: 4000)
+    #expect(await eventually { await session.snapshot().state == .backingOff(attempt: 1) })
+    await session.stop()
+    let text = try String(contentsOf: diagnostics.panicSaveURL, encoding: .utf8)
+    #expect(text.contains(#""close_code":4000"#))
+    #expect(text.contains("response_failure"))
+    #expect(!text.contains("test-token"))
+    #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).count == 1)
+    #expect(try String(data: diagnostics.exportData(), encoding: .utf8)?.contains("socket_closed") == true)
+}
+
+private func makeGatewaySession(
+    transport: FakeGatewayTransport,
+    clock: ManualGatewayClock,
+    randomValues: [Double],
+    maximumReconnectAttempts: Int = 8,
+    backoffCap: Duration = .seconds(60),
+    apiDiagnostics: DiscordAPIDiagnosticStore = .shared
+) -> GatewaySession {
+    let identify = encodedGatewayData(GatewayEnvelope(op: 2, data: .object([
+        "token": .string("test-token")
+    ])))
+    return GatewaySession(
+        configuration: GatewaySession.Configuration(
+            gatewayURL: URL(string: "wss://gateway.discord.gg")!,
+            identifyPayload: identify,
+            token: "test-token",
+            maximumReconnectAttempts: maximumReconnectAttempts,
+            backoffCap: backoffCap
+        ),
+        transport: transport,
+        clock: clock,
+        random: SequenceGatewayRandom(values: randomValues),
+        apiDiagnostics: apiDiagnostics
+    )
+}
+
+private func envelope(
+    op: Int,
+    data: JSONValue?,
+    sequence: Int? = nil,
+    eventName: String? = nil
+) -> GatewaySocketMessage {
+    let value = GatewayEnvelope(op: op, data: data, sequence: sequence, eventName: eventName)
+    return .text(encodedGatewayText(value))
+}
+
+private func encodedGatewayData(_ envelope: GatewayEnvelope) -> Data {
+    do {
+        return try JSONGatewayCodec().encode(envelope)
+    } catch {
+        preconditionFailure("Invalid test Gateway envelope: \(error)")
+    }
+}
+
+private func encodedGatewayText(_ envelope: GatewayEnvelope) -> String {
+    guard let text = String(data: encodedGatewayData(envelope), encoding: .utf8) else {
+        preconditionFailure("Gateway JSON encoder returned non-UTF-8 data")
+    }
+    return text
+}
+
+private func sentEnvelope(_ socket: FakeGatewaySocket, at index: Int) async throws -> GatewayEnvelope {
+    let data = try #require(await socket.sentData(at: index))
+    return try JSONGatewayCodec().decode(data)
+}
+
+private func seconds(_ duration: Duration) -> Double {
+    let parts = duration.components
+    return Double(parts.seconds) + Double(parts.attoseconds) / 1e18
+}
+
+private enum FakeGatewayError: Error { case closed, unavailable }
+
+private actor FakeGatewaySocket: GatewaySocket {
+    private var queued: [GatewaySocketMessage] = []
+    private var receiver: CheckedContinuation<GatewaySocketMessage, any Error>?
+    private(set) var sent: [Data] = []
+    private(set) var closeCodes: [Int] = []
+    private var terminalCloseCode: Int?
+
+    var sentCount: Int {
+        sent.count
+    }
+
+    func receive() async throws -> GatewaySocketMessage {
+        if !queued.isEmpty {
+            return queued.removeFirst()
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            receiver = continuation
+        }
+    }
+
+    func send(_ data: Data) async throws {
+        sent.append(data)
+    }
+
+    func close(code: Int) async {
+        closeCodes.append(code)
+        receiver?.resume(throwing: FakeGatewayError.closed)
+        receiver = nil
+    }
+
+    func closeCode() async -> Int? {
+        terminalCloseCode
+    }
+
+    func push(_ message: GatewaySocketMessage) {
+        if let receiver {
+            self.receiver = nil
+            receiver.resume(returning: message)
+        } else {
+            queued.append(message)
+        }
+    }
+
+    func terminate(code: Int?) {
+        terminalCloseCode = code
+        receiver?.resume(throwing: FakeGatewayError.closed)
+        receiver = nil
+    }
+
+    func sentData(at index: Int) -> Data? {
+        sent.indices.contains(index) ? sent[index] : nil
+    }
+}
+
+private actor FakeGatewayTransport: GatewayTransport {
+    private var sockets: [FakeGatewaySocket]
+    private(set) var connectedURLs: [URL] = []
+
+    init(sockets: [FakeGatewaySocket]) {
+        self.sockets = sockets
+    }
+
+    var connectionCount: Int {
+        connectedURLs.count
+    }
+
+    func connect(to url: URL, maximumMessageSize: Int) async throws -> any GatewaySocket {
+        connectedURLs.append(url)
+        guard !sockets.isEmpty else { throw FakeGatewayError.unavailable }
+        return sockets.removeFirst()
+    }
+}
+
+private actor BlockingGatewayTransport: GatewayTransport {
+    private var continuation: CheckedContinuation<any GatewaySocket, any Error>?
+    private(set) var connectionCount = 0
+
+    func connect(to url: URL, maximumMessageSize: Int) async throws -> any GatewaySocket {
+        connectionCount += 1
+        return try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func release(_ socket: any GatewaySocket) {
+        continuation?.resume(returning: socket)
+        continuation = nil
+    }
+}
+
+private actor SequenceGatewayRandom: GatewayRandomSource {
+    private var values: [Double]
+
+    init(values: [Double]) {
+        self.values = values
+    }
+
+    func unitInterval() async -> Double {
+        values.isEmpty ? 0.5 : values.removeFirst()
+    }
+}
+
+private actor GatewayEventRecorder {
+    private(set) var dispatchNames: [String] = []
+
+    func append(_ event: GatewaySessionEvent) {
+        guard case let .dispatch(name, _) = event else { return }
+        dispatchNames.append(name)
+    }
+}
+
+private actor ManualGatewayClock: GatewayClock {
+    private struct Waiter {
+        var duration: Duration
+        var continuation: CheckedContinuation<Void, Never>
+    }
+
+    private var waiters: [Waiter] = []
+    private(set) var recordedDurations: [Duration] = []
+
+    var activeWaitCount: Int {
+        waiters.count
+    }
+
+    var activeDurations: [Duration] {
+        waiters.map(\.duration)
+    }
+
+    func sleep(for duration: Duration) async throws {
+        recordedDurations.append(duration)
+        await withCheckedContinuation { continuation in
+            waiters.append(Waiter(duration: duration, continuation: continuation))
+        }
+        try Task.checkCancellation()
+    }
+
+    func advanceNext() {
+        guard !waiters.isEmpty else { return }
+        waiters.removeFirst().continuation.resume()
+    }
+
+    func advance(durationMatching value: Double) {
+        guard let index = waiters.firstIndex(where: { abs(seconds($0.duration) - value) < 0.001 }) else { return }
+        waiters.remove(at: index).continuation.resume()
+    }
+
+    func advanceAll() {
+        let current = waiters
+        waiters.removeAll()
+        for waiter in current {
+            waiter.continuation.resume()
+        }
+    }
+}

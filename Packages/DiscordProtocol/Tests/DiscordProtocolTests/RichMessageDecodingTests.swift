@@ -1,0 +1,471 @@
+@testable import DiscordProtocol
+import Foundation
+import SakuraCordModels
+import Testing
+
+@Test func `discord timestamps parse fractional and whole seconds`() throws {
+    let fractional = try #require(
+        DiscordDate.parse("2026-08-01T03:04:05.123456+00:00")
+    )
+    let whole = try #require(
+        DiscordDate.parse("2026-08-01T03:04:05+00:00")
+    )
+
+    #expect(abs(fractional.timeIntervalSince(whole) - 0.123456) < 0.000_001)
+}
+
+@Test func `enhanced role primary color takes precedence over legacy color`() throws {
+    let data = Data(
+        #"""
+        {
+          "id":"10","name":"Orange","position":2,"hoist":true,"color":16777215,
+          "colors":{"primary_color":16753920,"secondary_color":null,"tertiary_color":null},
+          "tags":{"subscription_listing_id":"20","available_for_purchase":null}
+        }
+        """#.utf8
+    )
+    let role = try JSONDecoder().decode(GuildRoleDTO.self, from: data).domain
+
+    #expect(role?.colorHex == 0xFFA500)
+    #expect(role?.isPurchasableSubscription == true)
+}
+
+@Test func `role color falls back to legacy field when enhanced color is absent`() throws {
+    let data = Data(
+        #"{"id":"10","name":"Orange","position":2,"hoist":true,"color":16753920}"#.utf8
+    )
+    let role = try JSONDecoder().decode(GuildRoleDTO.self, from: data).domain
+
+    #expect(role?.colorHex == 0xFFA500)
+    #expect(role?.isPurchasableSubscription == false)
+}
+
+@Test func `partial message member merge does not erase known role ids`() {
+    let existing = MessageGuildMember(
+        nickname: "Guild Name",
+        roleIDs: [RoleID(rawValue: 10)],
+        avatarURL: URL(string: "https://cdn.discordapp.com/avatar.webp")
+    )
+    let merged = MessageGuildMember.merging(
+        incoming: MessageGuildMember(),
+        existing: existing
+    )
+
+    #expect(merged == existing)
+    #expect(MessageGuildMember.merging(incoming: nil, existing: existing) == existing)
+}
+
+@Test func `channel decoder retains hidden channel timestamps`() throws {
+    let lastMessageID = ClientNonce.make(
+        now: Date(timeIntervalSince1970: 1_784_158_980.123)
+    )
+    let data = Data(
+        #"{"id":"200","guild_id":"300","name":"private","type":0,"last_message_id":"\#(lastMessageID)","last_pin_timestamp":"2026-07-10T11:16:00.000Z"}"#.utf8
+    )
+    let dto = try JSONDecoder().decode(ChannelDTO.self, from: data)
+    let channel = try dto.domain(guildID: nil)
+
+    #expect(channel.lastMessageID?.description == lastMessageID)
+    #expect(
+        abs((channel.lastMessageID?.createdAt.timeIntervalSince1970 ?? 0) - 1_784_158_980.123)
+            < 0.001
+    )
+    let timestampFormatter = ISO8601DateFormatter()
+    timestampFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    #expect(
+        channel.lastPinTimestamp
+            == timestampFormatter.date(from: "2026-07-10T11:16:00.000Z")
+    )
+}
+
+@Test func `channel DTOs and cached snapshots preserve value semantics across copies`() throws {
+    let data = Data(
+        #"""
+        {
+          "id":"200","guild_id":"300","type":11,
+          "message":{"id":"100","channel_id":"200","content":"Original",
+            "author":{"id":"1","username":"author"}}
+        }
+        """#.utf8
+    )
+    let original = try JSONDecoder().decode(ChannelDTO.self, from: data)
+    var updated = original
+    updated.message?.content = "Updated"
+    updated.message?.author?.username = "renamed"
+
+    #expect(original.message?.content == "Original")
+    #expect(original.message?.author?.username == "author")
+    #expect(updated.message?.content == "Updated")
+    #expect(updated.message?.author?.username == "renamed")
+    updated.message = nil
+    #expect(updated.message == nil)
+    #expect(original.message != nil)
+
+    var cache: ChannelDTOStore = [original.id: original]
+    let snapshot = cache
+    let values = Array(cache.values)
+    cache[original.id]?.message?.content = "Cache update"
+    cache[original.id]?.status = "Voice status"
+    #expect(cache[original.id]?.message?.content == "Cache update")
+    #expect(cache[original.id]?.status == "Voice status")
+    #expect(snapshot[original.id]?.message?.content == "Original")
+    #expect(snapshot[original.id]?.status == nil)
+    #expect(values.first?.message?.content == "Original")
+    cache[original.id] = nil
+    #expect(cache.keys.isEmpty)
+    #expect(cache.values.isEmpty)
+    #expect(snapshot[original.id] != nil)
+
+    let merged = ChannelDTOStore(
+        [(original.id, updated), (original.id, original)],
+        uniquingKeysWith: { _, newer in newer }
+    )
+    #expect(merged[original.id]?.message?.content == "Original")
+
+    for json in [#"{"id":"200","type":0}"#, #"{"id":"200","type":0,"message":null}"#] {
+        #expect(try JSONDecoder().decode(ChannelDTO.self, from: Data(json.utf8)).message == nil)
+    }
+}
+
+@Test func `rich message fixture decodes every content family and skips malformed siblings`() throws {
+    let data = Data(
+        #"""
+        {
+          "id":"100","channel_id":"200","guild_id":"300","application_id":"400","type":0,"flags":32768,
+          "author":{"id":"1","username":"fixture","global_name":"Fixture"},
+          "member":{"nick":"Guild Fixture","roles":["10","11"],"avatar":"guild-avatar"},
+          "content":"legacy content is suppressed",
+          "mentions":[{"id":"2","username":"mentioned","global_name":"Mentioned User","member":{"nick":"Server Nick","avatar":null,"roles":[]}}],
+          "timestamp":"2026-07-17T10:00:00.000Z",
+          "attachments":[
+            {"id":"1","filename":"photo.png","title":"Photo","description":"A blue square",
+             "url":"https://cdn.example/photo.png","proxy_url":"https://proxy.example/photo.png",
+             "content_type":"image/png","width":800,"height":600,"size":12,
+             "placeholder":"abc","placeholder_version":1},
+            {"id":false}
+          ],
+          "embeds":[
+            {"title":"Preview","description":"**Rich** description","url":"https://example.com",
+             "color":5793266,"fields":[{"name":"One","value":"Value","inline":true}],
+             "image":{"url":"attachment://photo.png","width":800,"height":600}},
+            {"type":"components","url":"https://example.com/preview","components":[
+              {"type":17,"id":1,"accent_color":15702980,"components":[
+                {"type":10,"id":2,"content":"# Website preview"}]}, false]},
+            false
+          ],
+          "components":[
+            {"type":17,"id":1,"accent_color":5793266,"components":[
+              {"type":10,"id":2,"content":"Component text"},
+              {"type":2,"id":3,"style":5,"label":"Open","emoji":{"id":"216154654256398347","name":"mmLol","animated":false},"url":"https://example.com"},
+              {"type":9,"id":5,"components":[{"type":10,"id":6,"content":"With thumbnail"}],
+               "accessory":{"type":11,"id":7,"media":{"url":"attachment://photo.png"},
+               "description":"Preview art","spoiler":true}},
+              {"type":13,"id":8,"file":{"url":"attachment://photo.png"},"spoiler":true},
+              {"type":12,"id":9,"items":[{"media":{"url":"https://cdn.example/banner.png",
+               "proxy_url":"https://proxy.example/banner.png","width":1200,"height":200,
+               "content_type":"image/png","placeholder":"thumbhash","placeholder_version":1,"flags":1},
+               "description":"Wide banner"}]},
+              {"type":999,"id":4}
+            ]},
+            false
+          ],
+          "sticker_items":[{"id":"500","name":"Wave","format_type":1}],
+          "thread":{"id":"600","guild_id":"300","parent_id":"200","name":"Discussion","message_count":4,"member_count":2,"thread_metadata":{"archived":false,"locked":false}}
+        }
+        """#.utf8
+    )
+
+    let message = try RichMessageFixtureDecoder.decodeMessage(from: data)
+    #expect(message.flags.contains(.isComponentsV2))
+    #expect(message.author.displayName == "Guild Fixture")
+    #expect(message.guildMember?.nickname == "Guild Fixture")
+    #expect(message.guildMember?.roleIDs == [RoleID(rawValue: 10), RoleID(rawValue: 11)])
+    #expect(message.author.avatarURL?.absoluteString.contains("/guilds/300/users/1/avatars/guild-avatar.webp") == true)
+    #expect(message.applicationID == ApplicationID(rawValue: 400))
+    #expect(message.attachments.count == 1)
+    #expect(message.attachments[0].title == "Photo")
+    #expect(message.embeds.count == 2)
+    #expect(message.embeds[0].fields.count == 1)
+    #expect(message.embeds[1].components == [
+        .container(id: "embed-1.0", accentColor: 15702980, spoiler: false, children: [
+            .textDisplay(id: "embed-1.0.0", content: "# Website preview"),
+        ]),
+    ])
+    #expect(message.components.count == 1)
+    guard case let .container(_, _, _, children) = message.components[0],
+          case let .button(_, _, _, emoji, _, _, _, _) = children[1]
+    else {
+        Issue.record("Expected decoded component button")
+        return
+    }
+    #expect(emoji?.id == "216154654256398347")
+    #expect(emoji?.name == "mmLol")
+    guard case let .section(_, _, accessory) = children[2],
+          case let .thumbnail(_, thumbnail)? = accessory,
+          case let .file(_, file) = children[3]
+    else {
+        Issue.record("Expected decoded thumbnail and file components")
+        return
+    }
+    #expect(thumbnail.attachmentName == "photo.png")
+    #expect(thumbnail.description == "Preview art")
+    #expect(thumbnail.isSpoiler)
+    #expect(file.attachmentName == "photo.png")
+    #expect(file.isSpoiler)
+    guard case let .mediaGallery(_, galleryItems) = children[4],
+          let galleryMedia = galleryItems.first?.media
+    else {
+        Issue.record("Expected decoded media gallery metadata")
+        return
+    }
+    #expect(galleryMedia.url?.absoluteString == "https://cdn.example/banner.png")
+    #expect(galleryMedia.proxyURL?.absoluteString == "https://proxy.example/banner.png")
+    #expect(galleryMedia.width == 1200)
+    #expect(galleryMedia.height == 200)
+    #expect(galleryMedia.contentType == "image/png")
+    #expect(galleryMedia.placeholder == "thumbhash")
+    #expect(galleryMedia.placeholderVersion == 1)
+    #expect(galleryMedia.flags == 1)
+    #expect(message.stickers.first?.name == "Wave")
+    #expect(message.thread?.id == ChannelID(rawValue: 600))
+    #expect(message.mentionedUsers.first?.displayName == "Server Nick")
+}
+
+@Test(arguments: ["image", "article"])
+func `image and article embeds promote wire thumbnails while link embeds keep them`(type: String) throws {
+    let source = "https://cdn.discordapp.com/attachments/1/2/cat.gif"
+    let signed = "https://cdn.discordapp.com/attachments/1/2/cat.gif?ex=1&is=2&hm=3&"
+    let signedProxy = "https://media.discordapp.net/attachments/1/2/cat.gif?ex=1&is=2&hm=3&"
+    let media = #"""
+        {"url":"\#(signed)","proxy_url":"\#(signedProxy)","width":498,"height":280,
+         "content_type":"image/gif","placeholder":"thumbhash","placeholder_version":1,"flags":32}
+        """#
+    let data = Data(
+        #"""
+        {
+          "id":"100","channel_id":"200","type":0,
+          "author":{"id":"1","username":"fixture"},
+          "content":"\#(source)","timestamp":"2026-09-28T10:00:00.000Z","attachments":[],
+          "embeds":[
+            {"type":"\#(type)","url":"\#(source)","thumbnail":\#(media)},
+            {"type":"\#(type)","url":"\#(source)","image":{"url":"https://cdn.example/explicit.png"},
+             "thumbnail":\#(media)},
+            {"type":"link","url":"https://example.com","thumbnail":\#(media)}
+          ]
+        }
+        """#.utf8
+    )
+
+    let embeds = try RichMessageFixtureDecoder.decodeMessage(from: data).embeds
+    #expect(embeds.count == 3)
+    let promoted = try #require(embeds[0].image)
+    #expect(embeds[0].url?.absoluteString == source)
+    #expect(embeds[0].thumbnail == nil)
+    #expect(promoted.url?.absoluteString == signed)
+    #expect(promoted.proxyURL?.absoluteString == signedProxy)
+    #expect(promoted.width == 498)
+    #expect(promoted.height == 280)
+    #expect(promoted.contentType == "image/gif")
+    #expect(promoted.placeholder == "thumbhash")
+    #expect(promoted.flags == 32)
+
+    #expect(embeds[1].image?.url?.absoluteString == "https://cdn.example/explicit.png")
+    #expect(embeds[1].thumbnail == nil)
+
+    #expect(embeds[2].image == nil)
+    #expect(embeds[2].thumbnail?.url?.absoluteString == signed)
+}
+
+@Test func `welcome messages and standard lottie stickers retain renderable metadata`() throws {
+    let data = Data(
+        #"""
+        {"id":"101","channel_id":"200","type":7,
+        "author":{"id":"1","username":"new-user","global_name":"New User"},
+        "content":"","sticker_items":[{"id":"749054660769218631","name":"Wave","format_type":3}]}
+        """#.utf8
+    )
+    let message = try RichMessageFixtureDecoder.decodeMessage(from: data)
+    #expect(message.type == .userJoin)
+    #expect(message.type.hasGeneratedContent)
+    #expect(message.stickers.first?.format == .lottie)
+    #expect(message.stickers.first?.mediaURL?.absoluteString.hasSuffix(".json") == true)
+}
+
+@Test func `reply preview retains referenced guild member roles`() throws {
+    let data = Data(
+        #"""
+        {
+          "id":"101","channel_id":"200","guild_id":"300","type":0,
+          "author":{"id":"1","username":"replying","global_name":"Replying User"},
+          "content":"Reply","timestamp":"2026-07-17T10:00:00.000Z",
+          "message_reference":{"message_id":"100"},
+          "referenced_message":{
+            "id":"100",
+            "author":{"id":"2","username":"original","global_name":"Original User"},
+            "member":{"nick":"Guild Original","roles":["10","11"],"avatar":null},
+            "content":"Original",
+            "attachments":[{"id":"a","filename":"photo.png","url":"https://cdn.discordapp.com/attachments/photo.png","size":10,"content_type":"image/png"}]
+          }
+        }
+        """#.utf8
+    )
+
+    let message = try RichMessageFixtureDecoder.decodeMessage(from: data)
+    #expect(message.replyPreview?.author.displayName == "Guild Original")
+    #expect(message.replyPreview?.mediaKind == .image)
+    #expect(
+        message.replyPreview?.guildMember?.roleIDs
+            == [RoleID(rawValue: 10), RoleID(rawValue: 11)]
+    )
+}
+
+@Test func `partial update changes present rich fields and preserves absent fields`() throws {
+    let author = User(id: UserID(rawValue: 1), username: "fixture", displayName: "Fixture")
+    var original = Message(
+        id: MessageID(rawValue: 100), channelID: ChannelID(rawValue: 200), author: author,
+        content: "before",
+        embeds: [MessageEmbed(title: "Keep until explicitly replaced")],
+        stickers: [MessageSticker(id: "1", name: "Keep")]
+    )
+    original.thread = MessageThreadSummary(id: ChannelID(rawValue: 600), parentID: original.channelID, name: "Keep thread")
+    let update = Data(
+        #"{"id":"100","channel_id":"200","content":"after","components":[{"type":10,"content":"new"}]}"#
+            .utf8
+    )
+    let merged = try RichMessageFixtureDecoder.mergeUpdate(from: update, into: original)
+
+    #expect(merged.thread == original.thread)
+    #expect(merged.content == "after")
+    #expect(merged.embeds == original.embeds)
+    #expect(merged.stickers == original.stickers)
+    #expect(merged.components.count == 1)
+}
+
+@Test func `deferred command update clears loading and preserves attribution`() throws {
+    let author = User(id: UserID(rawValue: 101), username: "app", displayName: "App", isBot: true)
+    let invocationUser = User(
+        id: UserID(rawValue: 1), username: "tester", displayName: "Tester"
+    )
+    let original = Message(
+        id: MessageID(rawValue: 100),
+        channelID: ChannelID(rawValue: 200),
+        author: author,
+        content: "Working…",
+        type: .chatInputCommand,
+        flags: .loading,
+        interactionMetadata: MessageInteractionMetadata(
+            id: "800", name: "verify", user: invocationUser, applicationID: "400"
+        )
+    )
+    let update = Data(
+        #"{"id":"100","channel_id":"200","content":"Complete","flags":0,"edited_timestamp":"2026-07-19T18:00:00.000Z"}"#.utf8
+    )
+    let merged = try RichMessageFixtureDecoder.mergeUpdate(from: update, into: original)
+
+    #expect(merged.content == "Complete")
+    #expect(!merged.flags.contains(.loading))
+    #expect(merged.editedTimestamp != nil)
+    #expect(merged.interactionMetadata == original.interactionMetadata)
+}
+
+@Test func `chat input response decodes command attribution and application identity`() throws {
+    let data = Data(
+        #"""
+        {
+          "id":"700",
+          "channel_id":"200",
+          "guild_id":"300",
+          "type":20,
+          "flags":64,
+          "author":{"id":"101","username":"verified","global_name":"Verified","bot":true},
+          "content":"Verification complete",
+          "nonce":"600",
+          "application_id":"100",
+          "application":{"id":"100","name":"Verified","description":"Verification tools","icon":"abc"},
+          "interaction":{"id":"800","type":2,"name":"verifyforme","user":{"id":"1","username":"tester","global_name":"Tester"}},
+          "interaction_metadata":{"id":"800","type":2,"application_id":"100","original_response_message_id":"700"}
+        }
+        """#.utf8
+    )
+
+    let message = try RichMessageFixtureDecoder.decodeMessage(from: data)
+    #expect(message.type == .chatInputCommand)
+    #expect(message.flags.contains(.ephemeral))
+    #expect(message.nonce == "600")
+    #expect(message.applicationID == ApplicationID("100"))
+    #expect(message.application?.name == "Verified")
+    #expect(message.application?.iconURL?.absoluteString.contains("/app-icons/100/abc.webp") == true)
+    #expect(message.interactionMetadata?.id == "800")
+    #expect(message.interactionMetadata?.displayName == "verifyforme")
+    #expect(message.interactionMetadata?.user?.displayName == "Tester")
+    #expect(message.interactionMetadata?.originalResponseMessageID == MessageID("700"))
+}
+
+@Test func `uploaded component media keeps its delivered URL alongside the attachment reference`() throws {
+    let data = Data(
+        #"""
+        {
+          "id":"700","channel_id":"200","type":23,"flags":32768,"content":"","attachments":[],
+          "author":{"id":"101","username":"greed","bot":true},
+          "components":[{"type":12,"id":1,"items":[{"media":{
+            "url":"https://cdn.discordapp.com/attachments/200/900/quote.png?ex=1",
+            "proxy_url":"https://media.discordapp.net/attachments/200/900/quote.png?ex=1",
+            "width":1200,"height":630,"content_type":"image/png","attachment_id":"900","flags":0
+          },"description":null,"spoiler":false}]}]
+        }
+        """#.utf8
+    )
+
+    let message = try RichMessageFixtureDecoder.decodeMessage(from: data)
+    guard case let .mediaGallery(_, items) = message.components.first, let media = items.first?.media else {
+        Issue.record("Expected a media gallery")
+        return
+    }
+    #expect(media.attachmentName == "900")
+    #expect(media.url?.host() == "cdn.discordapp.com")
+    #expect(media.proxyURL?.host() == "media.discordapp.net")
+}
+
+@Test func `webhook message identity survives decoding and sparse updates without indexing a user`() throws {
+    let data = Data(#"""
+    {"id":"100","channel_id":"200","webhook_id":"300",
+     "author":{"id":"300","username":"Test persona","discriminator":"0000","avatar":"custom_hash","bot":true},
+     "content":"Test","referenced_message":{"id":"99","webhook_id":"300",
+       "author":{"id":"300","username":"Other persona","discriminator":"0000","avatar":null,"bot":true},"content":"Earlier"}}
+    """#.utf8)
+    let dto = try JSONDecoder().decode(MessageDTO.self, from: data)
+    let message = try dto.domain()
+    #expect(message.webhookID == "300")
+    #expect(message.author.isWebhookIdentity)
+    #expect(message.author.avatarURL?.path == "/avatars/300/custom_hash.webp")
+    #expect(dto.searchIndexUsers.isEmpty)
+    #expect(message.replyPreview?.author.displayName == "Other persona")
+    #expect(message.replyPreview?.webhookID == "300")
+    // Legacy "0000" selects the first default artwork, like Discord's client.
+    #expect(message.replyPreview?.author.avatarURL?.lastPathComponent == "18e336a74a159cfd.png")
+    #expect(try JSONDecoder().decode(Message.self, from: JSONEncoder().encode(message)) == message)
+    var updated = message
+    let update = try JSONDecoder().decode(MessageUpdateDTO.self, from: Data(#"{"id":"100","channel_id":"200","content":"Edited"}"#.utf8))
+    update.apply(to: &updated)
+    #expect(updated.webhookID == message.webhookID && updated.author == message.author)
+    #expect(updated.content == "Edited")
+    // New avatar URLs are materialized asynchronously: CREATE has avatar:null,
+    // then UPDATE carries the complete message-scoped webhook author.
+    let avatarUpdate = try JSONDecoder().decode(MessageUpdateDTO.self, from: Data(#"""
+    {"id":"100","channel_id":"200","webhook_id":"300",
+     "author":{"id":"300","username":"New persona","discriminator":"0000","avatar":"ready_hash","bot":true}}
+    """#.utf8))
+    var coalesced = try #require(avatarUpdate.domain(guildID: nil))
+    coalesced.merge(try #require(update.domain(guildID: nil)))
+    coalesced.apply(to: &updated)
+    #expect(updated.author.displayName == "New persona")
+    #expect(updated.author.avatarURL?.path == "/avatars/300/ready_hash.webp")
+    #expect(updated.replyPreview == message.replyPreview)
+    #expect(coalesced.updatedUsers.isEmpty)
+    #expect(updated.content == "Edited")
+    var otherDTO = dto
+    otherDTO.id = "101"
+    var otherMessage = try otherDTO.domain()
+    coalesced.apply(to: &otherMessage)
+    #expect(otherMessage.author == message.author)
+}

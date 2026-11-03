@@ -1,0 +1,434 @@
+import SakuraCordModels
+import SwiftUI
+
+struct ChatDetailView: View {
+    let model: AppModel
+    @State private var floatingFooterHeight: CGFloat =
+        ChatDetailLayoutPolicy.defaultFloatingFooterHeight
+    @State private var editRequest: MessageTimelineEditRequest?
+
+    var body: some View {
+        if let channel = model.selectedChannel {
+            if model.selectedConversationAccess == .hidden {
+                HiddenChannelView(
+                    channel: channel,
+                    lastMessageDate: channel.lastMessageID?.createdAt,
+                    lastPinDate: channel.lastPinTimestamp,
+                    allowedPrincipals: HiddenChannelAccessPresentation.allowedPrincipals(
+                        channel: channel,
+                        members: model.members,
+                        roles: model.guildRoles
+                    )
+                )
+                .background {
+                    DisplayCompleteFrameReporter(
+                        presentationID: channel.id.rawValue
+                    ) {
+                        guard model.selectedChannelID == channel.id else {
+                            return
+                        }
+                        AppPerformanceSignposts
+                            .reportNonTimelineWorkspaceFrame()
+                        AppPerformanceSignposts.reportConversationFirstFrame(
+                            channelID: channel.id
+                        )
+                    }
+                    .frame(width: 1, height: 1)
+                }
+            } else {
+                MessageTimelineView(
+                    model: model,
+                    bottomContentInset: ChatDetailLayoutPolicy.bottomContentInset(
+                        measuredFooterHeight: floatingFooterHeight
+                    ),
+                    editRequest: editRequest
+                )
+                .overlay(alignment: .bottom) {
+                    ConversationFooterHost {
+                        ChatDetailFooter(
+                            model: model,
+                            channel: channel,
+                            access: model.selectedConversationAccess,
+                            onEditMessage: { messageID in
+                                editRequest = MessageTimelineEditRequest(
+                                    messageID: messageID
+                                )
+                            }
+                        )
+                    }
+                    .onGeometryChange(for: CGFloat.self) { proxy in
+                        proxy.size.height
+                    } action: { height in
+                        floatingFooterHeight = height
+                    }
+                }
+            }
+        } else {
+            ContentUnavailableView("Choose a conversation", systemImage: "bubble.left.and.bubble.right", description: Text("Select a server and channel to begin."))
+        }
+    }
+}
+
+private struct ChatDetailFooter: View {
+    let model: AppModel
+    let channel: Channel
+    let access: ConversationAccess
+    let onEditMessage: (MessageID) -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if let request = channel.messageRequest {
+                // Discord asks for a decision before a request can be answered.
+                DisabledComposerView(
+                    message: request == .spam ? "Discord filed this request as spam." : "Accept this request to reply.",
+                    appearance: model.appearanceSettings.composerBarAppearance
+                ) {
+                    MessageRequestActions(model: model, channel: channel)
+                        .controlSize(.small)
+                }
+            } else {
+                composerSlot
+            }
+        }
+    }
+
+    private var composerSlot: some View {
+        ConversationComposerSlot(
+            access: access,
+            timeoutUntil: model.guildTimeoutUntil(in: channel.id),
+            appearance: model.appearanceSettings.composerBarAppearance,
+            checkingMessage: "Checking channel permissions…",
+            readOnlyMessage: channel.isOfficialSystemDirectMessage
+                ? "This chat is reserved for official Discord notifications."
+                : (channel.guildID.flatMap { model.onboardingMember(in: $0) }?.isPending == true
+                   ? "Complete this server’s member screening in Discord to send messages."
+                   : "You do not have permission to send messages in this channel.")
+        ) {
+            if model.messageAppearance(for: channel.id) == .bubbles {
+                TypingBubbleIndicatorView(model: model, channel: channel)
+            } else {
+                TypingIndicatorView(typingState: model.typingState, channelID: channel.id)
+            }
+            ComposerView(
+                model: model,
+                channelName: channel.name,
+                onEditMessage: onEditMessage
+            )
+        }
+    }
+}
+
+/// The composer slot shared by every conversation footer. A timeout,
+/// permission check or read-only notice takes the composer's place.
+struct ConversationComposerSlot<Composer: View>: View {
+    let access: ConversationAccess
+    let timeoutUntil: Date?
+    let appearance: ComposerBarAppearance
+    let checkingMessage: String
+    /// Shown when the conversation is readable but not writable.
+    let readOnlyMessage: String?
+    @ViewBuilder let composer: Composer
+
+    var body: some View {
+        if let timeoutUntil {
+            DisabledComposerView(
+                message: "You are timed out.",
+                appearance: appearance,
+                timeoutUntil: timeoutUntil
+            )
+        } else {
+            switch access {
+            case .checking:
+                DisabledComposerView(message: checkingMessage, appearance: appearance)
+            case .readable(canSend: true):
+                composer
+            case .readable(canSend: false):
+                if let readOnlyMessage {
+                    DisabledComposerView(message: readOnlyMessage, appearance: appearance)
+                }
+            case .hidden:
+                EmptyView()
+            }
+        }
+    }
+}
+
+struct DisabledComposerView<Accessory: View>: View {
+    let message: String
+    let appearance: ComposerBarAppearance
+    var timeoutUntil: Date?
+    /// Controls at the bar's trailing edge, read apart from the notice.
+    @ViewBuilder var accessory: Accessory
+
+    var body: some View {
+        let usesDefaultStyle = appearance == .defaultStyle
+        let shape = usesDefaultStyle
+            ? AnyShape(ConcentricRectangle(
+                cornerRadius: ChatChromeMetrics.composerCornerRadius,
+                style: .continuous
+            ))
+            : AnyShape(ConcentricRectangle(
+                corners: .concentric(
+                    minimum: .fixed(
+                        ChatChromeMetrics.composerMinimumCornerRadius
+                    )
+                ),
+                isUniform: true
+            ))
+
+        HStack(spacing: 0) {
+            HStack(spacing: 0) {
+                if timeoutUntil != nil {
+                    Image(systemName: "clock")
+                        .foregroundStyle(.red)
+                        .padding(.trailing, InterfaceScale.metric(8))
+                        .accessibilityHidden(true)
+                }
+                Text(message)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                if let until = timeoutUntil {
+                    Text(timerInterval: min(Date.now, until) ... until, countsDown: true, showsHours: true)
+                        .monospacedDigit()
+                        .fixedSize()
+                        .help("Timeout ends \(until.formatted(date: .abbreviated, time: .standard))")
+                }
+            }
+            .accessibilityElement(children: .combine)
+            accessory
+        }
+        .font(.interfaceSystem(size: 15))
+        .foregroundStyle(timeoutUntil == nil ? AnyShapeStyle(.tertiary) : AnyShapeStyle(Color.white))
+        .padding(.horizontal, usesDefaultStyle ? InterfaceScale.metric(11) : InterfaceScale.metric(24))
+        .frame(
+            height: usesDefaultStyle
+                ? ChatChromeMetrics.composerControlHeight
+                : ChatChromeMetrics.controlHeight
+        )
+        .glassEffect(.regular, in: shape)
+        .padding(.horizontal, ChatChromeMetrics.composerWindowInset)
+        .padding(.bottom, ChatChromeMetrics.composerWindowInset)
+    }
+}
+
+extension DisabledComposerView where Accessory == EmptyView {
+    init(message: String, appearance: ComposerBarAppearance, timeoutUntil: Date? = nil) {
+        self.init(message: message, appearance: appearance, timeoutUntil: timeoutUntil) { EmptyView() }
+    }
+}
+
+private struct HiddenChannelView: View {
+    let channel: Channel
+    let lastMessageDate: Date?
+    let lastPinDate: Date?
+    let allowedPrincipals: [HiddenChannelAccessPrincipal]
+
+    var body: some View {
+        GeometryReader { geometry in
+            ScrollView {
+                VStack(spacing: InterfaceScale.metric(14)) {
+                    HiddenChannelHeader(channel: channel)
+
+                    HiddenChannelMetadata(
+                        lastMessageDate: lastMessageDate,
+                        lastPinDate: lastPinDate
+                    )
+
+                    if !allowedPrincipals.isEmpty {
+                        HiddenChannelAllowedPrincipals(principals: allowedPrincipals)
+                            .padding(.top, InterfaceScale.metric(10))
+                    }
+                }
+                .padding(InterfaceScale.metric(32))
+                .frame(maxWidth: .infinity, minHeight: geometry.size.height)
+            }
+        }
+    }
+}
+
+private struct HiddenChannelHeader: View {
+    let channel: Channel
+
+    var body: some View {
+        VStack(spacing: InterfaceScale.metric(14)) {
+            Image(systemName: "lock.fill")
+                .font(.interfaceSystem(size: 38, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: InterfaceScale.metric(82), height: InterfaceScale.metric(82))
+                .background(.quaternary, in: Circle())
+
+            Text(channel.kind == .voice ? "Voice channel chat unavailable" : "This is a hidden text channel")
+                .font(.interface(.title).weight(.bold))
+                .multilineTextAlignment(.center)
+
+            Text(
+                channel.kind == .voice
+                    ? "You cannot see the messages in \(channel.name)."
+                    : "You cannot see the messages in #\(channel.name)."
+            )
+            .font(.interface(.title3))
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct HiddenChannelMetadata: View {
+    let lastMessageDate: Date?
+    let lastPinDate: Date?
+
+    var body: some View {
+        VStack(spacing: InterfaceScale.metric(7)) {
+            if let lastMessageDate {
+                Text(
+                    "Last message created: \(lastMessageDate, format: .dateTime.day().month(.abbreviated).year().hour().minute())"
+                )
+            }
+            if let lastPinDate {
+                Text(
+                    "Last message pin: \(lastPinDate, format: .dateTime.day().month(.abbreviated).year().hour().minute())"
+                )
+            }
+        }
+        .font(.interface(.callout).weight(.semibold))
+        .foregroundStyle(.secondary)
+        .multilineTextAlignment(.center)
+    }
+}
+
+private struct HiddenChannelAllowedPrincipals: View {
+    let principals: [HiddenChannelAccessPrincipal]
+    @State private var isExpanded = true
+
+    var body: some View {
+        VStack(spacing: InterfaceScale.metric(12)) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: InterfaceScale.metric(7)) {
+                    Text("Allowed users and roles:")
+                    Image(systemName: "chevron.up")
+                        .rotationEffect(.degrees(isExpanded ? 0 : 180))
+                        .font(.interface(.callout).weight(.bold))
+                }
+                .font(.interface(.title3).weight(.bold))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+
+            if isExpanded {
+                HiddenChannelPrincipalFlowLayout(horizontalSpacing: InterfaceScale.metric(8), verticalSpacing: InterfaceScale.metric(8)) {
+                    ForEach(principals) { principal in
+                        HiddenChannelPrincipalChip(principal: principal)
+                    }
+                }
+                .frame(maxWidth: InterfaceScale.metric(700))
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+    }
+}
+
+private struct HiddenChannelPrincipalChip: View {
+    let principal: HiddenChannelAccessPrincipal
+
+    private var tint: Color {
+        SakuraCordAccentColor.color(forRoleColorHex: principal.colorHex)
+    }
+
+    var body: some View {
+        HStack(spacing: InterfaceScale.metric(6)) {
+            switch principal.kind {
+            case .member:
+                AvatarView(name: principal.name, url: principal.avatarURL, size: InterfaceScale.metric(21))
+            case .role:
+                RoleColorIndicator(colorHex: principal.colorHex, size: InterfaceScale.metric(9))
+            }
+            Text(principal.name)
+                .font(.interface(.callout).weight(.semibold))
+                .lineLimit(1)
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, InterfaceScale.metric(9))
+        .frame(height: InterfaceScale.metric(30))
+        .background(tint.opacity(0.12), in: Capsule())
+        .overlay {
+            Capsule().stroke(tint.opacity(0.62), lineWidth: 1)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct HiddenChannelPrincipalFlowLayout: Layout {
+    let horizontalSpacing: CGFloat
+    let verticalSpacing: CGFloat
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        plan(proposal: proposal, subviews: subviews).size
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        let result = plan(
+            proposal: ProposedViewSize(width: bounds.width, height: proposal.height),
+            subviews: subviews
+        )
+        let rows = Dictionary(grouping: result.frames.indices) { result.frames[$0].minY }
+        var horizontalOffsets: [CGFloat: CGFloat] = [:]
+        for (rowY, indices) in rows {
+            let rowWidth = indices.map { result.frames[$0].maxX }.max() ?? 0
+            horizontalOffsets[rowY] = max(0, (bounds.width - rowWidth) / 2)
+        }
+        for (index, frame) in result.frames.enumerated() {
+            subviews[index].place(
+                at: CGPoint(
+                    x: bounds.minX + frame.minX + horizontalOffsets[frame.minY, default: 0],
+                    y: bounds.minY + frame.minY
+                ),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(frame.size)
+            )
+        }
+    }
+
+    private func plan(proposal: ProposedViewSize, subviews: Subviews) -> (
+        size: CGSize,
+        frames: [CGRect]
+    ) {
+        let maximumWidth = proposal.width ?? 700
+        let sizes = subviews.map { $0.sizeThatFits(.unspecified) }
+        return InlineWrappingLayoutPlan.frames(
+            sizes: sizes,
+            maximumWidth: maximumWidth,
+            horizontalSpacing: horizontalSpacing,
+            verticalSpacing: verticalSpacing
+        )
+    }
+}
+
+private struct TypingIndicatorView: View {
+    let typingState: TypingStateModel
+    let channelID: ChannelID
+
+    var body: some View {
+        Text(typingState.presentation(in: channelID) ?? " ")
+            .font(.interface(.caption))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, minHeight: InterfaceScale.metric(18), maxHeight: InterfaceScale.metric(18), alignment: .leading)
+            .padding(.horizontal, InterfaceScale.metric(16))
+            .accessibilityHidden(typingState.presentation(in: channelID) == nil)
+    }
+}

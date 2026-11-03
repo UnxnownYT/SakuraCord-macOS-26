@@ -1,0 +1,9198 @@
+import AppKit
+@testable import DiscordProtocol
+import Foundation
+import MessageRendering
+import Observation
+import SakuraCordModels
+import SakuraCordPersistence
+import Testing
+import UserNotifications
+@testable import SakuraCord
+
+@MainActor
+@Test func `server rail projection isolates unrelated guild row updates`() {
+    var first = Guild(id: GuildID(rawValue: 1), name: "First")
+    let second = Guild(id: GuildID(rawValue: 2), name: "Second")
+    let missingID = GuildID(rawValue: 3)
+    let items: [GuildRailItem] = [
+        .guild(first.id),
+        .guild(second.id),
+        .guild(missingID),
+        .folder(
+            GuildFolder(
+                id: 4,
+                name: "Folder",
+                guildIDs: [first.id, missingID, second.id]
+            )
+        ),
+    ]
+    let settings: (Guild) -> GuildNotificationSettings = {
+        GuildNotificationSettings(guildID: $0.id)
+    }
+    let store = ServerRailPresentationStore()
+    store.updateLayout(items)
+    store.updateGuilds(
+        [first.id: first, second.id: second],
+        notificationSettings: settings,
+        isMutationPending: { _ in false }
+    )
+    let baseline = store.items
+    guard case .guild(let firstEntry) = baseline[0],
+          case .guild(let secondEntry) = baseline[1],
+          case .guild(let missingEntry) = baseline[2],
+          case .folder(let folderEntry) = baseline[3]
+    else {
+        Issue.record("Expected the projected server rail layout")
+        return
+    }
+    let secondPresentation = secondEntry.presentation
+
+    first.mentionCount = 1
+    store.updateGuilds(
+        [first.id: first, second.id: second],
+        notificationSettings: settings,
+        isMutationPending: { _ in false }
+    )
+    let updated = store.items
+
+    #expect(baseline.map(\.id) == items.map(\.id))
+    guard case .guild(let updatedFirstEntry) = updated[0],
+          case .guild(let updatedSecondEntry) = updated[1],
+          case .guild(let updatedMissingEntry) = updated[2],
+          case .folder(let updatedFolderEntry) = updated[3]
+    else {
+        Issue.record("Expected the stable projected server rail layout")
+        return
+    }
+    #expect(firstEntry === updatedFirstEntry)
+    #expect(secondEntry === updatedSecondEntry)
+    #expect(missingEntry === updatedMissingEntry)
+    #expect(folderEntry === updatedFolderEntry)
+    #expect(firstEntry.presentation?.guild.mentionCount == 1)
+    #expect(secondEntry.presentation == secondPresentation)
+    #expect(missingEntry.presentation == nil)
+    #expect(folderEntry.mentionCount == 1)
+}
+
+@MainActor
+@Test func `server rail shows only unacknowledged direct messages with one selected item`() {
+    let channel = Channel(
+        id: ChannelID(rawValue: 10),
+        guildID: nil,
+        name: "DM",
+        kind: .directMessage
+    )
+    let store = ServerRailPresentationStore()
+
+    store.updateDirectMessages([channel], unacknowledgedChannelIDs: [channel.id])
+    #expect(store.directMessages.map(\.id) == [channel.id])
+
+    store.updateSelection(nil, channelID: channel.id)
+    #expect(store.directMessages[0].isSelected)
+    #expect(!store.home.isSelected)
+
+    store.updateDirectMessages([channel], unacknowledgedChannelIDs: [])
+    #expect(store.directMessages.isEmpty)
+    #expect(store.home.isSelected)
+}
+
+@MainActor
+@Test func `voice sidebar projection isolates unrelated channel updates`() {
+    let firstChannelID = ChannelID(rawValue: 10)
+    let secondChannelID = ChannelID(rawValue: 20)
+    let firstUserID = UserID(rawValue: 11)
+    let secondUserID = UserID(rawValue: 21)
+    let firstEntry: VoiceSidebarChannelEntry
+    let secondEntry: VoiceSidebarChannelEntry
+    let store = VoiceSidebarPresentationStore()
+
+    firstEntry = store.entry(for: firstChannelID)
+    secondEntry = store.entry(for: secondChannelID)
+    let firstState = VoiceParticipantState(
+        userID: firstUserID,
+        channelID: firstChannelID,
+        guildID: GuildID(rawValue: 1),
+        sessionID: "first"
+    )
+    let secondState = VoiceParticipantState(
+        userID: secondUserID,
+        channelID: secondChannelID,
+        guildID: GuildID(rawValue: 1),
+        sessionID: "second"
+    )
+    let states = [firstUserID: firstState, secondUserID: secondState]
+    var firstMember = Member(
+        user: User(
+            id: firstUserID,
+            username: "first",
+            displayName: "First"
+        ),
+        roleName: "Member",
+        status: .online
+    )
+    let secondMember = Member(
+        user: User(
+            id: secondUserID,
+            username: "second",
+            displayName: "Second"
+        ),
+        roleName: "Member",
+        status: .online
+    )
+    store.update(
+        voiceStates: states,
+        membersByID: [firstUserID: firstMember, secondUserID: secondMember],
+        currentUser: nil,
+        activeVoiceChannel: nil,
+        isVoiceMuted: false,
+        isVoiceDeafened: false,
+        isCameraEnabled: false
+    )
+    let unchangedParticipants = secondEntry.participants
+
+    firstMember = Member(
+        user: User(
+            id: firstUserID,
+            username: "first",
+            displayName: "Renamed First"
+        ),
+        roleName: "Member",
+        status: .online
+    )
+    store.update(
+        voiceStates: states,
+        membersByID: [firstUserID: firstMember, secondUserID: secondMember],
+        currentUser: nil,
+        activeVoiceChannel: nil,
+        isVoiceMuted: false,
+        isVoiceDeafened: false,
+        isCameraEnabled: false
+    )
+
+    #expect(store.entry(for: firstChannelID) === firstEntry)
+    #expect(store.entry(for: secondChannelID) === secondEntry)
+    #expect(firstEntry.participants.map(\.name) == ["Renamed First"])
+    #expect(secondEntry.participants == unchangedParticipants)
+
+    store.update(
+        voiceStates: [secondUserID: secondState],
+        membersByID: [secondUserID: secondMember],
+        currentUser: nil,
+        activeVoiceChannel: nil,
+        isVoiceMuted: false,
+        isVoiceDeafened: false,
+        isCameraEnabled: false
+    )
+
+    #expect(firstEntry.participants.isEmpty)
+    #expect(secondEntry.participants == unchangedParticipants)
+}
+
+@Test func `loading overlap bootstrap keeps measured guild cold`() {
+    let google = Guild(id: GuildID(rawValue: 10), name: "Google Labs")
+    let control = Guild(id: GuildID(rawValue: 20), name: "Control")
+
+    #expect(
+        BootstrapInitialGuildPolicy.resolve(
+            guilds: [google, control],
+            retainedChannel: Channel(id: ChannelID(rawValue: 11), guildID: google.id, name: "general"),
+            avoidingGuildNamed: "google labs"
+        ) == control.id
+    )
+    #expect(
+        BootstrapInitialGuildPolicy.resolve(
+            guilds: [google, control],
+            retainedChannel: Channel(id: ChannelID(rawValue: 11), guildID: google.id, name: "general"),
+            avoidingGuildNamed: nil
+        ) == google.id
+    )
+    let dm = Channel(id: ChannelID(rawValue: 30), guildID: nil, name: "Direct message")
+    #expect(BootstrapInitialGuildPolicy.resolve(
+        guilds: [google, control], retainedChannel: dm, avoidingGuildNamed: nil
+    ) == nil)
+    #expect(BootstrapInitialGuildPolicy.resolve(
+        guilds: [google, control], retainedChannel: nil, avoidingGuildNamed: nil
+    ) == google.id)
+
+}
+
+@MainActor
+@Test func `numbered navigation maps and selects direct messages and eight servers in rail order`() async {
+    let model = AppModel(launchMode: .offlineTesting)
+    let guilds = (1 ... 10).map {
+        Guild(id: GuildID(rawValue: UInt64($0)), name: "Server \($0)")
+    }
+    model.serverRailGuildsByID = Dictionary(
+        uniqueKeysWithValues: guilds.map { ($0.id, $0) }
+    )
+    model.serverRailItems = [
+        .guild(guilds[0].id),
+        .folder(GuildFolder(id: 1, guildIDs: guilds[1 ... 3].map(\.id))),
+        .guild(GuildID(rawValue: 999)),
+        .folder(GuildFolder(id: 2, guildIDs: guilds[4 ... 7].map(\.id))),
+        .guild(guilds[8].id),
+        .guild(guilds[9].id),
+    ]
+
+    #expect(model.navigationDestination(for: 1) == .directMessages)
+    for shortcutNumber in 2 ... 9 {
+        #expect(
+            model.navigationDestination(for: shortcutNumber)
+                == .guild(guilds[shortcutNumber - 2].id)
+        )
+    }
+    #expect(model.navigationDestination(for: 0) == nil)
+    #expect(model.navigationDestination(for: 10) == nil)
+
+    model.navigateUsingShortcut(9)
+    await model.guildActivationTask?.value
+    #expect(model.selectedGuildID == guilds[7].id)
+
+    model.navigateUsingShortcut(1)
+    await model.guildActivationTask?.value
+    #expect(model.selectedGuildID == nil)
+}
+
+@MainActor
+@Test func `switching servers restores each server's last opened channel`() async throws {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    let auroraID = GuildID(rawValue: 100)
+    let nativeLabID = GuildID(rawValue: 101)
+    let rememberedAuroraChannel = try #require(
+        model.snapshot?.channels.first(where: {
+            $0.guildID == auroraID && $0.id == ChannelID(rawValue: 211)
+        })
+    )
+    let rememberedNativeChannel = try #require(
+        model.snapshot?.channels.first(where: {
+            $0.guildID == nativeLabID && $0.id == ChannelID(rawValue: 301)
+        })
+    )
+
+    model.selectedChannelID = rememberedAuroraChannel.id
+    #expect(model.lastOpenedChannelIDsByGuild[auroraID] == rememberedAuroraChannel.id)
+    model.selectGuild(nativeLabID)
+    await model.guildActivationTask?.value
+    model.selectedChannelID = rememberedNativeChannel.id
+    #expect(model.lastOpenedChannelIDsByGuild[nativeLabID] == rememberedNativeChannel.id)
+
+    model.selectGuild(auroraID)
+    await model.guildActivationTask?.value
+    #expect(model.selectedChannelID == rememberedAuroraChannel.id)
+
+    model.selectGuild(nativeLabID)
+    await model.guildActivationTask?.value
+    #expect(model.selectedChannelID == rememberedNativeChannel.id)
+}
+
+@MainActor
+@Test func `message search Escape respects focused and unfocused behavior`() async {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    model.presentMessageSearch()
+    model.messageSearch.queryText = "road"
+    model.messageSearch.isPresented = true
+
+    #expect(!model.consumeEscapeForUnfocusedMessageSearch())
+    #expect(model.messageSearch.queryText == "road")
+
+    model.handleMessageSearchEscape()
+    #expect(model.messageSearch.queryText.isEmpty)
+    #expect(model.messageSearch.isPresented)
+    #expect(model.messageSearch.isInputFocused)
+
+    model.handleMessageSearchEscape()
+    #expect(!model.messageSearch.isPresented)
+    #expect(!model.messageSearch.isInputFocused)
+
+    model.presentMessageSearch()
+    model.messageSearch.queryText = "priority"
+    model.messageSearch.isPresented = true
+    model.messageSearch.isInputFocused = false
+
+    #expect(model.consumeEscapeForUnfocusedMessageSearch())
+    #expect(model.messageSearch.queryText.isEmpty)
+    #expect(model.messageSearch.tokens.isEmpty)
+    #expect(!model.messageSearch.isPresented)
+    #expect(!model.consumeEscapeForUnfocusedMessageSearch())
+}
+
+@Test func `forum navigation keeps the toolbar search surface installed`() {
+    #expect(MessageSearchSurfacePolicy.showsToolbar(
+        channelKind: .forum,
+        hasOpenThread: false
+    ))
+    #expect(!MessageSearchSurfacePolicy.showsToolbar(
+        channelKind: .forum,
+        hasOpenThread: true
+    ))
+}
+
+@Test func `message search keeps guild thread metadata out of canonical channels`() {
+    let guildID = GuildID(rawValue: 100)
+    let thread = Channel(
+        id: ChannelID(rawValue: 300),
+        guildID: guildID,
+        name: "Search result thread",
+        categoryID: ChannelID(rawValue: 200)
+    )
+    let directMessage = Channel(
+        id: ChannelID(rawValue: 400),
+        guildID: nil,
+        name: "Maya",
+        kind: .directMessage
+    )
+    let groupDirectMessage = Channel(
+        id: ChannelID(rawValue: 500),
+        guildID: nil,
+        name: "Release group",
+        kind: .groupDirectMessage
+    )
+
+    let canonicalChannels = MessageSearchChannelMergePolicy
+        .canonicalPrivateChannels(
+            in: [thread, directMessage, groupDirectMessage]
+        )
+
+    #expect(canonicalChannels.map(\.id) == [
+        directMessage.id,
+        groupDirectMessage.id,
+    ])
+}
+
+@MainActor
+@Test func `command f scopes message search to the current conversation`() async throws {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    let channel = try #require(model.selectedChannel)
+
+    model.presentMessageSearchFromCommand()
+
+    let token = try #require(model.messageSearch.tokens.first)
+    guard case .channel(let channelID, let name) = token.kind else {
+        Issue.record("Command-F did not create an in: token")
+        return
+    }
+    #expect(channelID == channel.id)
+    #expect(name == model.messageSearchPresentedName(for: channel))
+    #expect(model.messageSearch.isInputFocused)
+}
+
+@MainActor
+@Test func `channel message cache keeps only the newest bounded history`() {
+    let channelID = ChannelID(rawValue: 9)
+    let author = User(
+        id: UserID(rawValue: 7),
+        username: "cache",
+        displayName: "Cache"
+    )
+    let messages = (0 ..< ChannelMessageCachePolicy.maximumMessageCountPerChannel + 25)
+        .map { index in
+            Message(
+                id: MessageID(rawValue: UInt64(index + 1)),
+                channelID: channelID,
+                author: author,
+                content: "Message \(index)",
+                timestamp: Date(timeIntervalSince1970: TimeInterval(index))
+            )
+        }
+    let retained = ChannelMessageCachePolicy.retainedMessages(from: messages)
+
+    #expect(
+        retained.count
+            == ChannelMessageCachePolicy.maximumMessageCountPerChannel
+    )
+    #expect(retained.first?.id == messages[messages.count - retained.count].id)
+    #expect(retained.last?.id == messages.last?.id)
+}
+
+@MainActor
+@Test func `app model loads demo and sends message`() async {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    #expect(model.snapshot != nil)
+    #expect(model.selectedChannel != nil)
+    #expect(model.supportsCapability(.components))
+    let before = model.messages.count
+    model.updateDraft("hello from test")
+    await model.send()
+    #expect(model.messages.count == before + 1)
+    #expect(model.messages.last?.content == "hello from test")
+}
+
+@MainActor
+@Test func `newest page reconciliation removes covered deletions and preserves live rows`() {
+    let channelID = ChannelID(rawValue: 9_100)
+    let author = User(
+        id: UserID(rawValue: 9_101),
+        username: "reconcile",
+        displayName: "Reconcile"
+    )
+    func message(
+        _ value: UInt64,
+        outboxState: OutboxState = .confirmed
+    ) -> Message {
+        Message(
+            id: MessageID(rawValue: value),
+            channelID: channelID,
+            author: author,
+            content: "message \(value)",
+            timestamp: Date(timeIntervalSince1970: TimeInterval(value)),
+            outboxState: outboxState
+        )
+    }
+    let current = [
+        message(1),
+        message(2),
+        message(3),
+        message(5),
+        message(6, outboxState: .sending),
+        message(7),
+    ]
+    let fresh = [message(2), message(4)]
+    let mutations = ConversationRefreshMutations(messages: [
+        message(7).id: .upsert(message(7))
+    ])
+    let refreshed = AppModel.applyingConversationRefreshMutations(
+        mutations,
+        to: fresh
+    )
+
+    // A newest page that does not reach the loaded window replaces it
+    // instead of joining two blocks across unloaded history.
+    let disjointPageIDs = AppModel.reconcilingNewestPage(
+        current: [message(1), message(2), message(6, outboxState: .sending)],
+        fresh: [message(4), message(5)],
+        hasMoreBefore: true
+    ).map(\.id.rawValue)
+    #expect(disjointPageIDs == [4, 5, 6])
+    // Messages after a recorded gap cannot connect the page to older ones.
+    let gapPageIDs = AppModel.reconcilingNewestPage(
+        current: [message(1), message(2), message(5)],
+        fresh: [message(4), message(5)],
+        hasMoreBefore: true,
+        contiguousThrough: message(2).id
+    ).map(\.id.rawValue)
+    #expect(gapPageIDs == [4, 5])
+
+    let partialPageIDs = AppModel.reconcilingNewestPage(
+        current: current,
+        fresh: refreshed,
+        hasMoreBefore: true,
+        authoritativeOldestMessageID: fresh.map(\.id).min()
+    ).map(\.id.rawValue)
+    let completePageIDs = AppModel.reconcilingNewestPage(
+        current: current,
+        fresh: refreshed,
+        hasMoreBefore: false,
+        authoritativeOldestMessageID: fresh.map(\.id).min()
+    ).map(\.id.rawValue)
+
+    // The in-flight send stays below settled messages.
+    #expect(partialPageIDs == [1, 2, 4, 7, 6])
+    #expect(completePageIDs == [2, 4, 7, 6])
+}
+
+@MainActor
+@Test func `inaccessible private channels remain visible but are excluded from unread state`() async {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    let privateChannelID = ChannelID(rawValue: 215)
+
+    #expect(await until {
+        model.readState.entries[privateChannelID]?.isAccessible == false
+    })
+    let privateChannel = model.visibleChannels.first { $0.id == privateChannelID }
+    #expect(privateChannel != nil)
+    #expect(privateChannel.map(model.conversationAccess(for:)) == .hidden)
+    #expect(model.hiddenChannelIDs.contains(privateChannelID))
+    #expect(!model.isChannelUnread(privateChannelID))
+    #expect(model.channelMentionCount(privateChannelID) == 0)
+
+    model.selectedChannelID = privateChannelID
+    #expect(await until {
+        model.selectedChannel?.id == privateChannelID
+            && model.selectedChannel.map(model.conversationAccess(for:)) == .hidden
+    })
+}
+
+@MainActor
+@Test func `selecting an inaccessible text channel performs no message read`() async throws {
+    let provider = InaccessibleChannelRequestCountingProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let channel = try hiddenMockChannel(kind: .text, in: model)
+
+    model.selectedChannelID = channel.id
+    try await Task.sleep(for: .milliseconds(40))
+
+    #expect(model.selectedConversationAccess == .hidden)
+    #expect(await provider.messageRequestCount(for: channel.id) == 0)
+    #expect(!model.isLoadingMessages)
+    #expect(model.messages.isEmpty)
+}
+
+@MainActor
+@Test func `unresolved channel waits for readable access before loading`() async throws {
+    let provider = InaccessibleChannelRequestCountingProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    var snapshot = try #require(model.snapshot)
+    var guild = try #require(snapshot.guilds.first)
+    guild.currentUserPermissions = nil
+    let guildIndex = try #require(snapshot.guilds.firstIndex { $0.id == guild.id })
+    snapshot.guilds[guildIndex] = guild
+    let channel = Channel(
+        id: ChannelID(rawValue: 77_150),
+        guildID: guild.id,
+        name: "permission-loading",
+        kind: .text,
+        lastMessageID: MessageID(rawValue: 77_151)
+    )
+    snapshot.channels.append(channel)
+    model.snapshot = snapshot
+    model.serverRailGuildsByID[guild.id] = guild
+    model.selectedGuildID = guild.id
+    model.currentUserRoleIDsByGuild[guild.id] = nil
+    model.membersByGuildID[guild.id] = nil
+    model.guildRolesByGuildID[guild.id] = nil
+    model.membersByID = [:]
+    model.guildRoles = []
+    model.refreshUnreadPresentation(appliesAccessImmediately: true)
+
+    #expect(model.conversationAccess(for: channel) == .checking)
+    #expect(model.checkingChannelIDs.contains(channel.id))
+    #expect(model.readState.entries[channel.id]?.isAccessible == false)
+    let checkingVoice = Channel(
+        id: ChannelID(rawValue: 77_152),
+        guildID: guild.id,
+        name: "permission-loading-voice",
+        kind: .voice
+    )
+    #expect(!model.canJoinVoice(checkingVoice))
+
+    model.selectedChannelID = channel.id
+    try await Task.sleep(for: .milliseconds(40))
+    #expect(await provider.messageRequestCount(for: channel.id) == 0)
+
+    guild.currentUserPermissions = .max
+    var resolvedSnapshot = try #require(model.snapshot)
+    let resolvedGuildIndex = try #require(
+        resolvedSnapshot.guilds.firstIndex { $0.id == guild.id }
+    )
+    resolvedSnapshot.guilds[resolvedGuildIndex] = guild
+    model.snapshot = resolvedSnapshot
+    model.serverRailGuildsByID[guild.id] = guild
+    model.currentUserRoleIDsByGuild[guild.id] = []
+    model.refreshUnreadPresentation(appliesAccessImmediately: true)
+
+    #expect(await until {
+        model.selectedConversationAccess.isReadable
+            && !model.checkingChannelIDs.contains(channel.id)
+    })
+    #expect(await until {
+        !model.isLoadingMessages
+    })
+    #expect(await provider.messageRequestCount(for: channel.id) == 1)
+}
+
+@MainActor
+@Test func `bootstrap membership gates onboarding without guessing and guide visibility follows resources or tasks`() async throws {
+    let model = AppModel(launchMode: .offlineTesting)
+    var snapshot = try await MockChatProvider().bootstrap()
+    let guildID = try #require(snapshot.guilds.first?.id)
+    snapshot.guilds[0].features.formUnion(["COMMUNITY", "GUILD_ONBOARDING", "GUILD_SERVER_GUIDE"])
+    var member = Member(user: snapshot.currentUser, roleName: "", isOnline: false)
+    member.flags = 98
+    member.joinedAt = .now.addingTimeInterval(-10 * 24 * 60 * 60)
+    snapshot.currentMembersByGuildID[guildID] = member
+    await model.applyBootstrap(snapshot, publishesSessionState: false)
+    model.selectedGuildID = guildID
+    #expect(model.onboardingMember(in: guildID)?.flags == 98)
+    #expect(model.onboardingEntryGuildID == nil)
+    #expect(!model.hasGuildGuide(in: guildID))
+
+    let resource = Channel(id: .init(rawValue: 77161), guildID: guildID, name: "handbook", kind: .text, flags: 128)
+    snapshot.channels.append(resource)
+    model.consumeSnapshotChanged(snapshot)
+    #expect(model.hasGuildGuide(in: guildID))
+    snapshot.channels.removeAll { $0.id == resource.id }
+    member.flags = 9
+    member.joinedAt = .now
+    snapshot.currentMembersByGuildID[guildID] = member
+    model.consumeSnapshotChanged(snapshot)
+    #expect(model.onboardingEntryGuildID == guildID)
+    #expect(model.hasGuildGuide(in: guildID))
+    member.flags = 107
+    snapshot.currentMembersByGuildID[guildID] = member
+    model.consumeSnapshotChanged(snapshot)
+    #expect(model.onboardingEntryGuildID == nil)
+    #expect(!model.hasGuildGuide(in: guildID))
+}
+
+@MainActor
+@Test func `flags-only self member updates unlock the sidebar and retry initial history`() async throws {
+    let provider = InaccessibleChannelRequestCountingProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    var snapshot = try #require(model.snapshot)
+    var guild = try #require(snapshot.guilds.first)
+    guild.features.insert("GUILD_ONBOARDING")
+    guild.currentUserPermissions = .max
+    let guildIndex = try #require(snapshot.guilds.firstIndex { $0.id == guild.id })
+    snapshot.guilds[guildIndex] = guild
+    let channel = Channel(id: .init(rawValue: 77160), guildID: guild.id, name: "first-channel", kind: .text)
+    snapshot.channels.append(channel)
+    model.snapshot = snapshot
+    model.serverRailGuildsByID[guild.id] = guild
+    model.selectedGuildID = guild.id
+    model.currentUserRoleIDsByGuild[guild.id] = []
+    let user = try #require(model.currentUser)
+    var member = Member(user: user, roleName: "", isOnline: false)
+    member.flags = nil
+    model.membersByGuildID[guild.id] = [user.id: member]
+    model.onboarding.members[guild.id] = member
+    model.refreshUnreadPresentation(appliesAccessImmediately: true)
+    model.selectedChannelID = channel.id
+    #expect(model.checkingChannelIDs.contains(channel.id))
+    #expect(model.onboardingEntryGuildID == nil)
+    #expect(await provider.messageRequestCount(for: channel.id) == 0)
+
+    member.flags = 11
+    member.isPending = false
+    member.joinedAt = .now
+    model.receiveOnboardingMember(member, guildID: guild.id)
+    #expect(model.hasPendingGuildGuideActions(in: guild.id))
+    #expect(model.onboardingEntryGuildID == nil)
+    #expect(!model.checkingChannelIDs.contains(channel.id))
+    #expect(await until { !model.isLoadingMessages })
+    #expect(await provider.messageRequestCount(for: channel.id) == 1)
+    #expect(model.selectedConversationAccess == .readable(canSend: true))
+    member.flags = 107
+    model.receiveOnboardingMember(member, guildID: guild.id)
+    #expect(!model.hasPendingGuildGuideActions(in: guild.id))
+    member.flags = nil
+    member.isPending = nil
+    model.receiveOnboardingMember(member, guildID: guild.id)
+    #expect(model.onboardingEntryGuildID == nil)
+    #expect(!model.checkingChannelIDs.contains(channel.id))
+    #expect(!model.hasPendingGuildGuideActions(in: guild.id))
+}
+
+@MainActor
+@Test func `selecting an inaccessible forum performs no forum read`() async throws {
+    let provider = InaccessibleChannelRequestCountingProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let channel = try hiddenMockChannel(kind: .forum, in: model)
+
+    model.selectedChannelID = channel.id
+    try await Task.sleep(for: .milliseconds(40))
+
+    #expect(model.selectedConversationAccess == .hidden)
+    #expect(await provider.forumRequestCount(for: channel.id) == 0)
+    #expect(model.forumLoadTask == nil)
+}
+
+@MainActor
+@Test func `inaccessible voice performs no history read or join`() async throws {
+    let provider = InaccessibleChannelRequestCountingProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let channel = try hiddenMockChannel(kind: .voice, in: model)
+
+    model.selectedChannelID = channel.id
+    try await Task.sleep(for: .milliseconds(40))
+    #expect(await provider.messageRequestCount(for: channel.id) == 0)
+    #expect(!model.isLoadingMessages)
+    #expect(model.selectedConversationAccess == .hidden)
+    #expect(!model.canJoinVoice(channel))
+
+    await model.joinVoice(channel)
+
+    #expect(await provider.voiceJoinRequestCount() == 0)
+    #expect(model.activeVoiceChannel == nil)
+}
+
+@MainActor
+@Test func `startup snapshot presents channel guild and folder unread without a later event`() async
+    throws
+{
+    let provider = StartupUnreadTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+
+    await model.start()
+
+    let channel = try #require(model.visibleChannels.first)
+    let guild = try #require(model.serverRailGuildsByID[GuildID(rawValue: 77_000)])
+    #expect(channel.unreadCount == 1)
+    #expect(channel.mentionCount == 2)
+    #expect(guild.unreadCount == 1)
+    #expect(guild.mentionCount == 2)
+    #expect(
+        model.serverRailItems
+            == [
+                .folder(
+                    GuildFolder(
+                        id: 77,
+                        name: "Startup",
+                        guildIDs: [GuildID(rawValue: 77_000)]
+                    )
+                )
+            ]
+    )
+}
+
+@MainActor
+@Test func `gateway guild metadata update preserves projected server unread`() async throws {
+    let provider = StartupUnreadTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+
+    let guildID = GuildID(rawValue: 77_000)
+    var gatewayGuild = try #require(model.snapshot?.guilds.first { $0.id == guildID })
+    gatewayGuild.unreadCount = 0
+    gatewayGuild.mentionCount = 0
+
+    model.selectedGuildID = guildID
+    gatewayGuild.name = "Renamed server"
+    model.consumeGuildChanged(gatewayGuild)
+
+    #expect(model.selectedGuild == model.snapshot?.guilds.first { $0.id == guildID })
+    #expect(model.messageSearchPromptTitle == "Search Renamed server")
+    #expect(model.currentUser == model.snapshot?.currentUser)
+    model.selectedGuildID = nil
+    #expect(model.selectedGuild == nil)
+    #expect(model.messageSearchPromptTitle == "Search in DMs")
+
+    #expect(model.serverRailGuildsByID[guildID]?.unreadCount == 1)
+    #expect(model.serverRailGuildsByID[guildID]?.mentionCount == 2)
+    #expect(model.snapshot?.guilds.first { $0.id == guildID }?.unreadCount == 1)
+}
+
+@MainActor
+@Test func `gateway guild layout update preserves projected server unread`() async throws {
+    let provider = StartupUnreadTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+
+    let guildID = GuildID(rawValue: 77_000)
+    var gatewayGuild = try #require(model.snapshot?.guilds.first { $0.id == guildID })
+    gatewayGuild.unreadCount = 0
+    gatewayGuild.mentionCount = 0
+    let railItems = model.serverRailItems
+
+    model.consumeGuildLayoutChanged(guilds: [gatewayGuild], railItems: railItems)
+
+    #expect(model.serverRailGuildsByID[guildID]?.unreadCount == 1)
+    #expect(model.serverRailGuildsByID[guildID]?.mentionCount == 2)
+    #expect(model.snapshot?.guilds.first { $0.id == guildID }?.unreadCount == 1)
+}
+
+@MainActor
+@Test func `untouched server keeps authoritative unread while permissions are checking`() async
+    throws
+{
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+
+    let guildID = GuildID(rawValue: 77_100)
+    let unreadChannelID = ChannelID(rawValue: 77_101)
+    let unknownChannelID = ChannelID(rawValue: 77_102)
+    var refreshed = try #require(model.snapshot)
+    refreshed.guilds.append(
+        Guild(
+            id: guildID,
+            name: "Untouched server",
+            defaultMessageNotifications: .allMessages
+        )
+    )
+    refreshed.guildRailItems.append(.guild(guildID))
+    refreshed.channels.append(contentsOf: [
+        Channel(
+            id: unreadChannelID,
+            guildID: guildID,
+            name: "authoritative-unread",
+            lastMessageID: MessageID(rawValue: 12)
+        ),
+        Channel(
+            id: unknownChannelID,
+            guildID: guildID,
+            name: "no-read-state",
+            lastMessageID: MessageID(rawValue: 22)
+        ),
+    ])
+    refreshed.readStates.append(
+        ChannelReadState(
+            channelID: unreadChannelID,
+            lastAcknowledgedMessageID: MessageID(rawValue: 10),
+            mentionCount: 2
+        )
+    )
+
+    model.consumeSnapshotChanged(refreshed)
+
+    #expect(model.checkingChannelIDs.contains(unreadChannelID))
+    #expect(model.checkingChannelIDs.contains(unknownChannelID))
+    #expect(model.readState.entries[unreadChannelID]?.isAccessible == true)
+    #expect(model.readState.entries[unknownChannelID]?.isAccessible == false)
+    #expect(model.serverRailGuildsByID[guildID]?.unreadCount == 1)
+    #expect(model.serverRailGuildsByID[guildID]?.mentionCount == 2)
+}
+
+@MainActor
+@Test func `reopening a channel reuses session memory without another history request`() async throws {
+    let provider = ChannelLoadTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let first = try #require(model.visibleChannels.first)
+    let second = try #require(model.visibleChannels.dropFirst().first)
+
+    model.selectedChannelID = first.id
+    await model.channelLoadTask?.value
+    #expect(await provider.requestCount(for: first.id) == 1)
+    let firstMessages = model.messages
+
+    model.selectedChannelID = second.id
+    await model.channelLoadTask?.value
+    model.selectedChannelID = first.id
+    await model.channelLoadTask?.value
+
+    #expect(model.messages == firstMessages)
+    #expect(await provider.requestCount(for: first.id) == 1)
+}
+
+@Test func `local history member resolution prioritizes newest unknown authors and stays bounded`() {
+    let channelID = ChannelID(rawValue: 76_000)
+    let messages = (1 ... 120).map { rawID in
+        let id = UInt64(rawID)
+        return Message(
+            id: MessageID(rawValue: id),
+            channelID: channelID,
+            author: User(
+                id: UserID(rawValue: id),
+                username: "user-\(id)",
+                displayName: "User \(id)"
+            ),
+            content: ""
+        )
+    }
+
+    let requested = LocalHistoryMemberResolution.userIDs(
+        in: messages,
+        known: [UserID(rawValue: 120)]
+    )
+
+    #expect(requested.count == LocalHistoryMemberResolution.maximumUserCount)
+    #expect(requested.first == UserID(rawValue: 119))
+    #expect(requested.last == UserID(rawValue: 20))
+    #expect(!requested.contains(UserID(rawValue: 120)))
+    #expect(!requested.contains(UserID(rawValue: 19)))
+}
+
+@MainActor
+@Test func `guild history resolves missing authors into the timeline member store`() async throws {
+    let provider = LocalHistoryMemberTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+
+    await model.start()
+
+    #expect(await eventually {
+        guard let message = model.messages.first else { return false }
+        return model.authorPresentation(for: message).roleColorHex == 0xFF7900
+    })
+    #expect(await provider.resolutionRequests() == [[UserID(rawValue: 76_101)]])
+    var threadMessage = try #require(model.messages.first)
+    let parentID = threadMessage.channelID
+    threadMessage.channelID = ChannelID(rawValue: 76_003)
+    threadMessage.guildID = nil
+    threadMessage.guildMember = nil
+    model.openThread = MessageThreadSummary(id: threadMessage.channelID, parentID: parentID, name: "Thread")
+    let reply = MessageReplyPreview(message: threadMessage)
+    #expect(model.authorPresentation(for: threadMessage).roleColorHex == 0xFF7900)
+    #expect(model.authorPresentation(for: reply, in: threadMessage).roleColorHex == 0xFF7900)
+    model.inbox.threads[threadMessage.channelID] = model.openThread
+    model.openThread = nil
+    model.selectedGuildID = GuildID(rawValue: 76_999)
+    model.membersByID = [:]
+    model.guildRoles = []
+    #expect(model.authorPresentation(for: threadMessage).roleColorHex == 0xFF7900)
+    #expect(model.authorPresentation(for: reply, in: threadMessage).roleColorHex == 0xFF7900)
+}
+
+@MainActor
+@Test func `history member hydration refreshes only affected message rows`() throws {
+    let model = AppModel(launchMode: .offlineTesting)
+    let channelID = ChannelID(rawValue: 76_400)
+    let affectedAuthor = User(
+        id: UserID(rawValue: 76_401),
+        username: "affected",
+        displayName: "Affected"
+    )
+    let unaffectedAuthor = User(
+        id: UserID(rawValue: 76_402),
+        username: "unaffected",
+        displayName: "Unaffected"
+    )
+    let sourceMessages = [
+        Message(
+            id: MessageID(rawValue: 76_403),
+            channelID: channelID,
+            author: affectedAuthor,
+            content: "Affected row"
+        ),
+        Message(
+            id: MessageID(rawValue: 76_404),
+            channelID: channelID,
+            author: unaffectedAuthor,
+            content: "Unaffected row"
+        ),
+    ]
+    model.replaceSelectedMessages(with: sourceMessages)
+    let affectedRow = try #require(model.messageRows.first)
+    let unaffectedRow = try #require(model.messageRows.last)
+    let previousRowsRevision = model.messageRowsRevision
+    let previousPresentationRevision = model.timelinePresentationRevision
+    let resolvedMember = Member(
+        user: User(
+            id: affectedAuthor.id,
+            username: affectedAuthor.username,
+            displayName: "Resolved nickname"
+        ),
+        roleName: "Resolved",
+        status: .offline,
+        roleID: RoleID(rawValue: 76_405),
+        rolePosition: 1,
+        isRoleCategory: true,
+        roleIDs: [RoleID(rawValue: 76_405)]
+    )
+    let hydrated = LocalHistoryMemberResolution.hydrating(
+        sourceMessages,
+        with: [resolvedMember.id: resolvedMember]
+    )
+
+    model.applySelectedHistoryMemberHydration(
+        hydrated,
+        presentationMessageIDs: [sourceMessages[0].id]
+    )
+
+    #expect(model.messages[0].guildMember != nil)
+    #expect(model.messageRows[0] !== affectedRow)
+    #expect(model.messageRows[0].textPlan == affectedRow.textPlan)
+    #expect(model.messageRows[1] === unaffectedRow)
+    #expect(model.messageRowsRevision == previousRowsRevision &+ 1)
+    #expect(model.timelinePresentationRevision == previousPresentationRevision)
+    let records = try #require(
+        model.messageRowsUpdateJournal.records(
+            after: previousRowsRevision,
+            through: model.messageRowsRevision
+        )
+    )
+    #expect(records.count == 1)
+    let record = try #require(records.first)
+    #expect(record.changedMessageIDs == [sourceMessages[0].id])
+    #expect(!record.invalidatesAllRows)
+}
+
+@MainActor
+@Test func `snapshot refresh preserves the account unread notification mode`() async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let currentUser = try #require(model.snapshot?.currentUser)
+    let guildID = GuildID(rawValue: 78_000)
+    let channelID = ChannelID(rawValue: 78_001)
+    let refreshed = BootstrapSnapshot(
+        currentUser: currentUser,
+        guilds: [
+            Guild(
+                id: guildID,
+                name: "Legacy unread policy",
+                currentUserPermissions: .max,
+                defaultMessageNotifications: .onlyMentions
+            )
+        ],
+        channels: [
+            Channel(
+                id: channelID,
+                guildID: guildID,
+                name: "general",
+                lastMessageID: MessageID(rawValue: 11)
+            )
+        ],
+        members: [],
+        readStates: [
+            ChannelReadState(
+                channelID: channelID,
+                lastAcknowledgedMessageID: MessageID(rawValue: 10)
+            )
+        ],
+        usesNewNotifications: false
+    )
+
+    await provider.emit(.snapshotChanged(refreshed))
+
+    #expect(await until {
+        model.snapshot?.usesNewNotifications == false
+            && model.snapshot?.channels.contains(where: { $0.id == channelID }) == true
+    })
+    #expect(model.isChannelUnread(channelID))
+    #expect(model.serverRailGuildsByID[guildID]?.unreadCount == 1)
+}
+
+@MainActor
+@Test func `workspace replacement removes stale channels and settings and replaces read state`() async throws {
+    let user = User(id: UserID(rawValue: 1), username: "reader", displayName: "Reader")
+    let guildID = GuildID(rawValue: 100)
+    let channelID = ChannelID(rawValue: 200)
+    let removedID = ChannelID(rawValue: 201)
+    let addedID = ChannelID(rawValue: 202)
+    let initial = BootstrapSnapshot(
+        currentUser: user, guilds: [Guild(id: guildID, name: "Fixture", isOwnedByCurrentUser: true)],
+        channels: [
+            Channel(id: channelID, guildID: guildID, name: "Before", lastMessageID: MessageID(rawValue: 900)),
+            Channel(id: removedID, guildID: guildID, name: "Removed", lastMessageID: MessageID(rawValue: 500)),
+        ], members: [], readStates: [
+            ChannelReadState(channelID: channelID, lastAcknowledgedMessageID: MessageID(rawValue: 250), mentionCount: 2, version: 1),
+            ChannelReadState(channelID: removedID, lastAcknowledgedMessageID: MessageID(rawValue: 100), mentionCount: 1, version: 1),
+        ], notificationSettings: [GuildNotificationSettings(guildID: guildID, isMuted: true)]
+    )
+    let model = AppModel(launchMode: .offlineTesting, provider: MockChatProvider(snapshot: initial, messages: []))
+    await model.start()
+    model.selectedChannelID = channelID
+    await model.channelLoadTask?.value
+    model.readState.completeAcknowledgement(token: "cleared-token", sentWith: nil)
+    model.readState.acknowledge(channelID: channelID, messageID: MessageID(rawValue: 900))
+    var replacement = initial
+    replacement.channels = [
+        Channel(id: channelID, guildID: guildID, name: "After", lastMessageID: MessageID(rawValue: 1000)),
+        Channel(id: addedID, guildID: guildID, name: "Added", lastMessageID: MessageID(rawValue: 1100)),
+    ]
+    replacement.readStates = [
+        ChannelReadState(channelID: channelID, lastAcknowledgedMessageID: MessageID(rawValue: 850), mentionCount: 1, version: 2),
+        ChannelReadState(channelID: addedID, lastAcknowledgedMessageID: MessageID(rawValue: 1000), mentionCount: 1, version: 2),
+    ]
+    replacement.notificationSettings = []
+    model.consumeSnapshotChanged(replacement)
+    await model.guildActivationTask?.value
+    #expect(model.selectedChannel?.name == "After")
+    #expect(model.visibleChannels.map(\.id) == [channelID, addedID])
+    #expect(model.readState.entries[removedID] == nil)
+    #expect(model.readState.entries[addedID]?.lastAcknowledgedMessageID == MessageID(rawValue: 1000))
+    #expect(model.readState.notificationSettings(guildID: guildID) == nil)
+    // As Discord's CONNECTION_OPEN, READY overrides an unconfirmed read.
+    #expect(model.readState.entries[channelID]?.lastAcknowledgedMessageID == MessageID(rawValue: 850))
+    #expect(model.readState.acknowledgementToken == nil)
+}
+
+@MainActor
+@Test func `gateway ready refreshes the account unread notification mode`() async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let guildID = GuildID(rawValue: 79_000)
+    let channelID = ChannelID(rawValue: 79_001)
+    let currentUser = try #require(model.snapshot?.currentUser)
+    let refreshed = BootstrapSnapshot(
+        currentUser: currentUser,
+        guilds: [
+            Guild(
+                id: guildID,
+                name: "Reconnect policy",
+                currentUserPermissions: .max,
+                defaultMessageNotifications: .onlyMentions
+            )
+        ],
+        channels: [
+            Channel(
+                id: channelID,
+                guildID: guildID,
+                name: "general",
+                lastMessageID: MessageID(rawValue: 11)
+            )
+        ],
+        members: [],
+        readStates: [
+            ChannelReadState(
+                channelID: channelID,
+                lastAcknowledgedMessageID: MessageID(rawValue: 10)
+            )
+        ],
+        usesNewNotifications: true
+    )
+    await provider.emit(.snapshotChanged(refreshed))
+    #expect(await until {
+        model.snapshot?.usesNewNotifications == true
+            && model.snapshot?.channels.contains(where: { $0.id == channelID }) == true
+    })
+    #expect(!model.isChannelUnread(channelID))
+
+    await provider.emit(
+        .notificationModeChanged(usesNewNotifications: false)
+    )
+
+    #expect(await until {
+        model.snapshot?.usesNewNotifications == false
+    })
+    #expect(model.isChannelUnread(channelID))
+    #expect(await until {
+        model.serverRailGuildsByID[guildID]?.unreadCount == 1
+    })
+}
+
+@MainActor
+@Test func `reaction gateway updates reconcile forum previews and open threads without reload`() async
+    throws
+{
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let forum = try #require(model.snapshot?.channels.first(where: { $0.kind == .forum }))
+
+    model.selectedChannelID = forum.id
+    #expect(await until { model.hasLoadedForumPosts && !model.forumPosts.isEmpty })
+    let post = try #require(model.forumPosts.first)
+    let starter = try #require(post.firstMessage)
+    model.open(post)
+    #expect(await until { !model.isLoadingThread && !model.threadMessages.isEmpty })
+
+    await provider.emit(
+        .messageReactionUpdated(
+            .add(
+                channelID: post.id,
+                messageID: starter.id,
+                userID: UserID(rawValue: 55_555),
+                emoji: "<:gateway_blob:999>",
+                kind: .normal
+            )
+        )
+    )
+
+    #expect(
+        await until {
+            model.threadMessages.first(where: { $0.id == starter.id })?
+                .reactions.contains(where: { $0.id == "custom:999" }) == true
+                && model.forumPosts.first(where: { $0.id == post.id })?
+                    .firstMessage?.reactions.contains(where: { $0.id == "custom:999" }) == true
+        }
+    )
+
+    await provider.emit(
+        .messageReactionUpdated(
+            .removeEmoji(
+                channelID: post.id,
+                messageID: starter.id,
+                emoji: "<a:renamed_gateway_blob:999>"
+            )
+        )
+    )
+    #expect(
+        await until {
+            model.threadMessages.first(where: { $0.id == starter.id })?
+                .reactions.contains(where: { $0.id == "custom:999" }) == false
+                && model.forumPosts.first(where: { $0.id == post.id })?
+                    .firstMessage?.reactions.contains(where: { $0.id == "custom:999" }) == false
+        }
+    )
+}
+
+@MainActor
+@Test func `rapid reaction clicks publish only the latest state per message and emoji`() async throws {
+    let provider = ReactionMutationTestProvider()
+    let model = reactionMutationTestModel(provider: provider)
+    await model.start()
+    let message = try #require(model.messages.first)
+
+    let initialRowsRevision = model.messageRowsRevision
+    await model.toggleReaction("🔥", on: message)
+    #expect(model.messages.first?.reactions.first?.didCurrentUserReact == true)
+    #expect(model.messageRows.first?.message.reactions.first?.didCurrentUserReact == true)
+    #expect(model.messageRowsRevision > initialRowsRevision)
+    await model.toggleReaction("🔥", on: message)
+    #expect(model.messages.first?.reactions.isEmpty == true)
+    #expect(model.messageRows.first?.message.reactions.isEmpty == true)
+    await model.toggleReaction("🔥", on: message)
+    #expect(model.messages.first?.reactions.first?.didCurrentUserReact == true)
+
+    #expect(await drainReactionMutations(in: model))
+    #expect(await provider.requests() == [.init(messageID: message.id, emoji: "🔥", reacted: true)])
+}
+
+@MainActor
+@Test func `reaction clicks that return to confirmed state issue no request`() async throws {
+    let provider = ReactionMutationTestProvider()
+    let model = reactionMutationTestModel(provider: provider)
+    await model.start()
+    let message = try #require(model.messages.first)
+
+    for _ in 0 ..< 20 {
+        await model.toggleReaction("🔥", on: message)
+    }
+
+    #expect(await drainReactionMutations(in: model))
+    #expect(await provider.requests().isEmpty)
+    #expect(model.messages.first?.reactions.isEmpty == true)
+}
+
+@MainActor
+@Test func `reaction mutations stay independent across message and emoji keys`() async throws {
+    let provider = ReactionMutationTestProvider()
+    let model = reactionMutationTestModel(provider: provider)
+    await model.start()
+    let first = try #require(model.messages.first)
+    let second = try #require(model.messages.dropFirst().first)
+
+    await model.toggleReaction("🔥", on: first)
+    await model.toggleReaction("✅", on: first)
+    await model.toggleReaction("🔥", on: second)
+
+    #expect(await drainReactionMutations(in: model))
+    let requests = await provider.requests()
+    #expect(requests.count == 3)
+    #expect(Set(requests.map(\.messageID)) == Set([first.id, second.id]))
+    #expect(Set(requests.map(\.emoji)) == Set(["🔥", "✅"]))
+}
+
+@MainActor
+@Test func `reaction failure reverts only the failed optimistic key`() async throws {
+    let provider = ReactionMutationTestProvider(failingEmoji: "🔥")
+    let model = reactionMutationTestModel(provider: provider)
+    await model.start()
+    let message = try #require(model.messages.first)
+
+    await model.toggleReaction("🔥", on: message)
+    await model.toggleReaction("✅", on: message)
+    #expect(model.messages.first?.reactions.count == 2)
+
+    #expect(await drainReactionMutations(in: model))
+    let reactions = try #require(model.messages.first?.reactions)
+    #expect(reactions.contains(where: { $0.id == "unicode:🔥" }) == false)
+    #expect(reactions.first(where: { $0.id == "unicode:✅" })?.didCurrentUserReact == true)
+}
+
+@MainActor
+@Test func `message updates preserve already loaded reactor avatars`() async throws {
+    let reactor = ReactionReactor(
+        id: UserID(rawValue: 98_200),
+        displayName: "Loaded Reactor",
+        avatarURL: URL(string: "https://cdn.example/reactor.png")
+    )
+    let provider = ReactionMutationTestProvider(
+        initialReaction: Reaction(emoji: "🔥", count: 2, reactors: [reactor])
+    )
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let original = try #require(model.messages.first(where: { !$0.reactions.isEmpty }))
+
+    await provider.emit(
+        .messageUpdated(
+            Message(
+                id: original.id,
+                channelID: original.channelID,
+                author: original.author,
+                content: original.content,
+                reactions: [Reaction(emoji: "🔥", count: 3)]
+            )
+        )
+    )
+
+    #expect(
+        await eventually {
+            let updated = model.messages.first(where: { $0.id == original.id })
+            return updated?.reactions.first?.count == 3
+                && updated?.reactions.first?.reactors == [reactor]
+        }
+    )
+}
+
+@MainActor
+@Test(arguments: [nil, .rateLimited(retryAfter: 1, requestID: nil), .invalidRequest("Retry rejected.")] as [ChatProviderError?])
+func `rate limited reactions stay interactive and retry only once`(retryFailure: ChatProviderError?) async throws {
+    let provider = ReactionMutationTestProvider(
+        failures: [.rateLimited(retryAfter: 1, requestID: nil)] + (retryFailure.map { [$0] } ?? [])
+    )
+    let waiting = AsyncStream<Duration>.makeStream()
+    let release = AsyncStream<Void>.makeStream()
+    defer {
+        waiting.continuation.finish()
+        release.continuation.finish()
+    }
+    let model = reactionMutationTestModel(provider: provider, timing: .init(
+        debounce: .zero,
+        sleepForRateLimit: { delay in
+            waiting.continuation.yield(delay)
+            var iterator = release.stream.makeAsyncIterator()
+            _ = await iterator.next()
+        }
+    ))
+    await model.start()
+    let message = try #require(model.messages.first)
+    await model.toggleReaction("🔥", on: message)
+    var iterator = waiting.stream.makeAsyncIterator()
+    #expect(await iterator.next() == .seconds(1))
+    #expect(model.errorMessage == nil)
+    #expect(model.messages.first?.reactions.first?.didCurrentUserReact == true)
+
+    await model.toggleReaction("🔥", on: message)
+    #expect(model.messages.first?.reactions.isEmpty == true)
+    #expect(model.messageRows.first?.message.reactions.isEmpty == true)
+    await model.toggleReaction("🔥", on: message)
+    #expect(model.messages.first?.reactions.first?.didCurrentUserReact == true)
+    #expect(model.messageRows.first?.message.reactions.first?.didCurrentUserReact == true)
+    #expect(await provider.requests().count == 1)
+    #expect(model.errorMessage == nil)
+
+    release.continuation.yield(())
+    #expect(await drainReactionMutations(in: model))
+    #expect(await provider.requests().map(\.reacted) == [true, true])
+    if let retryFailure {
+        #expect(model.errorMessage == retryFailure.localizedDescription)
+        #expect(model.messages.first?.reactions.isEmpty == true)
+    } else {
+        #expect(model.errorMessage == nil)
+        #expect(model.messages.first?.reactions.first?.didCurrentUserReact == true)
+    }
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `reaction cooldown drops cancelled intent and cleared mutations`(clearMutation: Bool) async throws {
+    let provider = ReactionMutationTestProvider(failures: [.rateLimited(retryAfter: 1, requestID: nil)])
+    let waiting = AsyncStream<Duration>.makeStream()
+    let release = AsyncStream<Void>.makeStream()
+    defer {
+        waiting.continuation.finish()
+        release.continuation.finish()
+    }
+    let model = reactionMutationTestModel(provider: provider, timing: .init(
+        debounce: .zero,
+        sleepForRateLimit: { delay in
+            waiting.continuation.yield(delay)
+            var iterator = release.stream.makeAsyncIterator()
+            _ = await iterator.next()
+        }
+    ))
+    await model.start()
+    let message = try #require(model.messages.first)
+    await model.toggleReaction("🔥", on: message)
+    var iterator = waiting.stream.makeAsyncIterator()
+    #expect(await iterator.next() == .seconds(1))
+    let retry = try #require(model.reactionMutationTasks.values.first)
+
+    if clearMutation {
+        model.clearReactionMutationState()
+    } else {
+        await model.toggleReaction("🔥", on: message)
+        #expect(model.messages.first?.reactions.isEmpty == true)
+    }
+    release.continuation.yield(())
+    await retry.value
+    #expect(await drainReactionMutations(in: model))
+    #expect(await provider.requests().count == 1)
+    #expect(model.errorMessage == nil)
+}
+
+@MainActor
+@Test func `clicks during an in flight reaction collapse to one latest follow up`() async throws {
+    let provider = ReactionMutationTestProvider(blocksFirstRequest: true)
+    let model = reactionMutationTestModel(provider: provider)
+    await model.start()
+    let message = try #require(model.messages.first)
+
+    await model.toggleReaction("🔥", on: message)
+    #expect(await eventually { await provider.requests().count >= 1 })
+    for _ in 0 ..< 9 {
+        await model.toggleReaction("🔥", on: message)
+    }
+    await provider.resumeFirstRequest()
+
+    let expectedRequests = [
+        ReactionMutationRequest(messageID: message.id, emoji: "🔥", reacted: true),
+        ReactionMutationRequest(messageID: message.id, emoji: "🔥", reacted: false),
+    ]
+    #expect(await drainReactionMutations(in: model))
+    #expect(await provider.requests() == expectedRequests)
+    #expect(model.messages.first?.reactions.isEmpty == true)
+}
+
+@MainActor
+@Test func `forum pagination failures preserve posts and can be retried`() async throws {
+    let provider = ForumPaginationTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+
+    #expect(
+        await until {
+            model.hasLoadedForumPosts
+                && model.forumPosts.count == 1
+                && model.hasMoreForumPosts
+        }
+    )
+    let initialPostIDs = model.forumPosts.map(\.id)
+
+    model.updateForumSearch("Recent")
+    #expect(!model.hasMoreForumPosts)
+    await model.loadMoreForumPosts()
+    #expect(await provider.paginationRequestCount() == 0)
+    model.updateForumSearch("")
+    #expect(model.hasMoreForumPosts)
+
+    await model.loadMoreForumPosts()
+
+    #expect(model.forumPosts.map(\.id) == initialPostIDs)
+    #expect(model.forumPostError == nil)
+    #expect(model.forumPaginationError != nil)
+    #expect(model.hasMoreForumPosts)
+
+    await model.loadMoreForumPosts()
+
+    #expect(model.forumPosts.count == 2)
+    #expect(model.forumPaginationError == nil)
+    #expect(!model.hasMoreForumPosts)
+    #expect(await provider.paginationRequestCount() == 2)
+}
+
+@MainActor
+@Test func `opening a forum acknowledges only the parent new post boundary`() async throws {
+    let provider = ForumVisitAcknowledgementTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+
+    #expect(
+        await until {
+            model.hasLoadedForumPosts && model.forumPosts.count == 2
+        }
+    )
+    #expect(await eventually { await !provider.acknowledgements().isEmpty })
+    let acknowledgement = try #require(await provider.acknowledgements().first)
+    #expect(acknowledgement.channelID == provider.forumID)
+    #expect(acknowledgement.messageID.rawValue > provider.newPostID.rawValue)
+    #expect(await provider.acknowledgements().count == 1)
+
+    let newPost = try #require(model.forumPosts.first(where: { $0.id == provider.newPostID }))
+    let unreadPost = try #require(
+        model.forumPosts.first(where: { $0.id == provider.unreadPostID })
+    )
+    #expect(model.readState.isNewForumPost(newPost))
+    #expect(model.shouldEmphasizeForumPost(newPost))
+    #expect(model.shouldEmphasizeForumPost(unreadPost))
+    #expect(!model.isChannelUnread(provider.forumID))
+
+    model.open(newPost)
+    #expect(!model.readState.isNewForumPost(newPost))
+}
+
+@MainActor
+@Test func `forum thread links select their parent and open the post`() async throws {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    let forum = try #require(model.snapshot?.channels.first(where: { $0.kind == .forum }))
+    model.selectedChannelID = forum.id
+    #expect(await until { model.hasLoadedForumPosts && !model.forumPosts.isEmpty })
+    let post = try #require(model.forumPosts.first)
+    let otherChannel = try #require(
+        model.snapshot?.channels.first(where: { $0.guildID == forum.guildID && $0.id != forum.id })
+    )
+
+    model.selectedChannelID = otherChannel.id
+    model.navigate(to: post.thread.guildID, linkedChannelID: post.id)
+
+    #expect(
+        await until {
+            model.selectedChannelID == forum.id && model.openThread?.id == post.id
+        }
+    )
+}
+
+@MainActor
+@Test func `returning to a forum clears the previous forum query state`() async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let forum = try #require(model.snapshot?.channels.first(where: { $0.kind == .forum }))
+    let otherChannel = try #require(
+        model.snapshot?.channels.first {
+            $0.guildID == forum.guildID && $0.id != forum.id && $0.kind != .forum
+        }
+    )
+    let tagID = try #require(forum.availableTags.first?.id)
+
+    model.selectedChannelID = forum.id
+    #expect(await until { model.hasLoadedForumPosts })
+    model.forumSelectedTagIDs = [tagID]
+    model.updateForumSearch("visual")
+    #expect(model.forumSearchText == "visual")
+    #expect(model.forumSelectedTagIDs == [tagID])
+
+    model.selectedChannelID = otherChannel.id
+    model.selectedChannelID = forum.id
+
+    #expect(model.forumSearchText.isEmpty)
+    #expect(model.forumSelectedTagIDs.isEmpty)
+    #expect(!model.hasMoreForumPosts)
+    #expect(
+        await until {
+            model.hasLoadedForumPosts
+                && model.forumSearchText.isEmpty
+                && model.forumSelectedTagIDs.isEmpty
+        }
+    )
+}
+
+@MainActor
+@Test func `returning to a forum keeps its sort and view but not its filters`() async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let forum = try #require(model.snapshot?.channels.first(where: { $0.kind == .forum }))
+    let otherChannel = try #require(
+        model.snapshot?.channels.first {
+            $0.guildID == forum.guildID && $0.id != forum.id && $0.kind != .forum
+        }
+    )
+    let tagID = try #require(forum.availableTags.first?.id)
+
+    model.selectedChannelID = forum.id
+    #expect(await until { model.hasLoadedForumPosts })
+    model.setForumSortOrder(.creationDate)
+    model.setForumLayout(.gallery)
+    model.setForumTagMatch(.matchAll)
+    model.toggleForumFilterTag(tagID)
+
+    model.selectedChannelID = otherChannel.id
+    model.selectedChannelID = forum.id
+
+    #expect(model.forumSortOrder == .creationDate)
+    #expect(model.forumLayout == .gallery)
+    #expect(model.forumTagMatch == .matchAll)
+    #expect(model.forumSelectedTagIDs.isEmpty)
+
+    model.resetForumView()
+    model.selectedChannelID = otherChannel.id
+    model.selectedChannelID = forum.id
+
+    #expect(model.forumSortOrder == (forum.defaultSortOrder ?? .latestActivity))
+    #expect(model.forumTagMatch == forum.defaultTagMatch)
+}
+
+@MainActor
+@Test func `a forum restores its scroll position once per visit unless the query changes`() {
+    let memory = ForumViewMemory(defaults: nil)
+    let forum = ChannelID(rawValue: 10)
+    let position = ForumViewMemory.ScrollPosition(postID: ChannelID(rawValue: 11), offset: 24)
+    memory.rememberScrollPosition(position, for: forum)
+
+    memory.beginVisit(forum)
+    #expect(memory.takePendingRestore(for: ChannelID(rawValue: 12)) == nil)
+    #expect(memory.takePendingRestore(for: forum) == position)
+    // A board rebuilt later in the same visit restores nothing.
+    #expect(memory.takePendingRestore(for: forum) == nil)
+
+    memory.beginVisit(forum)
+    memory.cancelPendingRestore()
+    #expect(memory.takePendingRestore(for: forum) == nil)
+
+    memory.beginVisit(forum)
+    memory.forget(forum)
+    #expect(memory.takePendingRestore(for: forum) == nil)
+    // Forgetting drops the position itself, not just this visit's restore.
+    memory.beginVisit(forum)
+    #expect(memory.takePendingRestore(for: forum) == nil)
+}
+
+@MainActor
+@Test func `a forum's sort and view survive a relaunch until reset`() throws {
+    let suiteName = "forum-view-memory-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let forum = ChannelID(rawValue: 20)
+
+    ForumViewMemory(defaults: defaults)
+        .remember(sortOrder: .creationDate, layout: .gallery, tagMatch: .matchAll, for: forum)
+
+    let relaunched = ForumViewMemory(defaults: defaults)
+    let saved = try #require(relaunched.preferences(for: forum))
+    #expect(saved.sortOrder == .creationDate)
+    #expect(saved.layout == .gallery)
+    #expect(saved.tagMatch == .matchAll)
+
+    relaunched.forget(forum)
+    #expect(ForumViewMemory(defaults: defaults).preferences(for: forum) == nil)
+}
+
+@MainActor
+@Test func `ordinary linked channels load their guild before forum resolution`() async {
+    let provider = LinkedChannelNavigationTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let target = provider.targetChannel
+
+    model.navigate(to: target.guildID, linkedChannelID: target.id)
+
+    #expect(
+        await until {
+            model.selectedGuildID == target.guildID
+                && model.selectedChannelID == target.id
+        }
+    )
+    #expect(await provider.forumPostRequestCount() == 0)
+}
+
+@MainActor
+@Test func `forum catalogue omissions keep the open post open and listed`() async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let forum = try #require(model.snapshot?.channels.first(where: { $0.kind == .forum }))
+
+    model.selectedChannelID = forum.id
+    #expect(await until { model.hasLoadedForumPosts && !model.forumPosts.isEmpty })
+    let post = try #require(model.forumPosts.first)
+    model.open(post)
+    #expect(model.openThread?.id == post.id)
+    let synced = ForumPost(thread: MessageThreadSummary(
+        id: ChannelID(rawValue: 999_003), guildID: forum.guildID, parentID: forum.id, name: "Synced post"
+    ))
+
+    // Omission from a catalogue is not deletion; only THREAD_DELETE closes it.
+    await provider.emit(
+        .forumPostsChanged(
+            channelID: forum.id,
+            posts: model.forumPosts.filter { $0.id != post.id } + [synced]
+        )
+    )
+
+    #expect(await until { model.forumPosts.contains { $0.id == synced.id } })
+    #expect(model.openThread?.id == post.id)
+    #expect(model.forumPosts.contains { $0.id == post.id })
+}
+
+@MainActor
+@Test func `inbox navigation resolves a thread no local projection knows`() async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let forum = try #require(model.snapshot?.channels.first(where: { $0.kind == .forum }))
+    let otherChannel = try #require(model.snapshot?.channels.first {
+        $0.guildID == forum.guildID && $0.kind == .text
+    })
+    let page = try await provider.forumPosts(in: forum.id, query: ForumPostQuery(limit: 100))
+    let post = try #require(page.posts.first { $0.firstMessage != nil })
+    var message = try #require(post.firstMessage)
+    message.guildID = forum.guildID
+    model.selectedChannelID = otherChannel.id
+    // The background inbox metadata lookup has not completed.
+    model.snapshot?.threads.removeAll { $0.id == post.id }
+    model.snapshot?.activeJoinedThreads.removeAll { $0.id == post.id }
+    model.inbox.threads = [:]
+
+    model.navigateToInboxResult(message)
+
+    #expect(await until { model.selectedChannelID == forum.id && model.openThread?.id == post.id })
+    #expect(model.errorMessage == nil)
+}
+
+@MainActor
+@Test func `gateway forum catalogues keep forwarding thread destinations current`() async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let forum = try #require(model.snapshot?.channels.first(where: { $0.kind == .forum }))
+    let thread = MessageThreadSummary(
+        id: ChannelID(rawValue: 999_002),
+        guildID: forum.guildID,
+        parentID: forum.id,
+        name: "Forward meow thread"
+    )
+
+    await provider.emit(
+        .forumPostsChanged(
+            channelID: forum.id,
+            posts: [ForumPost(thread: thread)]
+        )
+    )
+    #expect(await until {
+        model.snapshot?.threads.filter { $0.parentID == forum.id } == [thread]
+    })
+
+    await provider.emit(.forumPostsChanged(channelID: forum.id, posts: []))
+    #expect(await until {
+        model.snapshot?.threads.contains { $0.parentID == forum.id } == false
+    })
+}
+
+@MainActor
+@Test func `forum cache events cannot close an ordinary text thread`() async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let channel = try #require(model.snapshot?.channels.first(where: { $0.kind == .text }))
+    model.selectedChannelID = channel.id
+    let thread = MessageThreadSummary(
+        id: ChannelID(rawValue: 999_001),
+        guildID: channel.guildID,
+        parentID: channel.id,
+        name: "Ordinary thread"
+    )
+    model.open(thread)
+
+    await provider.emit(.forumPostsChanged(channelID: channel.id, posts: []))
+    await Task.yield()
+
+    #expect(model.openThread?.id == thread.id)
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `an open private thread a fresh READY omits is withheld from viewing until resolved`(
+    recoversThroughGateway: Bool
+) async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let snapshot = try #require(model.snapshot)
+    let guildID = try #require(model.selectedGuildID)
+    let channel = try #require(snapshot.channels.first { $0.kind == .text && $0.guildID == guildID })
+    let forum = try #require(snapshot.channels.first { $0.kind == .forum && $0.guildID == guildID })
+    // The Gateway case uses a thread the provider cannot look up; the other a
+    // thread its lookup resolves.
+    let resolvable = try #require(
+        try await provider.forumPosts(in: forum.id, query: ForumPostQuery(limit: 100)).posts.first
+    )
+    model.selectedChannelID = channel.id
+    var thread = MessageThreadSummary(
+        id: recoversThroughGateway ? ChannelID(rawValue: 999_005) : resolvable.id,
+        guildID: guildID, parentID: channel.id, name: "Private thread",
+        notificationSettings: ThreadNotificationSettings(), isPrivate: true
+    )
+    model.open(thread)
+    let author = try #require(model.currentUser)
+    let reply = Message(id: MessageID(rawValue: 999_006), channelID: thread.id, author: author, content: "Reply")
+    model.threadDraft = "Unsent draft"
+    model.threadReplyingTo = reply
+    let directory = try ComposerPromisedFileStorage.makeReceivingDirectory()
+    defer { ComposerPromisedFileStorage.removeDirectory(directory) }
+    let file = directory.appendingPathComponent("note.txt")
+    try Data("fixture".utf8).write(to: file)
+    #expect(await model.addPromisedComposerAttachments(
+        ComposerPromisedFileBatch(directory: directory, urls: [file]), to: .thread
+    ))
+    // An already-positioned thread at its read boundary in an active window.
+    _ = model.readState.updatePresentation(
+        channelID: thread.id, isPresented: true, initialHistoryLoaded: true,
+        initialPositionEstablished: true, windowIsActive: true, hasReachedReadBoundary: true
+    )
+    #expect(model.isConversationPresented(thread.id))
+    let newestMessageID = resolvable.firstMessage?.id
+    if !recoversThroughGateway {
+        // Its loaded window misses a message sent while disconnected, although
+        // a history boundary is cached.
+        #expect(await until { model.hasCompletedInitialThreadLoad })
+        model.threadMessages = []
+        #expect(model.hasMoreCache[thread.id] != nil)
+    }
+
+    await provider.emit(.snapshotChanged(snapshot))
+
+    #expect(await until { model.withholdsOpenThreadContent || model.openThread?.isPrivate == false })
+    if recoversThroughGateway {
+        #expect(!model.isConversationPresented(thread.id))
+        #expect(!model.readState.canAcknowledge(thread.id))
+        // The provider cannot resolve this thread: a terminal state, not a spinner.
+        #expect(await until { model.openThreadResolution == .failed })
+        #expect(model.openThreadAccess == .hidden)
+        // A Gateway record carrying the current user's member resolves it.
+        thread.name = "Private thread renamed"
+        await provider.emit(.forumPostsChanged(channelID: channel.id, posts: [ForumPost(thread: thread)]))
+        #expect(await until { model.openThreadResolution == nil && model.openThread?.name == thread.name })
+    } else {
+        #expect(await until { model.openThreadResolution == nil && model.openThread?.isPrivate == false })
+        // Resolution fetched the newest page despite the cached boundary.
+        #expect(await until { model.threadMessages.contains { $0.id == newestMessageID } })
+    }
+    // Resolved in place: the composer keeps its work, and the recreated
+    // timeline must establish its position before acknowledging.
+    #expect(!model.withholdsOpenThreadContent)
+    #expect(model.isConversationPresented(thread.id))
+    #expect(model.readState.presentations[thread.id]?.initialPositionEstablished == false)
+    #expect(model.threadDraft == "Unsent draft")
+    #expect(model.threadReplyingTo?.id == reply.id)
+    #expect(model.composerAttachments(for: .thread).count == 1)
+}
+
+@MainActor
+@Test func `reopening a private thread without membership evidence resolves its access again`() async throws {
+    let provider = ThreadAccessRecoveryTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let thread = provider.memberlessThread
+
+    // The first resolution fails, and the provider holds only a member-less
+    // record, as after a metadata-only THREAD_UPDATE.
+    model.open(thread)
+    #expect(await until { model.openThreadResolution == .failed })
+    model.dismissOpenThread()
+    #expect(model.openThread == nil)
+
+    model.navigate(to: thread.guildID, linkedChannelID: thread.id)
+
+    #expect(await until {
+        model.openThread?.id == thread.id && model.openThreadResolution == nil
+            && model.openThread?.notificationSettings != nil
+    })
+    #expect(await provider.accessResolutionCount() == 2)
+}
+
+@MainActor
+@Test func `directly opening another post retires a pending link navigation`() async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let forum = try #require(model.snapshot?.channels.first(where: { $0.kind == .forum }))
+    let posts = try await provider.forumPosts(in: forum.id, query: ForumPostQuery(limit: 100)).posts
+    let linked = try #require(posts.first { $0.firstMessage != nil })
+    let other = try #require(posts.first { $0.id != linked.id })
+    let messageID = try #require(linked.firstMessage?.id)
+    let target = ConversationNavigationTarget.message(linked.id, messageID, fullWidthThread: false)
+
+    // No navigation task runs before this test suspends, so the link is pending.
+    model.navigate(to: forum.guildID, linkedChannelID: linked.id, messageID: messageID)
+    #expect(model.isNavigating(to: target))
+    model.open(other)
+    #expect(!model.isNavigating(to: target))
+    #expect(model.openThread?.id == other.id)
+
+    model.navigate(to: forum.guildID, linkedChannelID: linked.id, messageID: messageID)
+
+    #expect(await until { model.openThread?.id == linked.id })
+}
+
+@MainActor
+@Test func `creating a thread makes a repeated pending link a new navigation`() async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let guildID = try #require(model.selectedGuildID)
+    let channel = try #require(model.snapshot?.channels.first { $0.kind == .text && $0.guildID == guildID })
+    let forum = try #require(model.snapshot?.channels.first { $0.kind == .forum && $0.guildID == guildID })
+    let linked = try #require(
+        try await provider.forumPosts(in: forum.id, query: ForumPostQuery(limit: 100)).posts
+            .first { $0.firstMessage != nil }
+    )
+    let messageID = try #require(linked.firstMessage?.id)
+    let target = ConversationNavigationTarget.message(linked.id, messageID, fullWidthThread: false)
+    model.selectedChannelID = channel.id
+    var creatable = try #require(model.selectedChannel)
+    let user = try #require(model.currentUser)
+    creatable.permissionOverwrites = [ChannelPermissionOverwrite(
+        id: user.id.description, type: 1, allow: DiscordPermissionBits.createPublicThreads
+    )]
+    model.selectedChannel = creatable
+
+    // No navigation task runs before this test suspends, so the link is pending.
+    model.navigate(to: guildID, linkedChannelID: linked.id, messageID: messageID)
+    #expect(model.isNavigating(to: target))
+    model.beginThreadCreation()
+    #expect(model.threadCreation != nil)
+    #expect(!model.isNavigating(to: target))
+
+    model.navigate(to: guildID, linkedChannelID: linked.id, messageID: messageID)
+
+    #expect(await until { model.openThread?.id == linked.id })
+}
+
+@MainActor
+@Test func `deleting a guild's last channel clears its selection and open thread`() async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let guildID = try #require(model.selectedGuildID)
+    let channel = try #require(model.snapshot?.channels.first {
+        $0.kind == .text && $0.guildID == guildID
+    })
+    model.selectedChannelID = channel.id
+    model.open(MessageThreadSummary(
+        id: ChannelID(rawValue: 999_004), guildID: channel.guildID, parentID: channel.id, name: "Thread"
+    ))
+
+    // An authoritative empty list is removal, unlike a guild not yet loaded.
+    await provider.emit(.channelsChanged(guildID: channel.guildID, channels: []))
+
+    #expect(await until { model.selectedChannelID == nil && model.openThread == nil })
+}
+
+@MainActor
+@Test(arguments: [(false, false), (true, false), (true, true)])
+func `authoritative thread deletion removes open cached and resource conversations`(location: (isOpen: Bool, resourceOnly: Bool)) {
+    let model = AppModel(launchMode: .offlineTesting)
+    let parent = ChannelID(rawValue: 200)
+    let thread = MessageThreadSummary(id: ChannelID(rawValue: 201), parentID: parent, name: "Deleted thread")
+    let author = User(id: UserID(rawValue: 1), username: "author", displayName: "Author")
+    var starter = Message(id: MessageID(rawValue: 201), channelID: parent, author: author, content: "Keep starter")
+    starter.thread = thread
+    let reply = Message(id: MessageID(rawValue: 202), channelID: thread.id, author: author, content: "Reply")
+    let other = Message(id: MessageID(rawValue: 302), channelID: ChannelID(rawValue: 301), author: author, content: "Keep other")
+    if location.resourceOnly {
+        let guildID = GuildID(rawValue: 100)
+        model.selectedGuildID = guildID
+        model.onboarding.presentedGuildID = guildID
+        model.onboarding.page = .guide
+        model.sideConversations.context = .guideResource(guildID, parent)
+        model.guideResource = GuildResourceState(
+            channelID: parent, messages: [starter], rows: [MessageGrouping.resourceRow(for: starter)]
+        )
+    } else {
+        model.storeCachedMessages([starter], for: parent)
+    }
+    model.storeCachedMessages([reply], for: thread.id)
+    model.storeCachedMessages([other], for: other.channelID)
+    model.hasMoreCache[thread.id] = false
+    model.refreshTimelineThreadCards(parentID: parent, posts: [ForumPost(thread: thread, mostRecentMessage: reply)])
+    if location.isOpen {
+        model.openThread = thread
+        model.threadMessages = [reply]
+    }
+
+    model.consumeImmediately(.threadDeleted(channelID: thread.id))
+
+    #expect(model.openThread == nil)
+    #expect(model.threadMessages.isEmpty)
+    #expect(model.messageCache[thread.id] == nil)
+    #expect(model.hasMoreCache[thread.id] == nil)
+    #expect(model.threadPreviewMessages[thread.id] == nil)
+    let retained = location.resourceOnly ? model.presentedGuideResource?.rows.first?.message : model.messageCache[parent]?.first
+    #expect(retained?.thread == nil)
+    #expect(retained?.content == starter.content)
+    #expect(model.messageCache[other.channelID] == [other])
+}
+
+@MainActor
+@Test func `thread send preserves history and confirmation revisions across navigation`() async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let forum = try #require(
+        model.snapshot?.channels.first(where: { $0.kind == .forum })
+    )
+    model.selectedChannelID = forum.id
+    #expect(
+        await until {
+            model.hasLoadedForumPosts
+                && model.forumPosts.contains(where: { !$0.thread.isLocked })
+        }
+    )
+    let post = try #require(
+        model.forumPosts.first(where: { !$0.thread.isLocked })
+    )
+    for index in 0 ..< 3 {
+        _ = try await provider.send(SendMessageDraft(
+            channelID: post.id,
+            content: "Existing reply \(index)"
+        ))
+    }
+    model.open(post)
+    #expect(
+        await eventually {
+            model.hasCompletedInitialThreadLoad
+                && model.openThreadAccess.canSend
+        }
+    )
+    let previousCount = model.threadMessages.count
+    let previousRevision = model.threadMessageRowsRevision
+    model.threadDraft = "one thread timeline mutation"
+
+    #expect(await model.sendThreadComposerMessage(attachments: []))
+    #expect(
+        await until {
+            model.threadMessages.count == previousCount + 1
+        }
+    )
+    await Task.yield()
+
+    #expect(model.threadMessageRowsRevision == previousRevision + 2)
+    #expect(
+        model.threadMessageRowsUpdateHint?.change
+            == .replace(IndexSet(integer: previousCount))
+    )
+    let records = try #require(
+        model.threadMessageRowsUpdateJournal.records(
+            after: previousRevision,
+            through: model.threadMessageRowsRevision
+        )
+    )
+    #expect(records.count == 2)
+    let insertion = try #require(records.first)
+    guard case let .insert(insertedIndexes) = insertion.change else {
+        Issue.record("Expected a bounded optimistic thread insertion hint")
+        return
+    }
+    #expect(insertedIndexes == IndexSet(integer: previousCount))
+    #expect(insertion.insertedMessageIDs.count == 1)
+    #expect(!insertion.invalidatesAllRows)
+    let confirmation = try #require(records.last)
+    #expect(confirmation.revision == model.threadMessageRowsRevision)
+    #expect(confirmation.insertedMessageIDs.isEmpty)
+    let confirmed = try #require(
+        model.threadMessages.first {
+            $0.content == "one thread timeline mutation"
+        }
+    )
+    #expect(confirmation.changedMessageIDs == [confirmed.id])
+    #expect(
+        confirmation.change
+            == .replace(IndexSet(integer: previousCount))
+    )
+    #expect(!confirmation.invalidatesAllRows)
+
+    let expectedIDs = model.threadMessages.map(\.id)
+    #expect(expectedIDs.count == 5)
+    let otherPost = try #require(model.forumPosts.first { $0.id != post.id })
+    for _ in 0 ..< 2 {
+        model.open(otherPost)
+        await model.threadLoadTask?.value
+        model.open(post)
+        await model.threadLoadTask?.value
+
+        #expect(model.threadMessages.map(\.id) == expectedIDs)
+        #expect(model.threadMessageRows.map(\.id) == expectedIDs)
+        #expect(!model.isLoadingThread)
+        #expect(model.hasCompletedInitialThreadLoad)
+    }
+}
+
+@MainActor
+@Test func `Discord channel links accept forum thread URLs without accepting lookalike hosts`() throws {
+    let forumURL = try #require(URL(string: "https://discord.com/channels/100/220"))
+    let lookalikeURL = try #require(URL(string: "https://discord.example/channels/100/220"))
+    guard case let .discordChannel(guildID, channelID) =
+        MessageLinkPolicy.destination(for: forumURL)
+    else {
+        Issue.record("Expected an internal Discord channel destination.")
+        return
+    }
+    #expect(guildID == GuildID(rawValue: 100))
+    #expect(channelID == ChannelID(rawValue: 220))
+    #expect(
+        MessageLinkPolicy.destination(for: lookalikeURL)
+            == .web(lookalikeURL)
+    )
+}
+
+@Test func `cancelled forum searches never become user visible errors`() {
+    #expect(AppModel.isForumLoadCancellation(CancellationError()))
+    #expect(AppModel.isForumLoadCancellation(URLError(.cancelled)))
+    #expect(!AppModel.isForumLoadCancellation(URLError(.timedOut)))
+}
+
+@MainActor
+@Test func `forum creation clears queued upload progress after completion`() async throws {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    let forum = try #require(model.snapshot?.channels.first(where: { $0.kind == .forum }))
+    let tag = try #require(forum.availableTags.first(where: { !$0.isModerated }))
+    model.selectedChannelID = forum.id
+    #expect(await until { model.hasLoadedForumPosts })
+
+    let didCreate = await model.createForumPost(
+        CreateForumPostDraft(
+            channelID: forum.id,
+            title: "Progress lifecycle",
+            content: "The completion state must not be overwritten by a queued callback.",
+            appliedTagIDs: [tag.id]
+        )
+    )
+    await Task.yield()
+
+    #expect(didCreate)
+    #expect(model.forumCreateProgress == nil)
+}
+
+@MainActor
+@Test func `deleting an offline forum post removes its card and closes its thread`() async throws {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    let forum = try #require(model.snapshot?.channels.first(where: { $0.kind == .forum }))
+    let currentUserID = try #require(model.snapshot?.currentUser.id)
+
+    model.selectedChannelID = forum.id
+    #expect(await until { model.hasLoadedForumPosts && !model.forumPosts.isEmpty })
+    let post = try #require(
+        model.forumPosts.first {
+            ($0.thread.ownerID ?? $0.owner?.id) == currentUserID
+        }
+    )
+    model.open(post)
+    #expect(model.openThread?.id == post.id)
+
+    model.deleteSidebarThread(post.thread)
+
+    #expect(await until { !model.forumPosts.contains { $0.id == post.id } && model.openThread == nil })
+    #expect(model.errorMessage == nil)
+}
+
+@Test func `rich message selection copies custom emoji as its discord token`() {
+    let value = NSMutableAttributedString(string: "hello ")
+    let attachment = NSMutableAttributedString(attachment: NSTextAttachment())
+    attachment.addAttribute(
+        .discordEmojiToken,
+        value: "<:wave:123>",
+        range: NSRange(location: 0, length: attachment.length)
+    )
+    value.append(attachment)
+    value.append(NSAttributedString(string: " @Design"))
+
+    #expect(
+        RichMessageCopySerializer.string(
+            from: value,
+            range: NSRange(location: 0, length: value.length)
+        ) == "hello <:wave:123> @Design"
+    )
+}
+
+@MainActor
+@Test func `only supported offline flags select testing mode`() {
+    #expect(AppLaunchConfiguration(arguments: ["SakuraCord"]).mode == .normal)
+    #expect(AppLaunchConfiguration(arguments: ["SakuraCord", "--offline"]).mode == .offlineTesting)
+    let signIn = AppLaunchConfiguration(arguments: ["SakuraCord", "--offline-sign-in"])
+    #expect(signIn.mode == .offlineTesting)
+    #expect(signIn.includesSignInFixture)
+    let longList = AppLaunchConfiguration(arguments: ["SakuraCord", "--offline-long-server-list"])
+    #expect(longList.mode == .offlineTesting)
+    #expect(longList.includesLongServerList)
+    let forumPerformance = AppLaunchConfiguration(
+        arguments: ["SakuraCord", "--offline-forum-performance"]
+    )
+    #expect(forumPerformance.mode == .offlineTesting)
+    #expect(forumPerformance.includesForumPerformanceFixture)
+    let chatPerformance = AppLaunchConfiguration(
+        arguments: ["SakuraCord", "--offline-chat-performance"]
+    )
+    #expect(chatPerformance.mode == .offlineTesting)
+    #expect(chatPerformance.includesChatPerformanceFixture)
+    #expect(!chatPerformance.runsChatPerformanceAutoScroll)
+    let chatAutoScroll = AppLaunchConfiguration(
+        arguments: ["SakuraCord", "--offline-chat-performance-autoscroll"]
+    )
+    #expect(chatAutoScroll.mode == .offlineTesting)
+    #expect(chatAutoScroll.includesChatPerformanceFixture)
+    #expect(chatAutoScroll.runsChatPerformanceAutoScroll)
+    #expect(!chatAutoScroll.runsChatLiveArrivalStress)
+    let chatLiveAutoScroll = AppLaunchConfiguration(
+        arguments: ["SakuraCord", "--offline-chat-performance-live-autoscroll"]
+    )
+    #expect(chatLiveAutoScroll.mode == .offlineTesting)
+    #expect(chatLiveAutoScroll.includesChatPerformanceFixture)
+    #expect(chatLiveAutoScroll.runsChatPerformanceAutoScroll)
+    #expect(chatLiveAutoScroll.runsChatLiveArrivalStress)
+    let chatMediaAutoScroll = AppLaunchConfiguration(
+        arguments: ["SakuraCord", "--offline-chat-media-performance-autoscroll"]
+    )
+    #expect(chatMediaAutoScroll.mode == .offlineTesting)
+    #expect(chatMediaAutoScroll.includesChatPerformanceFixture)
+    #expect(chatMediaAutoScroll.includesChatMediaPerformanceFixture)
+    #expect(chatMediaAutoScroll.runsChatPerformanceAutoScroll)
+    #expect(!chatMediaAutoScroll.runsChatLiveArrivalStress)
+    let pinsAutoScroll = AppLaunchConfiguration(
+        arguments: ["SakuraCord", "--offline-pins-performance-autoscroll"]
+    )
+    #expect(pinsAutoScroll.mode == .offlineTesting)
+    #expect(pinsAutoScroll.includesPinsPerformanceFixture)
+    #expect(pinsAutoScroll.includesChatPerformanceFixture)
+    #expect(pinsAutoScroll.runsPinsPerformanceAutoScroll)
+    let authenticatedAutoScroll = AppLaunchConfiguration(
+        arguments: [
+            "SakuraCord",
+            "--debug-authenticated-chat-performance-autoscroll",
+        ]
+    )
+    #expect(authenticatedAutoScroll.mode == .normal)
+    #expect(!authenticatedAutoScroll.includesChatPerformanceFixture)
+    #expect(authenticatedAutoScroll.runsChatPerformanceAutoScroll)
+    #expect(!authenticatedAutoScroll.runsMemberListPerformanceAutoScroll)
+    #expect(!authenticatedAutoScroll.runsChatLiveArrivalStress)
+    let authenticatedMemberListAutoScroll = AppLaunchConfiguration(
+        arguments: [
+            "SakuraCord",
+            "--debug-authenticated-member-list-performance-autoscroll",
+        ]
+    )
+    #expect(authenticatedMemberListAutoScroll.mode == .normal)
+    #expect(authenticatedMemberListAutoScroll.runsMemberListPerformanceAutoScroll)
+    #expect(!authenticatedMemberListAutoScroll.runsChatPerformanceAutoScroll)
+    let authenticatedGestureScroll = AppLaunchConfiguration(
+        arguments: [
+            "SakuraCord",
+            "--debug-authenticated-gesture-scroll-performance",
+        ]
+    )
+    #expect(authenticatedGestureScroll.mode == .normal)
+    #expect(authenticatedGestureScroll.runsAuthenticatedGestureScrollBenchmark)
+    #expect(authenticatedGestureScroll.runsAnyReadOnlyPerformanceBenchmark)
+    let authenticatedLoadingOverlap = AppLaunchConfiguration(
+        arguments: [
+            "SakuraCord",
+            "--debug-authenticated-loading-scroll-overlap-performance",
+        ]
+    )
+    #expect(authenticatedLoadingOverlap.mode == .normal)
+    #expect(
+        authenticatedLoadingOverlap
+            .runsLoadingScrollOverlapBenchmark
+    )
+    #expect(authenticatedLoadingOverlap.runsAnyReadOnlyPerformanceBenchmark)
+    let incomingPrivateCall = AppLaunchConfiguration(
+        arguments: ["SakuraCord", "--offline-incoming-private-call"]
+    )
+    #expect(incomingPrivateCall.mode == .offlineTesting)
+    #expect(incomingPrivateCall.includesIncomingPrivateCallFixture)
+}
+
+@MainActor
+@Test func `network disabled normal launch stops signed out without mock data`() async {
+    let model = AppModel(launchMode: .normal, discordNetworkDisabledOverride: true)
+    #expect(model.sessionState == .restoring)
+    await model.start()
+
+    #expect(model.sessionState == .signedOut)
+    #expect(model.snapshot == nil)
+    #expect(model.visibleChannels.isEmpty)
+    #expect(!model.isOfflineTesting)
+}
+
+@MainActor
+@Test(arguments: [false, true]) func `offline launch never consults its credential store`(signIn: Bool) async {
+    let credentials = CredentialAccessProbeStore()
+    let model = AppModel(launchMode: .offlineTesting, awaitsOfflineSignIn: signIn, credentialStore: credentials)
+
+    await model.start()
+    if signIn {
+        #expect(model.sessionState == .signedOut)
+        #expect(model.snapshot == nil)
+        #expect(model.isDiscordNetworkingDisabled)
+        #expect(await credentials.accessCount == 0)
+        #expect(await model.completeOfflineSignIn() == nil)
+    }
+
+    #expect(model.sessionState == .workspace)
+    #expect(await credentials.accessCount == 0)
+}
+
+@Test func `performance restore selects its requested stored account`() {
+    let first = CredentialHandle(accountID: "100")
+    let requested = CredentialHandle(accountID: "200")
+    let handles = [first, requested]
+
+    #expect(
+        RestoredCredentialSelectionPolicy.handle(
+            from: handles,
+            preferredAccountID: requested.accountID
+        ) == requested
+    )
+    #expect(
+        RestoredCredentialSelectionPolicy.handle(
+            from: handles,
+            preferredAccountID: "missing"
+        ) == first
+    )
+    #expect(
+        RestoredCredentialSelectionPolicy.handle(
+            from: handles,
+            preferredAccountID: nil
+        ) == first
+    )
+}
+
+@Test func `saved account registry filters removed credentials and remembers the newest account`()
+    async throws
+{
+    let store = UserDefaultsSavedAccountStore(defaults: InMemoryPreferences())
+    let older = SavedAccount(
+        accountID: "100",
+        username: "older",
+        displayName: "Older",
+        lastUsedAt: Date(timeIntervalSince1970: 100)
+    )
+    let newer = SavedAccount(
+        accountID: "200",
+        username: "newer",
+        displayName: "Newer",
+        lastUsedAt: Date(timeIntervalSince1970: 200)
+    )
+
+    await store.record(older)
+    await store.record(newer)
+    let accounts = await store.accounts(matching: [
+        CredentialHandle(accountID: "100"),
+        CredentialHandle(accountID: "200"),
+        CredentialHandle(accountID: "300"),
+    ])
+
+    #expect(accounts.map(\.accountID) == ["200", "100", "300"])
+    #expect(accounts.last?.resolvedSubtitle == "Saved account ••••300")
+    #expect(await store.preferredAccountID() == "200")
+
+    await store.remove(accountID: "200")
+    #expect(await store.preferredAccountID() == nil)
+    #expect(
+        await store.accounts(matching: [CredentialHandle(accountID: "100")])
+            == [older]
+    )
+}
+
+@MainActor
+@Test func `saved account switch reuses credentials and account management logs out selected sessions`()
+    async
+{
+    let firstUser = User(
+        id: UserID(rawValue: 93_000),
+        username: "first",
+        displayName: "First Account"
+    )
+    let secondUser = User(
+        id: UserID(rawValue: 94_000),
+        username: "second",
+        displayName: "Second Account"
+    )
+    let firstProvider = SuspendedBootstrapTestProvider(user: firstUser)
+    let secondProvider = SuspendedBootstrapTestProvider(user: secondUser)
+    let credentials = MultiAccountCredentialStore(accountIDs: ["93000", "94000"])
+    let savedAccounts = SavedAccountStoreSpy()
+    let model = AppModel(
+        launchMode: .normal,
+        discordNetworkDisabledOverride: false,
+        restoresStoredSession: false,
+        credentialStore: credentials,
+        savedAccountStore: savedAccounts,
+        authenticatedProviderFactory: { handle, _ in
+            handle.accountID == "93000" ? firstProvider : secondProvider
+        },
+        accountDatabaseFactory: { _ in nil }
+    )
+    await model.start()
+    await model.refreshSavedAccounts()
+    #expect(model.savedAccounts.map(\.accountID) == ["93000", "94000"])
+
+    let firstConnection = Task {
+        await model.switchAccount(to: "93000")
+    }
+    await firstProvider.waitUntilBootstrapStarts()
+    #expect(model.sessionState == .connecting)
+    #expect(model.isSwitchingAccounts)
+    await firstProvider.releaseBootstrap()
+    #expect(await firstConnection.value)
+    #expect(!model.isSwitchingAccounts)
+    #expect(model.activeAccountID == "93000")
+    #expect(model.savedAccounts.first?.displayName == "First Account")
+
+    let secondConnection = Task {
+        await model.switchAccount(to: "94000")
+    }
+    await secondProvider.waitUntilBootstrapStarts()
+    #expect(model.sessionState == .workspace)
+    #expect(model.isSwitchingAccounts)
+    await secondProvider.releaseBootstrap()
+    #expect(await secondConnection.value)
+    #expect(!model.isSwitchingAccounts)
+    #expect(model.activeAccountID == "94000")
+    #expect(await credentials.accountIDs == ["93000", "94000"])
+    #expect(await credentials.removedAccountIDs.isEmpty)
+    #expect(await savedAccounts.preferredAccountID() == "94000")
+
+    await model.logout(accountID: "93000")
+    #expect(model.sessionState == .workspace)
+    #expect(model.activeAccountID == "94000")
+    #expect(model.savedAccounts.map(\.accountID) == ["94000"])
+    #expect(await credentials.accountIDs == ["94000"])
+    #expect(await credentials.removedAccountIDs == ["93000"])
+    #expect(await savedAccounts.preferredAccountID() == "94000")
+
+    await model.logout()
+    #expect(model.sessionState == .signedOut)
+    #expect(model.activeAccountID == nil)
+    #expect(model.savedAccounts.isEmpty)
+    #expect(await credentials.accountIDs.isEmpty)
+    #expect(await credentials.removedAccountIDs == ["93000", "94000"])
+    #expect(await savedAccounts.preferredAccountID() == nil)
+}
+
+@MainActor
+@Test func `stale bootstrap persistence cannot replace the current account`() async {
+    let savedAccounts = SuspendedSavedAccountStore()
+    let model = AppModel(
+        launchMode: .normal,
+        discordNetworkDisabledOverride: false,
+        restoresStoredSession: false,
+        savedAccountStore: savedAccounts,
+        accountDatabaseFactory: { _ in nil }
+    )
+    model.activeAccountID = "current-account"
+    let staleSession = model.accountSession()
+    let persistence = Task { @MainActor in
+        await model.persistBootstrapAccount(
+            SavedAccount(accountID: "stale-account"),
+            session: staleSession
+        )
+    }
+    await savedAccounts.waitUntilRecordStarts()
+
+    model.invalidateAccountSession()
+    await savedAccounts.releaseRecord()
+    await persistence.value
+
+    #expect(model.activeAccountID == "current-account")
+    #expect(model.savedAccounts.isEmpty)
+    #expect(await savedAccounts.preferredAccountID() == "current-account")
+}
+
+@MainActor
+@Test func `workspace presentation does not wait for initial history`() async {
+    let provider = SuspendedBootstrapTestProvider(suspendsMessages: true)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+
+    let start = Task { await model.start() }
+    await provider.waitUntilBootstrapStarts()
+    await provider.releaseBootstrap()
+    await provider.waitUntilMessageLoadStarts()
+
+    #expect(model.sessionState == .workspace)
+    #expect(model.isLoadingMessages)
+    #expect(model.messages.isEmpty)
+
+    await provider.releaseMessageLoad()
+    await start.value
+    #expect(!model.isLoadingMessages)
+    #expect(model.hasCompletedInitialMessageLoad)
+}
+
+@MainActor
+@Test func `network disabled insecure debug launch prepares its credential store`() async {
+    let credentials = CredentialAccessProbeStore()
+    let model = AppModel(
+        launchMode: .normal,
+        discordNetworkDisabledOverride: true,
+        usesInsecureDebugCredentialsOverride: true,
+        credentialStore: credentials
+    )
+
+    await model.start()
+
+    #expect(model.sessionState == .signedOut)
+    #expect(await credentials.accessCount == 1)
+}
+
+@MainActor
+@Test func `interactive sign in keeps login presentation alive until bootstrap finishes`() async {
+    let provider = SuspendedBootstrapTestProvider()
+    let notifications = PermissionRecordingNotificationService()
+    let model = AppModel(
+        launchMode: .normal,
+        discordNetworkDisabledOverride: false,
+        restoresStoredSession: false,
+        authenticatedProviderFactory: { _, _ in provider },
+        accountDatabaseFactory: { _ in
+            try? SakuraCordDatabase(inMemory: true)
+        },
+        notificationService: notifications
+    )
+    await model.start()
+    #expect(model.sessionState == .signedOut)
+
+    let connection = Task {
+        await model.connectAuthenticatedAccount(
+            CredentialHandle(accountID: "93000"),
+            preservesInteractivePresentation: true
+        )
+    }
+    await provider.waitUntilBootstrapStarts()
+
+    // Switching to `.connecting` here destroys DiscordLoginView, whose
+    // disappearance cancels the task that is performing this bootstrap.
+    #expect(model.sessionState == .signedOut)
+
+    await provider.releaseBootstrap()
+    #expect(await connection.value)
+    #expect(model.sessionState == .workspace)
+    #expect(model.isAuthenticated)
+    #expect(notifications.authorizationRequestCount == 1)
+}
+
+@MainActor
+@Test func `pending sign in persists only after ready and uses the ready account id`() async throws {
+    let pending = try PendingDiscordCredential(
+        Data("pending-session-credential-value".utf8)
+    )
+    let capabilities: Set<ChatCapability> = [.gifs, .stickers, .stickerSending, .forums]
+    let provider = SuspendedBootstrapTestProvider(pendingCredential: pending, capabilities: capabilities)
+    let credentials = PendingCredentialRecordingStore()
+    var openedAccountIDs: [String] = []
+    let model = AppModel(
+        launchMode: .normal,
+        discordNetworkDisabledOverride: false,
+        restoresStoredSession: false,
+        credentialStore: credentials,
+        pendingAuthenticatedProviderFactory: { _, _ in provider },
+        accountDatabaseFactory: { accountID in
+            openedAccountIDs.append(accountID.description)
+            return try? SakuraCordDatabase(inMemory: true)
+        }
+    )
+    await model.start()
+
+    let connection = Task {
+        await model.connectPendingAuthenticatedAccount(
+            pending,
+            preservesInteractivePresentation: true
+        )
+    }
+    await provider.waitUntilBootstrapStarts()
+
+    #expect(await credentials.storedAccountID == nil)
+    #expect(openedAccountIDs.isEmpty)
+    #expect(model.credentialHandle == nil)
+    #expect(model.sessionState == .signedOut)
+
+    await provider.releaseBootstrap()
+    #expect(await connection.value)
+    #expect(await credentials.storedAccountID == "93000")
+    #expect(await credentials.storedCredential == Data("pending-session-credential-value".utf8))
+    #expect(openedAccountIDs == ["93000"])
+    #expect(model.credentialHandle == CredentialHandle(accountID: "93000"))
+    #expect(model.sessionState == .workspace)
+    #expect(model.supportedCapabilities == capabilities)
+}
+
+@MainActor
+@Test func `cancelled pending sign in stores nothing and discards the credential`() async throws {
+    let pending = try PendingDiscordCredential(
+        Data("cancelled-session-credential-value".utf8)
+    )
+    let provider = SuspendedBootstrapTestProvider(pendingCredential: pending)
+    let credentials = PendingCredentialRecordingStore()
+    let model = AppModel(
+        launchMode: .normal,
+        discordNetworkDisabledOverride: false,
+        restoresStoredSession: false,
+        credentialStore: credentials,
+        pendingAuthenticatedProviderFactory: { _, _ in provider },
+        accountDatabaseFactory: { _ in nil }
+    )
+    await model.start()
+
+    let connection = Task {
+        await model.connectPendingAuthenticatedAccount(
+            pending,
+            preservesInteractivePresentation: true
+        )
+    }
+    await provider.waitUntilBootstrapStarts()
+    connection.cancel()
+    await provider.releaseBootstrap()
+
+    #expect(await !(connection.value))
+    #expect(await credentials.storedAccountID == nil)
+    await #expect(throws: PendingDiscordCredentialError.unavailable) {
+        try await provider.persistPendingCredential(
+            to: credentials,
+            accountID: "93000"
+        )
+    }
+    #expect(model.sessionState == .signedOut)
+}
+
+@MainActor
+@Test func `failed pending bootstrap stores nothing and discards the credential`() async throws {
+    let pending = try PendingDiscordCredential(
+        Data("failed-session-credential-value".utf8)
+    )
+    let provider = SuspendedBootstrapTestProvider(
+        bootstrapError: .invalidRequest("fixture pending bootstrap stopped"),
+        pendingCredential: pending
+    )
+    let credentials = PendingCredentialRecordingStore()
+    let model = AppModel(
+        launchMode: .normal,
+        discordNetworkDisabledOverride: false,
+        restoresStoredSession: false,
+        credentialStore: credentials,
+        pendingAuthenticatedProviderFactory: { _, _ in provider },
+        accountDatabaseFactory: { _ in nil }
+    )
+    await model.start()
+
+    let connection = Task {
+        await model.connectPendingAuthenticatedAccount(
+            pending,
+            preservesInteractivePresentation: true
+        )
+    }
+    await provider.waitUntilBootstrapStarts()
+    await provider.releaseBootstrap()
+
+    #expect(await !(connection.value))
+    #expect(await credentials.storedAccountID == nil)
+    await #expect(throws: PendingDiscordCredentialError.unavailable) {
+        try await provider.persistPendingCredential(
+            to: credentials,
+            accountID: "93000"
+        )
+    }
+    #expect(model.sessionState == .signedOut)
+    #expect(model.errorMessage == "fixture pending bootstrap stopped")
+}
+
+private actor CredentialAccessProbeStore: CredentialStore {
+    private(set) var accessCount = 0
+
+    func store(_ credential: Data, accountID: String) async throws -> CredentialHandle {
+        accessCount += 1
+        return CredentialHandle(accountID: accountID)
+    }
+
+    func credential(for handle: CredentialHandle) async throws -> Data {
+        accessCount += 1
+        return Data()
+    }
+
+    func remove(_ handle: CredentialHandle) async throws {
+        accessCount += 1
+    }
+
+    func handles() async throws -> [CredentialHandle] {
+        accessCount += 1
+        return []
+    }
+}
+
+private actor MultiAccountCredentialStore: CredentialStore {
+    private(set) var accountIDs: [String]
+    private(set) var removedAccountIDs: [String] = []
+
+    init(accountIDs: [String]) {
+        self.accountIDs = accountIDs.sorted()
+    }
+
+    func store(_ credential: Data, accountID: String) async throws -> CredentialHandle {
+        if !accountIDs.contains(accountID) {
+            accountIDs.append(accountID)
+            accountIDs.sort()
+        }
+        return CredentialHandle(accountID: accountID)
+    }
+
+    func credential(for handle: CredentialHandle) async throws -> Data {
+        guard accountIDs.contains(handle.accountID) else {
+            throw PendingDiscordCredentialError.unavailable
+        }
+        return Data("stored-account-credential".utf8)
+    }
+
+    func remove(_ handle: CredentialHandle) async throws {
+        accountIDs.removeAll { $0 == handle.accountID }
+        removedAccountIDs.append(handle.accountID)
+    }
+
+    func handles() async throws -> [CredentialHandle] {
+        accountIDs.map(CredentialHandle.init(accountID:))
+    }
+}
+
+private actor SavedAccountStoreSpy: SavedAccountStoring {
+    private var accountsByID: [String: SavedAccount] = [:]
+    private var preferredID: String?
+
+    func accounts(matching handles: [CredentialHandle]) -> [SavedAccount] {
+        handles.map { handle in
+            accountsByID[handle.accountID] ?? SavedAccount(handle: handle)
+        }
+    }
+
+    func preferredAccountID() -> String? {
+        preferredID
+    }
+
+    func record(_ account: SavedAccount) {
+        accountsByID[account.accountID] = account
+        preferredID = account.accountID
+    }
+
+    func markSignInRequired(accountID: String) {
+        var account = accountsByID[accountID] ?? SavedAccount(accountID: accountID)
+        account.signInRequiredAt = .now
+        accountsByID[accountID] = account
+    }
+
+    func remove(accountID: String) {
+        accountsByID.removeValue(forKey: accountID)
+        if preferredID == accountID {
+            preferredID = nil
+        }
+    }
+
+    func setPreferredAccountID(_ accountID: String?) {
+        preferredID = accountID
+    }
+}
+
+private actor SuspendedSavedAccountStore: SavedAccountStoring {
+    private var preferredID: String?
+    private var recordStarted = false
+    private var recordStartWaiters: [CheckedContinuation<Void, Never>] = []
+    private var recordRelease: CheckedContinuation<Void, Never>?
+
+    func accounts(matching handles: [CredentialHandle]) -> [SavedAccount] {
+        handles.map(SavedAccount.init(handle:))
+    }
+
+    func preferredAccountID() -> String? {
+        preferredID
+    }
+
+    func record(_ account: SavedAccount) async {
+        recordStarted = true
+        let waiters = recordStartWaiters
+        recordStartWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withCheckedContinuation { continuation in
+            recordRelease = continuation
+        }
+        preferredID = account.accountID
+    }
+
+    func markSignInRequired(accountID: String) {}
+
+    func remove(accountID: String) {}
+
+    func setPreferredAccountID(_ accountID: String?) {
+        preferredID = accountID
+    }
+
+    func waitUntilRecordStarts() async {
+        guard !recordStarted else { return }
+        await withCheckedContinuation { continuation in
+            recordStartWaiters.append(continuation)
+        }
+    }
+
+    func releaseRecord() {
+        recordRelease?.resume()
+        recordRelease = nil
+    }
+}
+
+private actor PendingCredentialRecordingStore: CredentialStore {
+    private(set) var storedAccountID: String?
+    private(set) var storedCredential: Data?
+
+    func store(_ credential: Data, accountID: String) async throws -> CredentialHandle {
+        storedAccountID = accountID
+        storedCredential = credential
+        return CredentialHandle(accountID: accountID)
+    }
+
+    func credential(for handle: CredentialHandle) async throws -> Data {
+        guard handle.accountID == storedAccountID, let storedCredential else {
+            throw PendingDiscordCredentialError.unavailable
+        }
+        return storedCredential
+    }
+
+    func remove(_ handle: CredentialHandle) async throws {
+        storedAccountID = nil
+        storedCredential = nil
+    }
+
+    func handles() async throws -> [CredentialHandle] {
+        storedAccountID.map { [CredentialHandle(accountID: $0)] } ?? []
+    }
+}
+
+private actor FailingRemovalCredentialStore: CredentialStore {
+    private(set) var accountIDs: [String]
+
+    init(accountID: String) {
+        accountIDs = [accountID]
+    }
+
+    func store(_ credential: Data, accountID: String) async throws -> CredentialHandle {
+        CredentialHandle(accountID: accountID)
+    }
+
+    func credential(for handle: CredentialHandle) async throws -> Data {
+        Data("credential".utf8)
+    }
+
+    func remove(_ handle: CredentialHandle) async throws {
+        throw ChatProviderError.invalidRequest("fixture credential removal failed")
+    }
+
+    func handles() async throws -> [CredentialHandle] {
+        accountIDs.map(CredentialHandle.init(accountID:))
+    }
+}
+
+@MainActor
+@Test func `interactive sign in failure stays signed out and exposes bootstrap error`() async {
+    let provider = SuspendedBootstrapTestProvider(bootstrapError: .invalidRequest("fixture bootstrap stopped"))
+    let notifications = PermissionRecordingNotificationService()
+    let model = AppModel(
+        launchMode: .normal,
+        discordNetworkDisabledOverride: false,
+        restoresStoredSession: false,
+        authenticatedProviderFactory: { _, _ in provider },
+        accountDatabaseFactory: { _ in
+            try? SakuraCordDatabase(inMemory: true)
+        },
+        notificationService: notifications
+    )
+    await model.start()
+
+    let connection = Task {
+        await model.connectAuthenticatedAccount(
+            CredentialHandle(accountID: "93000"),
+            preservesInteractivePresentation: true
+        )
+    }
+    await provider.waitUntilBootstrapStarts()
+    #expect(model.sessionState == .signedOut)
+
+    await provider.releaseBootstrap()
+    #expect(await !(connection.value))
+    #expect(model.sessionState == .signedOut)
+    #expect(model.errorMessage == "fixture bootstrap stopped")
+    #expect(model.provider is SignedOutChatProvider)
+    #expect(model.credentialHandle == nil)
+    #expect(model.database == nil)
+    #expect(await provider.disconnectCount == 1)
+    #expect(notifications.authorizationRequestCount == 0)
+}
+
+@MainActor
+@Test func `rejected saved session requires sign in and keeps the account`() async {
+    let provider = SuspendedBootstrapTestProvider(bootstrapError: .unauthenticated)
+    let credentials = MultiAccountCredentialStore(accountIDs: ["93000"])
+    let savedAccounts = SavedAccountStoreSpy()
+    let model = AppModel(
+        launchMode: .normal,
+        discordNetworkDisabledOverride: false,
+        restoresStoredSession: false,
+        credentialStore: credentials,
+        savedAccountStore: savedAccounts,
+        authenticatedProviderFactory: { _, _ in provider },
+        accountDatabaseFactory: { _ in nil }
+    )
+    await model.start()
+    await model.refreshSavedAccounts()
+    #expect(model.savedAccounts.map(\.requiresSignIn) == [false])
+
+    let connection = Task { await model.switchAccount(to: "93000") }
+    await provider.waitUntilBootstrapStarts()
+    await provider.releaseBootstrap()
+    #expect(await !(connection.value))
+    #expect(model.sessionState == .signedOut)
+    #expect(model.savedAccounts.map(\.requiresSignIn) == [true])
+    let stored = await savedAccounts.accounts(matching: [CredentialHandle(accountID: "93000")])
+    #expect(stored.map(\.requiresSignIn) == [true])
+    #expect(await credentials.accountIDs == ["93000"])
+    #expect(await credentials.removedAccountIDs.isEmpty)
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `cache cleanup failure cannot retain a logged out credential`(hasCredential: Bool) async throws {
+    let credentials = MultiAccountCredentialStore(accountIDs: hasCredential ? ["93000", "94000"] : ["94000"])
+    let savedAccounts = SavedAccountStoreSpy()
+    let model = AppModel(
+        launchMode: .normal, restoresStoredSession: false,
+        credentialStore: credentials, savedAccountStore: savedAccounts
+    )
+    let handle = CredentialHandle(accountID: "93000")
+    model.savedAccounts = [SavedAccount(handle: handle), SavedAccount(handle: CredentialHandle(accountID: "94000"))]
+    var cleanupError: String?
+    do {
+        try await model.removeSavedAccount(accountID: handle.accountID, credentialHandle: hasCredential ? handle : nil) { _ in
+            throw CocoaError(.fileWriteNoPermission)
+        }
+    } catch {
+        cleanupError = error.localizedDescription
+    }
+    #expect(await credentials.accountIDs == ["94000"])
+    #expect(model.savedAccounts.map(\.accountID) == ["94000"])
+    #expect(await savedAccounts.preferredAccountID() == "94000")
+    #expect(cleanupError?.contains("saved account was removed") == true)
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `removing a saved account without a credential still clears derived caches`(switchesAccount: Bool) async throws {
+    let accountID = "missing-\(UUID().uuidString)"
+    let root = try #require(FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first)
+        .appending(path: "dev.sakuracord.SakuraCord")
+    let cacheURLs = ["ForwardSearchPeople/\(accountID).json", "QuickSwitcherChannelStore/\(accountID).json", "EmojiCache/\(accountID)"]
+        .map { root.appending(path: $0) }
+    // An unsaved status edit belongs to the account and leaves with it.
+    let statusKeys = ["dev.sakuracord.pending-status-edit.\(accountID)", "dev.sakuracord.presence.\(accountID)"]
+    defer {
+        for url in cacheURLs { try? FileManager.default.removeItem(at: url) }
+        for key in statusKeys { UserDefaults.standard.removeObject(forKey: key) }
+    }
+    for url in cacheURLs {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("fixture".utf8).write(to: url)
+    }
+    UserDefaults.standard.set(["status": "invisible"], forKey: statusKeys[0])
+    UserDefaults.standard.set("invisible", forKey: statusKeys[1])
+    let savedAccounts = SavedAccountStoreSpy()
+    let model = AppModel(
+        launchMode: .normal, restoresStoredSession: false,
+        credentialStore: MultiAccountCredentialStore(accountIDs: ["94000"]), savedAccountStore: savedAccounts
+    )
+    model.activeAccountID = "94000"
+    model.savedAccounts = [accountID, "94000"].map { SavedAccount(handle: CredentialHandle(accountID: $0)) }
+    if switchesAccount { #expect(await !model.switchAccount(to: accountID)) }
+    else { await model.logout(accountID: accountID) }
+    for url in cacheURLs { #expect(!FileManager.default.fileExists(atPath: url.path)) }
+    for key in statusKeys { #expect(UserDefaults.standard.object(forKey: key) == nil) }
+    #expect(model.savedAccounts.map(\.accountID) == ["94000"])
+    #expect(await savedAccounts.preferredAccountID() == "94000")
+    #expect(model.activeAccountID == "94000")
+}
+
+@MainActor
+@Test func `activity clearing stops at an account change without describing draft deletion`() async throws {
+    let provider = DiscordRESTProvider(
+        credentials: MultiAccountCredentialStore(accountIDs: []), handle: CredentialHandle(accountID: "privacy-fixture"),
+        session: URLSession(configuration: .ephemeral), usesEmojiDiskCache: false, usesForwardSearchPeopleDiskCache: false
+    )
+    let began = AsyncStream<Void>.makeStream()
+    let release = AsyncStream<Void>.makeStream()
+    await provider.installPrivacyClearGate(began: began.continuation, release: release.stream)
+    let model = AppModel(launchMode: .offlineTesting)
+    model.installAccountSession(provider: provider, database: nil)
+    let clearing = Task { try await model.clearLocalActivity() }
+    var iterator = began.stream.makeAsyncIterator()
+    _ = await iterator.next()
+    model.installAccountSession(provider: MockChatProvider(), database: nil)
+    model.draft = "new account draft"
+    model.forwardDestinationHistory = [ChannelID(rawValue: 200)]
+    release.continuation.yield(())
+    do {
+        try await clearing.value
+        Issue.record("Clearing should report the account change")
+    } catch {
+        #expect(error is LocalPrivacyActionError)
+        #expect(error.localizedDescription.contains("local data"))
+        #expect(!error.localizedDescription.contains("draft"))
+    }
+    #expect(model.draft == "new account draft")
+    #expect(model.forwardDestinationHistory == [ChannelID(rawValue: 200)])
+    await provider.disconnect()
+}
+
+private extension DiscordRESTProvider {
+    func installPrivacyClearGate(began: AsyncStream<Void>.Continuation, release: AsyncStream<Void>) {
+        derivedCacheClearDidBeginForTesting = { began.yield(()) }
+        forwardPeopleCacheWriteTask = Task {
+            var iterator = release.makeAsyncIterator()
+            _ = await iterator.next()
+        }
+    }
+}
+
+@MainActor
+@Test func `logout completes locally when saved credential removal fails`() async {
+    let credentials = FailingRemovalCredentialStore(accountID: "93000")
+    let provider = SuspendedBootstrapTestProvider()
+    let model = AppModel(
+        launchMode: .normal,
+        discordNetworkDisabledOverride: false,
+        restoresStoredSession: false,
+        credentialStore: credentials,
+        authenticatedProviderFactory: { _, _ in provider },
+        accountDatabaseFactory: { _ in nil }
+    )
+    await model.start()
+
+    let connection = Task {
+        await model.connectAuthenticatedAccount(
+            CredentialHandle(accountID: "93000")
+        )
+    }
+    await provider.waitUntilBootstrapStarts()
+    await provider.releaseBootstrap()
+    #expect(await connection.value)
+
+    await model.logout()
+
+    #expect(model.sessionState == .signedOut)
+    #expect(!model.isAuthenticated)
+    #expect(model.activeAccountID == nil)
+    #expect(model.credentialHandle == nil)
+    #expect(model.provider is SignedOutChatProvider)
+    #expect(model.errorMessage == "fixture credential removal failed")
+    #expect(await credentials.accountIDs == ["93000"])
+}
+
+@MainActor
+@Test func `failed bootstrap never presents or authenticates a workspace`() async throws {
+    let provider = SuspendedBootstrapTestProvider(
+        bootstrapError: .invalidRequest("fixture bootstrap stopped")
+    )
+    let database = try SakuraCordDatabase(inMemory: true)
+    let notifications = PermissionRecordingNotificationService()
+    let model = AppModel(
+        launchMode: .normal,
+        discordNetworkDisabledOverride: false,
+        restoresStoredSession: false,
+        authenticatedProviderFactory: { _, _ in provider },
+        accountDatabaseFactory: { _ in database },
+        notificationService: notifications
+    )
+    await model.start()
+
+    let connection = Task {
+        await model.connectAuthenticatedAccount(
+            CredentialHandle(accountID: "93100"),
+            preservesInteractivePresentation: true
+        )
+    }
+    await provider.waitUntilBootstrapStarts()
+    // Interactive sign-in keeps the login presentation alive until READY;
+    // critically, it never substitutes the stored workspace while waiting.
+    #expect(model.sessionState == .signedOut)
+    #expect(model.snapshot == nil)
+    #expect(model.serverRailItems.isEmpty)
+    #expect(!model.isAuthenticated)
+
+    await provider.releaseBootstrap()
+    #expect(await !(connection.value))
+    #expect(model.sessionState == .signedOut)
+    #expect(!model.isAuthenticated)
+    #expect(model.snapshot == nil)
+    #expect(model.errorMessage == "fixture bootstrap stopped")
+    #expect(notifications.authorizationRequestCount == 0)
+}
+
+@MainActor
+@Test func `logout cancels account loads and clears every forum surface`() async throws {
+    let oldProvider = SuspendedAccountLoadTestProvider(
+        label: "Old",
+        suspendsLoads: true
+    )
+    let model = AppModel(
+        launchMode: .normal,
+        discordNetworkDisabledOverride: false,
+        restoresStoredSession: false,
+        credentialStore: CredentialAccessProbeStore(),
+        authenticatedProviderFactory: { _, _ in oldProvider },
+        accountDatabaseFactory: { _ in nil }
+    )
+    await model.start()
+    #expect(await model.connectAuthenticatedAccount(
+        CredentialHandle(accountID: "account-load-old")
+    ))
+    #expect(await oldProvider.waitUntilLoadsStart())
+
+    let stalePost = oldProvider.post
+    model.forumPosts = [stalePost]
+    model.forumCataloguePosts = [stalePost]
+    model.forumCatalogueIndexByID = [stalePost.id: 0]
+    model.forumRecentPostCount = 1
+    model.isLoadingForumPosts = true
+    model.isSearchingForumPosts = true
+    model.hasLoadedForumPosts = true
+    model.isLoadingMoreForumPosts = true
+    model.hasMoreForumPosts = true
+    model.forumPostError = "load"
+    model.forumActionError = "action"
+    model.forumPaginationError = "pagination"
+    model.forumCreateProgress = .submitting
+    model.forumSearchText = "stale query"
+    model.forumSelectedTagIDs = [ForumTagID(rawValue: 1)]
+    model.forumSortOrder = .creationDate
+    model.forumLayout = .gallery
+    model.forumTagMatch = .matchAll
+    model.forumNextOffset = 25
+    let staleCallChannelID = ChannelID(rawValue: 98_765)
+    model.privateCallsByChannel[staleCallChannelID] = PrivateCall(
+        channelID: staleCallChannelID,
+        ongoingRings: [
+            PrivateCallRing(
+                recipientID: UserID(rawValue: 1),
+                senderID: UserID(rawValue: 2)
+            ),
+        ]
+    )
+    let memberGeneration = model.memberLoadGeneration
+    let forumGeneration = model.forumLoadGeneration
+    let createGeneration = model.forumCreateGeneration
+
+    await model.logout()
+
+    #expect(model.memberLoadTask == nil)
+    #expect(model.forumLoadTask == nil)
+    #expect(model.memberLoadGeneration > memberGeneration)
+    #expect(model.forumLoadGeneration > forumGeneration)
+    #expect(model.forumCreateGeneration > createGeneration)
+    #expect(model.forumPosts.isEmpty)
+    #expect(model.forumCataloguePosts.isEmpty)
+    #expect(model.forumCatalogueIndexByID.isEmpty)
+    #expect(model.forumRecentPostCount == 0)
+    #expect(!model.isLoadingForumPosts)
+    #expect(!model.isSearchingForumPosts)
+    #expect(!model.hasLoadedForumPosts)
+    #expect(!model.isLoadingMoreForumPosts)
+    #expect(!model.hasMoreForumPosts)
+    #expect(model.forumPostError == nil)
+    #expect(model.forumActionError == nil)
+    #expect(model.forumPaginationError == nil)
+    #expect(model.forumCreateProgress == nil)
+    #expect(model.forumSearchText.isEmpty)
+    #expect(model.forumSelectedTagIDs.isEmpty)
+    #expect(model.forumSortOrder == .latestActivity)
+    #expect(model.forumLayout == .list)
+    #expect(model.forumTagMatch == .matchSome)
+    #expect(model.forumNextOffset == nil)
+    #expect(model.privateCallsByChannel.isEmpty)
+
+    await oldProvider.releaseSuspendedLoads()
+    #expect(await oldProvider.waitUntilLoadsReturn())
+    for _ in 0 ..< 20 { await Task.yield() }
+    #expect(model.members.isEmpty)
+    #expect(model.forumPosts.isEmpty)
+    #expect(model.forumCataloguePosts.isEmpty)
+}
+
+@MainActor
+@Test func `reconnect rejects old provider loads when account IDs are identical`() async throws {
+    let oldProvider = SuspendedAccountLoadTestProvider(
+        label: "Old",
+        suspendsLoads: true
+    )
+    let newProvider = SuspendedAccountLoadTestProvider(
+        label: "New",
+        suspendsLoads: false
+    )
+    let model = AppModel(
+        launchMode: .normal,
+        discordNetworkDisabledOverride: false,
+        restoresStoredSession: false,
+        credentialStore: CredentialAccessProbeStore(),
+        authenticatedProviderFactory: { handle, _ in
+            handle.accountID == "account-load-old" ? oldProvider : newProvider
+        },
+        accountDatabaseFactory: { _ in nil }
+    )
+    await model.start()
+    #expect(await model.connectAuthenticatedAccount(
+        CredentialHandle(accountID: "account-load-old")
+    ))
+    #expect(await oldProvider.waitUntilLoadsStart())
+
+    #expect(await model.connectAuthenticatedAccount(
+        CredentialHandle(accountID: "account-load-new")
+    ))
+    #expect(await until {
+        model.members.first?.user.displayName == "New member"
+            && model.forumPosts.first?.thread.name == "New post"
+    })
+    #expect(model.selectedGuildID == oldProvider.guildID)
+    #expect(model.selectedChannelID == oldProvider.forumID)
+
+    await oldProvider.releaseSuspendedLoads()
+    #expect(await oldProvider.waitUntilLoadsReturn())
+    for _ in 0 ..< 20 { await Task.yield() }
+
+    #expect(model.members.first?.user.displayName == "New member")
+    #expect(model.forumPosts.first?.thread.name == "New post")
+    #expect(model.forumCataloguePosts.first?.thread.name == "New post")
+}
+
+@MainActor
+@Test(.timeLimit(.minutes(1))) func `completed old account send and edit cannot enter replacement account state`()
+    async throws
+{
+    let directory = FileManager.default.temporaryDirectory.appending(
+        path: "sakuracord-account-mutation-race-\(UUID().uuidString)"
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let oldProvider = SuspendedAccountOperationTestProvider(suspendsOperations: true)
+    let newProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let oldDatabase = try SakuraCordDatabase(
+        accountID: AccountID(rawValue: 96_100),
+        directory: directory
+    )
+    let newAccountID = AccountID(rawValue: 96_101)
+    let newDatabase = try SakuraCordDatabase(
+        accountID: newAccountID,
+        directory: directory
+    )
+    let model = AppModel(launchMode: .offlineTesting, provider: oldProvider)
+    model.database = oldDatabase
+    model.selectedChannelID = oldProvider.channelID
+    model.replaceSelectedMessages(with: [oldProvider.editTarget])
+
+    let send = Task { @MainActor in
+        await model.performOutgoingSend(
+            SendMessageDraft(
+                channelID: oldProvider.channelID,
+                content: "old account send"
+            ),
+            isRetry: false
+        )
+    }
+    let edit = Task { @MainActor in
+        await model.edit(oldProvider.editTarget, content: "old account edit")
+    }
+    guard await oldProvider.waitUntilMutationRequestsStart() else {
+        send.cancel()
+        edit.cancel()
+        await oldProvider.releaseMutationRequests()
+        _ = await cancellableValue(of: send)
+        await cancellableValue(of: edit)
+        try #require(Bool(false), "Old account mutations did not start before cancellation")
+        return
+    }
+
+    model.invalidateAccountSession()
+    model.installAccountSession(provider: newProvider, database: newDatabase)
+    var replacementMessage = oldProvider.editTarget
+    replacementMessage.content = "replacement account value"
+    model.replaceSelectedMessages(with: [replacementMessage])
+
+    await oldProvider.releaseMutationRequests()
+    #expect(await !cancellableValue(of: send))
+    await cancellableValue(of: edit)
+
+    #expect(model.messages.map(\.id) == [replacementMessage.id])
+    #expect(model.messages.first?.content == "replacement account value")
+    #expect(
+        model.conversationRefreshJournals.values.allSatisfy {
+            $0.mutationsByMessageID.isEmpty
+        }
+    )
+}
+
+@MainActor
+@Test func `account session identity changes only with an atomically installed provider database pair`() {
+    let firstProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let secondProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let model = AppModel(launchMode: .offlineTesting, provider: firstProvider)
+    let first = model.accountSession()
+    let replacementDatabase = try? SakuraCordDatabase(inMemory: true)
+
+    model.installAccountSession(
+        provider: secondProvider,
+        database: replacementDatabase
+    )
+
+    #expect(!model.isCurrentAccountSession(first))
+    let second = model.accountSession()
+    #expect(model.isCurrentAccountSession(second))
+    #expect(second.installedRevision == first.installedRevision + 1)
+    #expect(second.database === replacementDatabase)
+}
+
+@MainActor
+@Test func `account transition fails closed before reaching the installed provider`() async {
+    let provider = SuspendedAccountOperationTestProvider(suspendsOperations: true)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    model.accountTransitionIsActive = true
+
+    let sent = await model.performOutgoingSend(
+        SendMessageDraft(channelID: provider.channelID, content: "must not leave"),
+        isRetry: false
+    )
+
+    #expect(!sent)
+    #expect(await !provider.sendRequestHasStarted())
+}
+
+@MainActor
+@Test func `a started account transition cannot be superseded by credential reuse`() async {
+    let provider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let model = AppModel(
+        launchMode: .normal,
+        discordNetworkDisabledOverride: false,
+        restoresStoredSession: false,
+        authenticatedProviderFactory: { _, _ in provider }
+    )
+    let generation = model.accountSessionGeneration
+    #expect(await model.accountTransitionCoordinator.acquireIfAvailable())
+
+    let connected = await model.connectAuthenticatedAccount(
+        CredentialHandle(accountID: "account-transition-in-progress")
+    )
+
+    #expect(!connected)
+    #expect(model.accountSessionGeneration == generation)
+    await model.accountTransitionCoordinator.release()
+}
+
+@MainActor
+@Test(.timeLimit(.minutes(1)))
+func `completed old account earlier pages cannot enter replacement conversations`()
+    async throws
+{
+    let directory = FileManager.default.temporaryDirectory.appending(
+        path: "sakuracord-account-pagination-race-\(UUID().uuidString)"
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let oldProvider = SuspendedAccountOperationTestProvider(suspendsOperations: true)
+    let newProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let oldDatabase = try SakuraCordDatabase(
+        accountID: AccountID(rawValue: 96_200),
+        directory: directory
+    )
+    let newAccountID = AccountID(rawValue: 96_201)
+    let newDatabase = try SakuraCordDatabase(
+        accountID: newAccountID,
+        directory: directory
+    )
+    let model = AppModel(launchMode: .offlineTesting, provider: oldProvider)
+    model.database = oldDatabase
+    model.selectedChannelID = oldProvider.channelID
+    model.replaceSelectedMessages(with: [oldProvider.selectedNewest])
+    model.hasMoreMessages = true
+    model.openThread = oldProvider.thread
+    model.threadMessages = [oldProvider.threadNewest]
+    model.threadWindow.lowerCursor = oldProvider.threadNewest.id
+    model.threadWindow.upperCursor = oldProvider.threadNewest.id
+    model.hasMoreThreadMessages = true
+
+    let selectedLoad = Task { @MainActor in await model.loadEarlier() }
+    let threadLoad = Task { @MainActor in await model.loadEarlierThread() }
+    let requestsStarted = await oldProvider.waitUntilEarlierPageRequestsStart(expected: 2)
+    if !requestsStarted {
+        selectedLoad.cancel()
+        threadLoad.cancel()
+        await oldProvider.releaseEarlierPageRequests()
+        await selectedLoad.value
+        await threadLoad.value
+    }
+    try #require(requestsStarted)
+
+    model.invalidateAccountSession()
+    model.installAccountSession(provider: newProvider, database: newDatabase)
+    var replacementSelected = oldProvider.selectedNewest
+    replacementSelected.content = "replacement selected newest"
+    var replacementThread = oldProvider.threadNewest
+    replacementThread.content = "replacement thread newest"
+    model.replaceSelectedMessages(with: [replacementSelected])
+    model.hasMoreMessages = true
+    model.openThread = oldProvider.thread
+    model.threadMessages = [replacementThread]
+    model.hasMoreThreadMessages = true
+    model.isLoadingEarlier = true
+    model.isLoadingEarlierThread = true
+
+    await oldProvider.releaseEarlierPageRequests()
+    await selectedLoad.value
+    await threadLoad.value
+
+    #expect(model.messages.map(\.id) == [replacementSelected.id])
+    #expect(model.messages.first?.content == "replacement selected newest")
+    #expect(model.threadMessages.map(\.id) == [replacementThread.id])
+    #expect(model.threadMessages.first?.content == "replacement thread newest")
+    #expect(model.isLoadingEarlier)
+    #expect(model.isLoadingEarlierThread)
+}
+
+@MainActor
+@Test(.timeLimit(.minutes(1)), arguments: [false, true])
+func `quit warning tracks Discord attachment sends until success or failure`(fails: Bool) async throws {
+    let provider = SuspendedAccountOperationTestProvider(suspendsOperations: true, failsSend: fails)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    let draft = SendMessageDraft(
+        channelID: provider.channelID,
+        content: "attachment",
+        attachments: [ForumPostAttachment(url: URL(filePath: "/tmp/quit-warning-fixture.txt"))]
+    )
+    #expect(!model.generalQuitActivities.contains(.upload))
+    let send = Task { await model.performOutgoingSend(draft, isRetry: false) }
+    let sendStarted = await provider.waitUntilSendRequestStarts()
+    if !sendStarted {
+        send.cancel()
+        await provider.releaseSendRequest()
+        _ = await cancellableValue(of: send)
+    }
+    try #require(sendStarted)
+    #expect(model.generalQuitActivities.contains(.upload))
+    await provider.releaseSendRequest()
+    #expect(await cancellableValue(of: send) == !fails)
+    #expect(!model.generalQuitActivities.contains(.upload))
+}
+
+@MainActor
+@Test(.timeLimit(.minutes(1)), arguments: [false, true], [false, true])
+func `GIF completion preserves newer text and channel drafts`(changesChannel: Bool, fails: Bool) async throws {
+    let provider = SuspendedAccountOperationTestProvider(suspendsOperations: true, failsSend: fails)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    let channel = Channel(id: provider.channelID, guildID: nil, name: "shared")
+    model.snapshot = BootstrapSnapshot(currentUser: provider.editTarget.author, guilds: [], channels: [channel], members: [])
+    model.visibleChannels = [channel]
+    model.selectedChannel = channel
+    model.selectedChannelID = channel.id
+    model.draft = "existing text"
+    model.replyingTo = provider.editTarget
+    let gif = GIFSearchResult(id: "race", title: "Race", url: URL(string: "https://example.com/race.gif")!, previewURL: URL(string: "https://example.com/preview.gif")!)
+    let send = Task { @MainActor in await model.sendGIF(gif) }
+    let sendStarted = await provider.waitUntilSendRequestStarts()
+    if !sendStarted {
+        send.cancel()
+        await provider.releaseSendRequest()
+        _ = await cancellableValue(of: send)
+    }
+    try #require(sendStarted)
+    #expect(model.draft == "existing text")
+    if changesChannel { model.selectedChannelID = ChannelID(rawValue: 96_099) }
+    model.draft = "newer text"
+    let currentReply = model.replyingTo
+    await provider.releaseSendRequest()
+    #expect(await cancellableValue(of: send) == !fails)
+    #expect(model.draft == "newer text")
+    #expect(model.replyingTo == currentReply)
+    let sent = try #require(await provider.sentDraft)
+    #expect(sent.channelID == channel.id)
+    #expect(sent.content == gif.url.absoluteString)
+    #expect(sent.replyTo == provider.editTarget.id)
+}
+
+@MainActor
+@Test(.timeLimit(.minutes(1))) func `stale GIF send cannot restore an old account draft`() async throws {
+    let oldProvider = SuspendedAccountOperationTestProvider(suspendsOperations: true)
+    let newProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let model = AppModel(launchMode: .offlineTesting, provider: oldProvider)
+    let channel = Channel(id: oldProvider.channelID, guildID: nil, name: "shared")
+    model.snapshot = BootstrapSnapshot(
+        currentUser: oldProvider.editTarget.author,
+        guilds: [],
+        channels: [channel],
+        members: []
+    )
+    model.visibleChannels = [channel]
+    model.selectedChannel = channel
+    model.selectedChannelID = oldProvider.channelID
+    model.draft = "old account draft"
+    let gif = GIFSearchResult(
+        id: "account-race-gif",
+        title: "Account race",
+        url: URL(string: "https://example.com/account-race.gif")!,
+        previewURL: URL(string: "https://example.com/account-race-preview.gif")!
+    )
+
+    let send = Task { @MainActor in await model.sendGIF(gif) }
+    let sendStarted = await oldProvider.waitUntilSendRequestStarts()
+    if !sendStarted {
+        send.cancel()
+        await oldProvider.releaseSendRequest()
+        _ = await cancellableValue(of: send)
+    }
+    try #require(sendStarted)
+    model.invalidateAccountSession()
+    model.installAccountSession(provider: newProvider, database: nil)
+    model.draft = "replacement account draft"
+
+    await oldProvider.releaseSendRequest()
+    #expect(await !cancellableValue(of: send))
+    #expect(model.draft == "replacement account draft")
+}
+
+@MainActor
+@Test func `enqueued old account command and call observers never reach replacement provider`()
+    async
+{
+    let oldProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let newProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let commandChannel = Channel(
+        id: oldProvider.channelID,
+        guildID: nil,
+        name: "command-boundary",
+        kind: .text
+    )
+    let commandModel = AppModel(launchMode: .offlineTesting, provider: oldProvider)
+    commandModel.snapshot = BootstrapSnapshot(
+        currentUser: oldProvider.editTarget.author,
+        guilds: [],
+        channels: [commandChannel],
+        members: []
+    )
+    commandModel.visibleChannels = [commandChannel]
+    commandModel.selectedChannelID = commandChannel.id
+    commandModel.supportedCapabilities = [.slashCommands]
+    commandModel.loadApplicationCommands()
+    let commandTask = commandModel.commandComposer.loadTask
+
+    commandModel.invalidateAccountSession()
+    commandModel.installAccountSession(provider: newProvider, database: nil)
+    await commandTask?.value
+
+    #expect(await oldProvider.applicationCommandRequestCount == 0)
+    #expect(await newProvider.applicationCommandRequestCount == 0)
+
+    let oldCallProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let newCallProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let privateChannel = Channel(
+        id: oldCallProvider.channelID,
+        guildID: nil,
+        name: "private-call-boundary",
+        kind: .directMessage
+    )
+    let callModel = AppModel(launchMode: .offlineTesting, provider: oldCallProvider)
+    callModel.snapshot = BootstrapSnapshot(
+        currentUser: oldCallProvider.editTarget.author,
+        guilds: [],
+        channels: [privateChannel],
+        members: []
+    )
+    callModel.visibleChannels = [privateChannel]
+    callModel.selectedChannelID = privateChannel.id
+    let observerTasks = Array(callModel.accountChildTasks.values)
+
+    callModel.invalidateAccountSession()
+    callModel.installAccountSession(provider: newCallProvider, database: nil)
+    for task in observerTasks {
+        await task.value
+    }
+
+    #expect(await oldCallProvider.privateCallSubscriptionRequestCount == 0)
+    #expect(await newCallProvider.privateCallSubscriptionRequestCount == 0)
+}
+
+@MainActor
+@Test func `enqueued old account channel and guild loads never reach replacement provider`() async {
+    let oldProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let newProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let sharedChannel = Channel(
+        id: oldProvider.channelID,
+        guildID: nil,
+        name: "shared-channel-boundary",
+        kind: .text
+    )
+    let channelModel = AppModel(launchMode: .offlineTesting, provider: oldProvider)
+    channelModel.snapshot = BootstrapSnapshot(
+        currentUser: oldProvider.editTarget.author,
+        guilds: [],
+        channels: [sharedChannel],
+        members: []
+    )
+    channelModel.visibleChannels = [sharedChannel]
+    channelModel.selectedChannelID = sharedChannel.id
+    let channelTask = channelModel.channelLoadTask
+
+    channelModel.invalidateAccountSession()
+    channelModel.installAccountSession(provider: newProvider, database: nil)
+    channelModel.selectedChannelID = nil
+    await channelTask?.value
+
+    #expect(channelModel.selectedChannelID == nil)
+    #expect(await oldProvider.newestMessageRequestCount == 0)
+    #expect(await newProvider.newestMessageRequestCount == 0)
+
+    let oldGuildProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let newGuildProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let oldGuildID = GuildID(rawValue: 96_100)
+    let replacementGuildID = GuildID(rawValue: 96_101)
+    let guildModel = AppModel(launchMode: .offlineTesting, provider: oldGuildProvider)
+    guildModel.snapshot = BootstrapSnapshot(
+        currentUser: oldGuildProvider.editTarget.author,
+        guilds: [Guild(id: oldGuildID, name: "Old account guild")],
+        channels: [],
+        members: []
+    )
+    guildModel.selectGuild(oldGuildID)
+    let guildTask = guildModel.guildActivationTask
+
+    guildModel.invalidateAccountSession()
+    guildModel.installAccountSession(provider: newGuildProvider, database: nil)
+    guildModel.selectedGuildID = replacementGuildID
+    await guildTask?.value
+
+    #expect(guildModel.selectedGuildID == replacementGuildID)
+    #expect(guildModel.selectedChannelID == nil)
+    #expect(await oldGuildProvider.channelRequestCount == 0)
+    #expect(await newGuildProvider.channelRequestCount == 0)
+}
+
+@MainActor
+@Test func `cancelled enqueued thread load never leaves a refresh journal`() async {
+    let provider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    let firstThread = MessageThreadSummary(
+        id: provider.threadID,
+        parentID: provider.channelID,
+        name: "First queued thread"
+    )
+    let secondThread = MessageThreadSummary(
+        id: ChannelID(rawValue: provider.threadID.rawValue + 1),
+        parentID: provider.channelID,
+        name: "Replacement queued thread"
+    )
+
+    model.openThreadConversation(
+        firstThread,
+        starter: nil,
+        startedAt: nil,
+        initialMessages: []
+    )
+    let firstTask = model.threadLoadTask
+    model.openThreadConversation(
+        secondThread,
+        starter: nil,
+        startedAt: nil,
+        initialMessages: []
+    )
+    let secondTask = model.threadLoadTask
+
+    await firstTask?.value
+    await secondTask?.value
+
+    #expect(model.openThread?.id == secondThread.id)
+    #expect(model.conversationRefreshJournals[firstThread.id] == nil)
+    #expect(model.conversationRefreshJournals[secondThread.id] == nil)
+}
+
+@MainActor
+@Test func `old private call deletion cannot tear down replacement voice state`() async {
+    let oldProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let newProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let model = AppModel(launchMode: .offlineTesting, provider: oldProvider)
+    let sharedChannel = Channel(
+        id: oldProvider.channelID,
+        guildID: nil,
+        name: "shared-call",
+        kind: .directMessage
+    )
+    model.activeVoiceChannel = sharedChannel
+    model.voiceSessionState = .connected
+
+    model.consumePrivateCallDeleted(channelID: sharedChannel.id, unavailable: false)
+    let leaveTasks = Array(model.accountChildTasks.values)
+    model.invalidateAccountSession()
+    model.installAccountSession(provider: newProvider, database: nil)
+    model.activeVoiceChannel = sharedChannel
+    model.voiceSessionState = .connected
+
+    for task in leaveTasks {
+        await task.value
+    }
+
+    #expect(model.activeVoiceChannel == sharedChannel)
+    #expect(model.voiceSessionState == .connected)
+    #expect(await newProvider.voiceStateUpdateRequestCount == 0)
+}
+
+@MainActor
+@Test func `account transition cancels and drains stale native notification delivery`() async {
+    let notifications = SuspendedAccountNotificationService()
+    let notificationPreferences = NotificationPreferences(defaults: InMemoryPreferences())
+    notificationPreferences.suppressesCurrentConversation = false
+    let oldProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let newProvider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let model = AppModel(
+        launchMode: .offlineTesting,
+        provider: oldProvider,
+        notificationService: notifications,
+        notificationPreferences: notificationPreferences
+    )
+    await model.start()
+    let author = oldProvider.editTarget.author
+    let message = Message(
+        id: MessageID(rawValue: 96_050),
+        channelID: oldProvider.channelID,
+        author: author,
+        content: "old account notification"
+    )
+
+    model.deliverNativeNotification(for: message)
+    await notifications.waitUntilDeliveryStarts()
+    model.invalidateAccountSession()
+    await model.resetAccountScopedLoadsAndForumState()
+    let drain = Task { @MainActor in
+        await model.drainAccountChildTasks()
+    }
+    await Task.yield()
+    notifications.releaseDelivery()
+    await drain.value
+    model.installAccountSession(provider: newProvider, database: nil)
+
+    #expect(notifications.publishedMessageIDs.isEmpty)
+    #expect(model.accountChildTasks.isEmpty)
+}
+
+@MainActor
+@Test func `replying targets the selected message and clears after sending`() async throws {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    let target = try #require(model.messages.first)
+
+    model.reply(to: target)
+    #expect(model.replyingTo?.id == target.id)
+
+    model.updateDraft("reply from test")
+    await model.send()
+
+    #expect(model.messages.last?.replyTo == target.id)
+    #expect(model.messageRows.last?.replyPreview?.messageID == target.id)
+    #expect(model.messageRows.last?.replyPreview?.content == target.content)
+    #expect(model.replyingTo == nil)
+}
+
+@MainActor
+@Test func `reply ping choice is shared and survives self replies account resets and relaunch`() async throws {
+    let defaults = InMemoryPreferences()
+    let preferences = SettingsPreferenceStore(defaults: defaults)
+    let model = AppModel(launchMode: .offlineTesting, composerPreferences: preferences)
+    await model.start()
+    let currentUser = try #require(model.snapshot?.currentUser)
+    let target = try #require(model.messages.first { $0.author.id != currentUser.id })
+    let thread = MessageThreadSummary(
+        id: ChannelID(rawValue: 88_001), parentID: target.channelID, name: "Reply preference"
+    )
+    model.openThread = thread
+    let threadTarget = Message(
+        id: MessageID(rawValue: 88_002), channelID: thread.id,
+        author: target.author, content: "thread target"
+    )
+    model.reply(to: target)
+    model.reply(to: threadTarget)
+    #expect(model.replyMentionsAuthor && model.threadReplyMentionsAuthor)
+
+    let changes = AsyncStream<MessageComposerDestination>.makeStream()
+    withObservationTracking {
+        _ = model.replyMentionsAuthor
+    } onChange: { changes.continuation.yield(.channel) }
+    withObservationTracking {
+        _ = model.threadReplyMentionsAuthor
+    } onChange: { changes.continuation.yield(.thread) }
+    model.setReplyMentionsAuthor(false, in: .channel)
+    changes.continuation.finish()
+    var observedChanges: Set<MessageComposerDestination> = []
+    for await destination in changes.stream { observedChanges.insert(destination) }
+    #expect(observedChanges == [.channel, .thread])
+    #expect(!model.replyMentionsAuthor && !model.threadReplyMentionsAuthor)
+    model.setReplyMentionsAuthor(true, in: .thread)
+    #expect(model.replyMentionsAuthor && model.threadReplyMentionsAuthor)
+
+    let selfReply = Message(
+        id: MessageID(rawValue: 88_003), channelID: target.channelID,
+        author: currentUser, content: "self target"
+    )
+    model.replaceSelectedMessages(with: [target, selfReply])
+    #expect(model.navigateReplySelection(in: .channel, direction: .newer))
+    #expect(!model.replyMentionsAuthor && model.threadReplyMentionsAuthor)
+    model.setReplyMentionsAuthor(false, in: .channel)
+    #expect(preferences.value(for: .replyMentionsAuthor) == .bool(true))
+    #expect(model.navigateReplySelection(in: .channel, direction: .older))
+    #expect(model.replyMentionsAuthor)
+
+    model.setReplyMentionsAuthor(false, in: .thread)
+    model.updateDraft("unpinged reply")
+    try #require(await model.send())
+    #expect(model.replyingTo == nil)
+    #expect(model.messages.last?.mentionedUsers.contains(where: { $0.id == target.author.id }) == false)
+    #expect(!model.threadReplyMentionsAuthor)
+    await model.resetAccountScopedLoadsAndForumState()
+    #expect(model.replyingTo == nil && model.threadReplyingTo == nil)
+    #expect(!model.replyMentionsAuthor && !model.threadReplyMentionsAuthor)
+    #expect(preferences.value(for: .replyMentionsAuthor) == .bool(false))
+
+    let relaunched = AppModel(
+        launchMode: .offlineTesting,
+        composerPreferences: SettingsPreferenceStore(defaults: defaults)
+    )
+    await relaunched.start()
+    let nextTarget = try #require(relaunched.messages.first { $0.author.id != relaunched.snapshot?.currentUser.id })
+    relaunched.reply(to: nextTarget)
+    #expect(!relaunched.replyMentionsAuthor)
+    #expect(AppModel(launchMode: .offlineTesting).replyMentionsAuthor)
+}
+
+@MainActor
+@Test func `reply selection navigates both directions without wrapping`() async throws {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    let messages = model.messages
+    #expect(messages.count >= 2)
+
+    #expect(model.navigateReplySelection(in: .channel, direction: .older))
+    #expect(model.replyingTo?.id == messages.last?.id)
+
+    #expect(model.navigateReplySelection(in: .channel, direction: .older))
+    #expect(model.replyingTo?.id == messages.dropLast().last?.id)
+
+    model.reply(to: messages.first!)
+    #expect(model.navigateReplySelection(in: .channel, direction: .older))
+    #expect(model.replyingTo?.id == messages.first?.id)
+
+    #expect(model.navigateReplySelection(in: .channel, direction: .newer))
+    #expect(model.replyingTo?.id == messages.dropFirst().first?.id)
+
+    model.reply(to: messages.last!)
+    #expect(model.navigateReplySelection(in: .channel, direction: .newer))
+    #expect(model.replyingTo?.id == messages.last?.id)
+}
+
+@MainActor
+@Test func `reply Escape cancels reply state`() async throws {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    let target = try #require(model.messages.last)
+
+    model.reply(to: target)
+    #expect(model.consumeEscapeForReply(in: .channel))
+    #expect(model.replyingTo == nil)
+    #expect(!model.consumeEscapeForReply(in: .channel))
+}
+
+@MainActor
+@Test func `side chats close from the top and a thread returns to its context`() async throws {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    let voiceChannel = try #require(model.visibleChannels.first(where: { $0.kind == .voice }))
+    model.selectedChannelID = voiceChannel.id
+    let thread = MessageThreadSummary(
+        id: ChannelID(rawValue: 88_001),
+        parentID: ChannelID(rawValue: 88_000),
+        name: "Escape priority"
+    )
+    model.openThread = thread
+    #expect(model.workspacePresentation.paneSideConversation == .thread(thread, isFullWidth: false))
+
+    #expect(model.consumeEscapeForSupplementaryConversation())
+    #expect(model.openThread == nil)
+    #expect(model.isVoiceChatOpen)
+    #expect(model.workspacePresentation.paneSideConversation == .voiceChat(voiceChannel.id))
+
+    // Closing the context also closes a thread opened above it.
+    model.openThread = thread
+    model.closeVoiceChat()
+    #expect(model.openThread == nil)
+    #expect(!model.isVoiceChatOpen)
+    #expect(!model.consumeEscapeForSupplementaryConversation())
+}
+
+@MainActor
+@Test func `replying in a forum post targets the thread message and clears after sending`() async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let forum = try #require(
+        model.snapshot?.channels.first(where: { $0.kind == .forum })
+    )
+    model.selectedChannelID = forum.id
+    #expect(
+        await until {
+            model.hasLoadedForumPosts
+                && model.forumPosts.contains(where: { !$0.thread.isLocked })
+        }
+    )
+    let post = try #require(
+        model.forumPosts.first(where: { !$0.thread.isLocked })
+    )
+    model.open(post)
+    #expect(
+        await eventually {
+            model.hasCompletedInitialThreadLoad
+                && model.openThreadAccess.canSend
+                && !model.threadMessages.isEmpty
+        }
+    )
+    let target = try #require(model.threadMessages.first)
+
+    model.reply(to: target)
+    #expect(model.threadReplyingTo?.id == target.id)
+    #expect(model.replyingTo == nil)
+
+    model.threadDraft = "forum reply from test"
+    #expect(await model.sendThreadComposerMessage(attachments: []))
+    #expect(
+        await until {
+            model.threadMessages.last?.replyTo == target.id
+        }
+    )
+    #expect(model.threadMessages.last?.replyPreview?.messageID == target.id)
+    #expect(model.threadMessages.last?.replyPreview?.content == target.content)
+    #expect(model.threadReplyingTo == nil)
+}
+
+@MainActor
+@Test func `member store merge retains members outside latest range and replaces updates`() {
+    let orangeRole = GuildRole(
+        id: RoleID(rawValue: 10), name: "Orange", position: 10,
+        colorHex: 0xFF8800
+    )
+    var existing = Member(
+        user: User(id: UserID(rawValue: 1), username: "first", displayName: "First"),
+        roleName: orangeRole.name,
+        status: .online,
+        roleID: orangeRole.id,
+        rolePosition: orangeRole.position,
+        isRoleCategory: true,
+        roles: [orangeRole]
+    )
+    existing.memberListIndex = 73
+    let replacement = Member(
+        user: existing.user,
+        roleName: "Member",
+        status: .idle
+    )
+    let other = Member(
+        user: User(id: UserID(rawValue: 2), username: "other", displayName: "Other"),
+        roleName: "Member",
+        status: .online
+    )
+
+    let merged = MemberStoreMerge.merging(
+        existing: [existing.id: existing],
+        updates: [replacement, other]
+    )
+
+    #expect(merged.count == 2)
+    #expect(merged[existing.id]?.status == replacement.status)
+    #expect(merged[existing.id]?.memberListIndex == 73)
+    #expect(merged[other.id] == other)
+}
+
+@Test func `timeline member impact ignores members absent from retained message rows`() {
+    let author = User(
+        id: UserID(rawValue: 81), username: "author", displayName: "Author"
+    )
+    let replyAuthor = User(
+        id: UserID(rawValue: 82), username: "reply", displayName: "Reply"
+    )
+    let mentioned = User(
+        id: UserID(rawValue: 83), username: "mention", displayName: "Mention"
+    )
+    let unrelated = User(
+        id: UserID(rawValue: 84), username: "other", displayName: "Other"
+    )
+    let message = Message(
+        id: MessageID(rawValue: 8_100),
+        channelID: ChannelID(rawValue: 8_101),
+        author: author,
+        content: "Member presentation dependencies",
+        replyPreview: MessageReplyPreview(
+            messageID: MessageID(rawValue: 8_099),
+            author: replyAuthor,
+            content: "Referenced reply"
+        ),
+        mentionedUsers: [mentioned]
+    )
+    let referenced = TimelineMemberPresentationImpact.referencedUserIDs(
+        in: [message]
+    )
+    #expect(referenced == [author.id, replyAuthor.id, mentioned.id])
+
+    let oldMembers = Dictionary(
+        uniqueKeysWithValues: [author, replyAuthor, mentioned, unrelated].map {
+            ($0.id, Member(user: $0, roleName: "Member", status: .online))
+        }
+    )
+    let newMembers = oldMembers.mapValues { member in
+        var changed = member
+        changed.user.displayName += " updated"
+        return changed
+    }
+    let changed = TimelineMemberPresentationImpact.changedUserIDs(
+        from: oldMembers,
+        to: newMembers,
+        guildRoles: [],
+        candidates: referenced
+    )
+
+    #expect(changed == referenced)
+    #expect(!changed.contains(unrelated.id))
+    #expect(
+        TimelineMemberPresentationImpact.affectedMessageIDs(
+            in: [message],
+            changedUserIDs: changed
+        ) == [message.id]
+    )
+}
+
+@MainActor
+@Test func `member viewport replays after subscription arming and guild reentry`() async throws {
+    let provider = DelayedMemberViewportTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    let snapshot = try await provider.bootstrap()
+    let guild = try #require(snapshot.guilds.first)
+    let channel = try #require(snapshot.channels.first { $0.guildID == guild.id })
+    model.snapshot = snapshot
+    model.selectedGuildID = guild.id
+    model.visibleChannels = snapshot.channels.filter { $0.guildID == guild.id }
+    model.selectedChannelID = channel.id
+    model.beginMemberLoad(for: guild.id)
+
+    #expect(await provider.waitUntilMemberLoadStarts())
+    let visibleRange = 200 ... 219
+
+    model.updateMemberListViewport(visibleRange)
+    #expect(await provider.waitUntilViewportAttemptCount(1))
+    #expect(await provider.acceptedViewportRequests().isEmpty)
+
+    await provider.releaseMemberLoad()
+    #expect(await provider.waitUntilAcceptedViewportCount(1))
+
+    #expect(await provider.acceptedViewportRequests() == [
+        DelayedMemberViewportTestProvider.ViewportRequest(
+            guildID: guild.id,
+            channelID: channel.id,
+            visibleRange: visibleRange
+        )
+    ])
+
+    let replacementChannel = try #require(
+        snapshot.channels.first {
+            $0.guildID == guild.id && $0.id != channel.id && $0.kind != .voice
+        }
+    )
+    model.selectedChannelID = replacementChannel.id
+    #expect(await provider.waitUntilAcceptedViewportCount(2))
+    #expect(await provider.acceptedViewportRequests().last ==
+        DelayedMemberViewportTestProvider.ViewportRequest(
+            guildID: guild.id,
+            channelID: replacementChannel.id,
+            visibleRange: visibleRange
+        )
+    )
+
+    let directMessage = try #require(
+        snapshot.channels.first { $0.guildID == nil }
+    )
+    await provider.disarmMemberSubscription()
+    model.selectedGuildID = nil
+    model.selectedChannelID = directMessage.id
+    model.selectedGuildID = guild.id
+    model.selectedChannelID = channel.id
+    model.beginMemberLoad(for: guild.id)
+
+    #expect(await provider.waitUntilAcceptedViewportCount(3))
+    #expect(await provider.acceptedViewportRequests().last ==
+        DelayedMemberViewportTestProvider.ViewportRequest(
+            guildID: guild.id,
+            channelID: channel.id,
+            visibleRange: visibleRange
+        )
+    )
+
+    let otherGuildID = GuildID(rawValue: 88_100)
+    let otherChannel = Channel(
+        id: ChannelID(rawValue: 88_101),
+        guildID: otherGuildID,
+        name: "other-public"
+    )
+    await provider.disarmMemberSubscription()
+    model.selectedGuildID = otherGuildID
+    model.visibleChannels = [otherChannel]
+    model.selectedChannelID = otherChannel.id
+    model.beginMemberLoad(for: otherGuildID)
+    #expect(await provider.waitUntilAcceptedViewportCount(4))
+
+    await provider.disarmMemberSubscription()
+    model.selectedGuildID = guild.id
+    model.visibleChannels = snapshot.channels.filter { $0.guildID == guild.id }
+    model.selectedChannelID = replacementChannel.id
+    model.beginMemberLoad(for: guild.id)
+
+    #expect(await provider.waitUntilAcceptedViewportCount(5))
+    #expect(await provider.acceptedViewportRequests().last ==
+        DelayedMemberViewportTestProvider.ViewportRequest(
+            guildID: guild.id,
+            channelID: replacementChannel.id,
+            visibleRange: visibleRange
+        )
+    )
+}
+
+@MainActor
+@Test func `empty member load bootstraps the initial viewport`() async throws {
+    let provider = DelayedMemberViewportTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    let snapshot = try await provider.bootstrap()
+    let guild = try #require(snapshot.guilds.first)
+    let channel = try #require(snapshot.channels.first { $0.guildID == guild.id })
+    model.snapshot = snapshot
+    model.selectedGuildID = guild.id
+    model.visibleChannels = snapshot.channels.filter { $0.guildID == guild.id }
+    model.selectedChannelID = channel.id
+
+    model.beginMemberLoad(for: guild.id)
+    #expect(await provider.waitUntilMemberLoadStarts())
+    await provider.releaseMemberLoad()
+
+    #expect(await provider.waitUntilAcceptedViewportCount(1))
+    #expect(await provider.acceptedViewportRequests() == [
+        DelayedMemberViewportTestProvider.ViewportRequest(
+            guildID: guild.id,
+            channelID: channel.id,
+            visibleRange: 0 ... 0
+        ),
+    ])
+}
+
+@MainActor
+@Test func `automatic guild selection follows visible order without preferring general`() {
+    let guildID = GuildID(rawValue: 7)
+    let voiceGeneral = Channel(
+        id: ChannelID(rawValue: 70),
+        guildID: guildID,
+        name: "general",
+        kind: .voice
+    )
+    let welcome = Channel(
+        id: ChannelID(rawValue: 71),
+        guildID: guildID,
+        name: "welcome",
+        kind: .text
+    )
+    let textGeneral = Channel(
+        id: ChannelID(rawValue: 72),
+        guildID: guildID,
+        name: "general",
+        kind: .text
+    )
+
+    #expect(
+        AppModel.preferredInitialChannelID(
+            in: [voiceGeneral, welcome, textGeneral]
+        ) == welcome.id
+    )
+    #expect(
+        AppModel.preferredInitialChannelID(in: [voiceGeneral, welcome])
+            == welcome.id
+    )
+    #expect(
+        AppModel.preferredInitialChannelID(in: [voiceGeneral])
+            == voiceGeneral.id
+    )
+}
+
+@MainActor
+@Test func `first guild visit keeps its channel selected while permissions load`() async {
+    let provider = FirstGuildVisitPermissionTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+
+    await model.start()
+
+    #expect(model.selectedGuildID == provider.guildID)
+    #expect(model.selectedChannelID == provider.channelID)
+    #expect(model.selectedChannel?.id == provider.channelID)
+    #expect(model.selectedConversationAccess == .checking)
+    #expect(model.messages.isEmpty)
+    #expect(await provider.messageRequestCount() == 0)
+    #expect(await provider.waitUntilRoleRequestStarts())
+
+    await provider.releaseRoles()
+
+    #expect(await eventually {
+        model.selectedConversationAccess.isReadable
+            && model.messages.map(\.content) == ["Loaded automatically"]
+    })
+    #expect(await provider.messageRequestCount() == 1)
+}
+
+@MainActor
+@Test func `automatic first channel moves to first readable channel when access resolves hidden`() {
+    let model = AppModel(launchMode: .offlineTesting)
+    let guildID = GuildID(rawValue: 77_300)
+    let privateChannel = Channel(
+        id: ChannelID(rawValue: 77_301), guildID: guildID, name: "staff"
+    )
+    let welcomeChannel = Channel(
+        id: ChannelID(rawValue: 77_302), guildID: guildID, name: "welcome"
+    )
+    model.selectedGuildID = guildID
+    model.visibleChannels = [privateChannel, welcomeChannel]
+    model.pendingAutomaticChannelAccessID = privateChannel.id
+    model.selectedChannelID = privateChannel.id
+    model.checkingChannelIDs = [privateChannel.id, welcomeChannel.id]
+
+    model.applyUnreadAccessProjection(UnreadAccessProjection(
+        accessByChannelID: [
+            privateChannel.id: .hidden,
+            welcomeChannel.id: .readable(canSend: false),
+        ],
+        accessibilityByChannelID: [
+            privateChannel.id: false,
+            welcomeChannel.id: true,
+        ]
+    ))
+
+    #expect(model.selectedChannelID == welcomeChannel.id)
+    #expect(model.pendingAutomaticChannelAccessID == nil)
+}
+
+@MainActor
+@Test func `selecting voice channel opens its text chat by default without joining`() async throws {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    let voiceChannel = try #require(model.visibleChannels.first(where: { $0.kind == .voice }))
+
+    model.selectedChannelID = voiceChannel.id
+
+    #expect(model.selectedChannel?.id == voiceChannel.id)
+    #expect(model.selectedChannel?.kind == .voice)
+    #expect(model.activeVoiceChannel == nil)
+    #expect(model.isVoiceChatOpen)
+    #expect(await eventually { !model.isLoadingMessages && !model.messages.isEmpty })
+}
+
+@MainActor
+@Test func `voice channel selection reuses the session page when chat is reopened`() async throws {
+    let provider = ChannelLoadTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let voiceChannel = ChannelID(rawValue: 91003)
+
+    model.selectedChannelID = voiceChannel
+    #expect(await until { !model.isLoadingMessages })
+    #expect(await provider.requestCount(for: voiceChannel) == 1)
+    #expect(model.activeVoiceChannel == nil)
+    #expect(model.isVoiceChatOpen)
+
+    let channel = try #require(model.selectedChannel)
+    model.openVoiceChat(for: channel)
+    #expect(await provider.requestCount(for: voiceChannel) == 1)
+    #expect(model.messages.map(\.channelID) == [voiceChannel])
+    #expect(model.activeVoiceChannel == nil)
+    #expect(model.isVoiceChatOpen)
+
+    model.openVoiceChat(for: channel)
+    try await Task.sleep(for: .milliseconds(30))
+    #expect(await provider.requestCount(for: voiceChannel) == 1)
+
+    model.closeVoiceChat()
+    #expect(!model.isVoiceChatOpen)
+    #expect(model.activeVoiceChannel == nil)
+
+    model.openVoiceChat(for: channel)
+    #expect(model.isVoiceChatOpen)
+    try await Task.sleep(for: .milliseconds(40))
+    #expect(!model.isLoadingMessages)
+    #expect(model.messages.map(\.channelID) == [voiceChannel])
+    #expect(await provider.requestCount(for: voiceChannel) == 1)
+    #expect(model.activeVoiceChannel == nil)
+}
+
+@MainActor
+@Test func `connection gap refreshes the selected session page once`() async throws {
+    let provider = ChannelLoadTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let channelID = ChannelID(rawValue: 91001)
+    model.connectionState = .ready
+
+    model.selectedChannelID = channelID
+    await model.channelLoadTask?.value
+    #expect(await provider.requestCount(for: channelID) == 1)
+    let loadedMessages = model.messages
+    #expect(!loadedMessages.isEmpty)
+    #expect(model.readState.presentations[channelID]?.initialHistoryLoaded == true)
+
+    model.consumeConnectionChange(.resuming)
+    model.consumeConnectionChange(.ready)
+
+    #expect(model.messages == loadedMessages)
+    #expect(!model.isLoadingMessages)
+    model.consumeReadStateSnapshot([])
+    #expect(model.readState.presentations[channelID]?.initialHistoryLoaded == true)
+
+    await model.channelLoadTask?.value
+    #expect(await provider.requestCount(for: channelID) == 2)
+    model.consumeConnectionChange(.ready)
+    try await Task.sleep(for: .milliseconds(40))
+    #expect(await provider.requestCount(for: channelID) == 2)
+}
+
+@MainActor
+@Test func `gateway recovery republishes an active voice state once`() async {
+    let provider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    model.activeVoiceChannel = Channel(
+        id: provider.channelID,
+        guildID: nil,
+        name: "Recovered call",
+        kind: .directMessage
+    )
+    model.voiceSessionState = .reconnecting
+    model.connectionState = .resuming
+
+    model.consumeConnectionChange(.ready)
+    for task in Array(model.accountChildTasks.values) {
+        await task.value
+    }
+    #expect(await provider.voiceStateUpdateRequestCount == 1)
+
+    model.consumeConnectionChange(.ready)
+    for task in Array(model.accountChildTasks.values) {
+        await task.value
+    }
+    #expect(await provider.voiceStateUpdateRequestCount == 1)
+}
+
+@MainActor
+@Test func `server disconnected voice session tears down locally without leaving the replacement client`() async throws {
+    let provider = SuspendedAccountOperationTestProvider(suspendsOperations: false)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    let snapshot = try await provider.bootstrap()
+    model.snapshot = snapshot
+    model.activeVoiceChannel = Channel(
+        id: provider.channelID,
+        guildID: nil,
+        name: "Displaced call",
+        kind: .directMessage
+    )
+    model.voiceSessionState = .connected
+    let replacementState = VoiceParticipantState(
+        userID: snapshot.currentUser.id,
+        channelID: provider.channelID,
+        guildID: nil,
+        sessionID: "replacement-session"
+    )
+    model.voiceStates[snapshot.currentUser.id] = replacementState
+
+    model.consumeVoiceEvent(.stateChanged(.disconnected))
+    for task in Array(model.accountChildTasks.values) {
+        await task.value
+    }
+
+    #expect(model.activeVoiceChannel == nil)
+    #expect(model.voiceSessionState == .idle)
+    #expect(model.voiceStates[snapshot.currentUser.id] == replacementState)
+    #expect(await provider.voiceStateUpdateRequestCount == 0)
+}
+
+@MainActor
+@Test func `unchanged unread projection does not republish the account snapshot`() async throws {
+    let snapshot = try await MockChatProvider().bootstrap()
+    #expect(
+        !UnreadPresentationPublicationPolicy.shouldPublish(
+            snapshot: snapshot,
+            channels: snapshot.channels,
+            guilds: snapshot.guilds
+        )
+    )
+
+    var changedChannels = snapshot.channels
+    changedChannels[0].unreadCount += 1
+    #expect(
+        UnreadPresentationPublicationPolicy.shouldPublish(
+            snapshot: snapshot,
+            channels: changedChannels,
+            guilds: snapshot.guilds
+        )
+    )
+}
+
+@MainActor
+@Test func `account status changes from other clients update the current user and self member`() async throws {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    let currentUserID = try #require(model.snapshot?.currentUser.id)
+    let others = model.members.filter { $0.id != currentUserID }
+    #expect(model.members.contains { $0.id == currentUserID })
+    #expect(model.currentStatus != .dnd)
+
+    await model.consume(.currentUserStatusChanged(.dnd))
+
+    #expect(model.currentStatus == .dnd)
+    #expect(model.members.filter { $0.id == currentUserID }.allSatisfy { $0.status == .dnd })
+    #expect(model.members.filter { $0.id != currentUserID } == others)
+
+    // Cached member lists shown again, or republished, carry the current status.
+    let guildID = try #require(model.selectedGuildID)
+    var stale = try #require(model.members.first { $0.id == currentUserID })
+    stale.status = .online
+    model.memberListsByGuildID[guildID] = [stale]
+    model.membersByGuildID[guildID] = [currentUserID: stale]
+    model.restoreMemberPresentation(for: guildID)
+    #expect(model.members.map(\.status) == [.dnd])
+    #expect(model.membersByID[currentUserID]?.status == .dnd)
+    model.consumeMembersChanged(guildID: guildID, members: [stale], groups: [])
+    #expect(model.members.map(\.status) == [.dnd])
+    #expect(model.memberListsByGuildID[guildID]?.map(\.status) == [.dnd])
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `selecting member loads full profile and expands independently`(fromInbox: Bool) async throws {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    var member = try #require(model.members.first)
+    let destination: ProfilePresentationDestination = fromInbox ? .contextual : .inspector
+    let guildID = fromInbox ? GuildID(rawValue: 99_999) : model.selectedGuildID
+    if fromInbox {
+        member.user.displayName = "Inbox server nickname"
+        member.roleName = "Inbox server role"
+        model.membersByGuildID[try #require(guildID)] = [member.id: member]
+        let message = Message(id: MessageID(rawValue: 99_998), channelID: ChannelID(rawValue: 99_997),
+                              author: member.user, content: "Inbox mention", guildID: guildID)
+        model.showProfile(for: member.user, sourceMessage: message)
+    } else {
+        model.selectMember(member)
+    }
+    #expect(await until { model.profilePresentation(for: destination)?.profile?.id == member.id })
+
+    let profile = try #require(model.profilePresentation(for: destination)?.profile)
+    #expect(model.isInspectorProfilePresented == !fromInbox)
+    #expect(profile.id == member.id)
+    #expect(!profile.badges.isEmpty)
+    #expect(!profile.mutualGuilds.isEmpty)
+    #expect(model.profileCache[SakuraCord.ProfileCacheKey(userID: member.id, guildID: guildID)] != nil)
+
+    let presentation = try #require(model.liveProfilePresentation(for: destination))
+    #expect(presentation.member.user.displayName == member.user.displayName)
+    #expect(presentation.member.roleName == member.roleName)
+    model.expandProfile(presentation)
+    model.dismissInspectorProfile()
+    #expect(model.expandedProfilePresentation?.profile?.id == member.id)
+    #expect(model.expandedProfilePresentation?.isLoading == false)
+    #expect(model.liveProfilePresentation(for: .expanded)?.member.user.displayName == member.user.displayName)
+    #expect(!model.isInspectorProfilePresented)
+
+    model.dismissAllProfiles(clearsCache: true)
+    #expect(model.expandedProfilePresentation == nil)
+}
+
+@MainActor
+@Test func `startup prefetches current user profile for initial guild`() async throws {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+
+    let currentUser = try #require(model.snapshot?.currentUser)
+    let cacheKey = SakuraCord.ProfileCacheKey(
+        userID: currentUser.id,
+        guildID: model.selectedGuildID
+    )
+    #expect(await eventually { model.profileCache[cacheKey] != nil })
+
+    let member = model.membersByID[currentUser.id]
+        ?? Member(user: currentUser, roleName: "You", status: model.currentStatus)
+    let requestID = model.presentProfile(
+        for: member,
+        in: model.selectedGuildID,
+        destination: .contextual
+    )
+    #expect(model.contextualProfilePresentation?.requestID == requestID)
+    #expect(model.contextualProfilePresentation?.profile != nil)
+    #expect(model.contextualProfilePresentation?.isLoading == false)
+}
+
+@MainActor
+private func reactionMutationTestModel(
+    provider: any ChatProvider,
+    timing: AppModel.ReactionMutationTiming = .init(debounce: .zero)
+) -> AppModel {
+    AppModel(
+        launchMode: .offlineTesting,
+        provider: provider,
+        reactionMutationTiming: timing
+    )
+}
+
+@MainActor
+private func drainReactionMutations(in model: AppModel) async -> Bool {
+    await eventually {
+        model.reactionMutationTasks.isEmpty && model.reactionMutations.isEmpty
+    }
+}
+
+@MainActor
+private func hiddenMockChannel(
+    kind: ChannelKindValue,
+    in model: AppModel
+) throws -> Channel {
+    let channelID = ChannelID(rawValue: 215)
+    var snapshot = try #require(model.snapshot)
+    let index = try #require(
+        snapshot.channels.firstIndex { $0.id == channelID }
+    )
+    var channel = snapshot.channels[index]
+    channel.kind = kind
+    snapshot.channels[index] = channel
+    model.snapshot = snapshot
+    model.refreshUnreadPresentation(appliesAccessImmediately: true)
+    #expect(model.conversationAccess(for: channel) == .hidden)
+    return channel
+}
+
+@MainActor
+@Test func `app model reconciles lazy production reactors without repeated reads`() async throws {
+    let provider = ChannelLoadTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+
+    let message = try #require(model.messages.first)
+    let reaction = try #require(message.reactions.first)
+    #expect(reaction.reactors.isEmpty)
+    await model.loadReactionReactors(reaction, on: message)
+
+    let loaded = try #require(model.messages.first?.reactions.first)
+    #expect(loaded.reactors.map(\.displayName) == ["One", "Two", "Three", "Four", "Five"])
+    #expect(await provider.reactorRequestCount() == 1)
+
+    await model.loadReactionReactors(loaded, on: try #require(model.messages.first))
+    #expect(await provider.reactorRequestCount() == 1)
+}
+
+@MainActor
+@Test func `failed earlier page stays retryable without refreshing the newest page`() async throws {
+    let provider = ChannelLoadTestProvider(failsFirstEarlierPage: true)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+
+    await model.start()
+    let channelID = try #require(model.selectedChannelID)
+    #expect(model.hasMoreMessages)
+
+    await model.loadEarlier()
+    #expect(model.messageLoadError != nil)
+    #expect(model.hasMoreMessages)
+    #expect(!model.isLoadingEarlier)
+
+    model.retryMessageLoad()
+
+    #expect(await eventually {
+        model.messageLoadError == nil
+            && !model.isLoadingEarlier
+            && !model.hasMoreMessages
+            && model.messages.count == 2
+    })
+    #expect(await provider.requestCount(for: channelID) == 3)
+    #expect(await provider.earlierRequestCount() == 2)
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `gateway mutations keep exact indexes after repeated history prepends`(
+    whileScrolling: Bool
+) async throws {
+    let provider = MockChatProvider(timelineMessageCount: 2_000)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+
+    let timelineChannelID = ChannelID(rawValue: 210)
+    model.navigate(to: timelineChannelID)
+    #expect(await until {
+        model.selectedChannelID == timelineChannelID
+            && model.hasCompletedInitialMessageLoad
+    })
+    if whileScrolling {
+        model.reportTimelineLiveScrolling(true, conversationID: timelineChannelID)
+    }
+    defer {
+        model.reportTimelineLiveScrolling(false, conversationID: timelineChannelID)
+    }
+    let initialCount = model.messages.count
+    for _ in 0 ..< 13 {
+        await model.loadEarlier()
+    }
+    #expect(model.messages.count == initialCount + 13 * 20)
+
+    let updateTarget = model.messages[173]
+    var updated = updateTarget
+    updated.content = "Updated after repeated prepended pages"
+    await provider.emit(.messageUpdated(updated))
+
+    #expect(await eventually {
+        model.messages.first(where: { $0.id == updateTarget.id })?.content
+            == updated.content
+    })
+
+    let deleted = model.messages[211]
+    await provider.emit(.messageDeleted(
+        channelID: deleted.channelID,
+        messageID: deleted.id
+    ))
+    #expect(await eventually {
+        !model.messages.contains(where: { $0.id == deleted.id })
+    })
+}
+
+@MainActor
+@Test func `distant message navigation owns a contiguous bidirectional history window`() async throws {
+    let provider = MockChatProvider(timelineMessageCount: 500)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+
+    let channelID = ChannelID(rawValue: 210)
+    let targetID = MessageID(rawValue: 5_000_100)
+    model.navigate(to: GuildID(rawValue: 100), channelID: channelID, messageID: targetID)
+
+    #expect(await eventually {
+        model.messageNavigationRequest?.messageID == targetID
+            && model.messages.contains(where: { $0.id == targetID })
+    })
+    #expect(model.messages.map(\.id) == (85 ... 114).map {
+        MessageID(rawValue: 5_000_000 + UInt64($0))
+    })
+    #expect(model.hasMoreMessages)
+    #expect(model.hasMoreLaterMessages)
+
+    await model.loadEarlier()
+    #expect(model.messages.map(\.id) == (65 ... 114).map {
+        MessageID(rawValue: 5_000_000 + UInt64($0))
+    })
+
+    await model.loadLater()
+    #expect(model.messages.map(\.id) == (65 ... 134).map {
+        MessageID(rawValue: 5_000_000 + UInt64($0))
+    })
+    #expect(model.hasMoreLaterMessages)
+
+    let liveMessage = Message(
+        id: MessageID(rawValue: 6_000_000),
+        channelID: channelID,
+        author: try #require(model.snapshot?.currentUser),
+        content: "This must not bridge the unloaded history gap."
+    )
+    // Delivered before the newest read starts, which would otherwise replay it.
+    model.consumeImmediately(.messageCreated(liveMessage))
+    #expect(!model.messages.contains(where: { $0.id == liveMessage.id }))
+
+    #expect(await model.loadNewestMessageWindow())
+    #expect(model.messages.map(\.id) == (490 ... 499).map {
+        MessageID(rawValue: 5_000_000 + UInt64($0))
+    })
+    #expect(model.hasMoreMessages)
+    #expect(!model.hasMoreLaterMessages)
+}
+
+/// A 300-message channel whose message at offset `n` has ID `channelID + n`.
+private let historyParityChannelID = ChannelID(rawValue: 91_001)
+
+private func historyParityMessageID(_ offset: Int) -> MessageID {
+    MessageID(rawValue: historyParityChannelID.rawValue + UInt64(offset))
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `history requests use the official client's counts and anchors`(inThread: Bool) async {
+    let conversationID = inThread ? ChannelID(rawValue: 95_999) : historyParityChannelID
+    func id(_ offset: Int) -> MessageID { MessageID(rawValue: conversationID.rawValue + UInt64(offset)) }
+    let provider = ChannelLoadTestProvider(paginatedThreadID: conversationID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    if inThread {
+        model.open(MessageThreadSummary(id: conversationID, parentID: ChannelID(rawValue: 91_001), name: "Counts"))
+        await model.threadLoadTask?.value
+        await model.loadEarlierThread()
+        #expect(await model.loadThreadWindow(around: id(100), session: model.accountSession()))
+        await model.loadLaterThread()
+        #expect(await model.loadNewestThreadWindow())
+    } else {
+        await model.start()
+        #expect(await until { model.selectedChannelID == conversationID && model.hasCompletedInitialMessageLoad })
+        // A fast scroll does not enlarge the older page.
+        model.reportTimelineLiveScrolling(true, conversationID: conversationID)
+        await model.loadEarlier()
+        model.reportTimelineLiveScrolling(false, conversationID: conversationID)
+        model.navigate(to: nil, channelID: conversationID, messageID: id(100))
+        #expect(await until { model.messageNavigationRequest?.messageID == id(100) })
+        await model.loadLater()
+        #expect(await model.loadNewestMessageWindow())
+    }
+
+    #expect(await provider.requests(for: conversationID) == [
+        .init(anchor: .newest, limit: 10),
+        .init(anchor: .before(id(290)), limit: 20),
+        .init(anchor: .around(id(100)), limit: 30),
+        .init(anchor: .after(id(114)), limit: 20),
+        .init(anchor: .newest, limit: 10),
+    ])
+}
+
+@MainActor
+@Test(arguments: [true, false])
+func `jumping to unread makes one around read, or pages when nothing was acknowledged`(
+    hasAcknowledgedMessage: Bool
+) async throws {
+    let channelID = historyParityChannelID
+    let provider = ChannelLoadTestProvider(paginatedThreadID: channelID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    #expect(await until { model.selectedChannelID == channelID && model.hasCompletedInitialMessageLoad })
+    #expect(model.readState.applyRemote(ChannelReadState(
+        channelID: channelID,
+        lastAcknowledgedMessageID: hasAcknowledgedMessage ? historyParityMessageID(100) : MessageID(rawValue: 0),
+        isManual: true
+    )))
+    #expect(model.hasUnresolvedUnreadBoundary(channelID: channelID))
+
+    model.jumpToUnreadBoundary(channelID: channelID)
+    #expect(await until { model.messageNavigationRequest != nil })
+
+    let request = try #require(model.messageNavigationRequest)
+    let requests = await provider.requests(for: channelID)
+    if hasAcknowledgedMessage {
+        #expect(request.messageID == historyParityMessageID(101))
+        #expect(request.isUnreadBoundary)
+        #expect(requests == [
+            .init(anchor: .newest, limit: 10),
+            .init(anchor: .around(historyParityMessageID(100)), limit: 30),
+        ])
+    } else {
+        #expect(request.messageID == historyParityMessageID(0))
+        #expect(!model.hasMoreMessages)
+        #expect(requests.allSatisfy { if case .around = $0.anchor { false } else { true } })
+    }
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `returning to a detached channel window restores it without a request unless a gateway gap crossed it`(
+    crossesGap: Bool
+) async throws {
+    let channelID = historyParityChannelID
+    let provider = ChannelLoadTestProvider(paginatedThreadID: channelID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    model.consumeImmediately(.connectionChanged(.ready))
+    #expect(await until { model.selectedChannelID == channelID && model.hasCompletedInitialMessageLoad })
+    model.navigate(to: nil, channelID: channelID, messageID: historyParityMessageID(100))
+    #expect(await until { model.messageNavigationRequest != nil })
+    await model.loadEarlier()
+    let detachedIDs = model.messages.map(\.id)
+    let reading = MessageTimelineScrollRequest.Target.readingPosition(
+        historyParityMessageID(70), offsetFromViewportTop: 12
+    )
+    model.channelTimelinePosition.reading = reading
+    let requestCount = await provider.requests(for: channelID).count
+
+    let otherChannelID = ChannelID(rawValue: 91_002)
+    model.selectedChannelID = otherChannelID
+    #expect(await until { model.hasCompletedInitialMessageLoad && !model.isLoadingMessages })
+    // A live message must not join the cached window past its open edge.
+    let live = Message(
+        id: historyParityMessageID(300),
+        channelID: channelID,
+        author: User(id: UserID(rawValue: 91_000), username: "tester", displayName: "Tester"),
+        content: "live"
+    )
+    model.consumeImmediately(.messageCreated(live))
+    if crossesGap {
+        model.consumeImmediately(.connectionChanged(.disconnected))
+        model.consumeImmediately(.connectionChanged(.ready))
+    }
+
+    model.selectedChannelID = channelID
+    await model.channelLoadTask?.value
+
+    #expect(!model.messages.contains { $0.id == live.id })
+    if crossesGap {
+        #expect(!model.hasMoreLaterMessages)
+        #expect(Array(await provider.requests(for: channelID).dropFirst(requestCount)) == [.init(anchor: .newest, limit: 10)])
+    } else {
+        #expect(model.messages.map(\.id) == detachedIDs)
+        #expect(model.hasMoreMessages)
+        #expect(model.hasMoreLaterMessages)
+        #expect(model.channelTimelinePosition.restore == reading)
+        #expect(await provider.requests(for: channelID).count == requestCount)
+    }
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `a jump into a channel with nothing loaded makes one around read and finishes loading`(
+    cancelsNavigation: Bool
+) async {
+    let channelID = historyParityChannelID
+    let provider = ChannelLoadTestProvider(paginatedThreadID: channelID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    #expect(await until { model.selectedChannelID == channelID && model.hasCompletedInitialMessageLoad })
+    model.selectedChannelID = ChannelID(rawValue: 91_002)
+    #expect(await until { model.hasCompletedInitialMessageLoad && !model.isLoadingMessages })
+    model.messageCache[channelID] = nil
+    model.messageCacheOrder.removeAll { $0 == channelID }
+    model.hasMoreCache[channelID] = nil
+    let requestCount = await provider.requests(for: channelID).count
+
+    model.navigate(to: nil, channelID: channelID, messageID: historyParityMessageID(100))
+    if cancelsNavigation {
+        #expect(await until { model.selectedChannelID == channelID })
+        // Reselecting the open channel, as the Quick Switcher does, cancels the
+        // navigation without starting another load.
+        model.cancelConversationNavigation()
+    } else {
+        #expect(await until { model.messageNavigationRequest?.messageID == historyParityMessageID(100) })
+    }
+    await model.channelLoadTask?.value
+
+    #expect(Array(await provider.requests(for: channelID).dropFirst(requestCount)) == [
+        .init(anchor: .around(historyParityMessageID(100)), limit: 30),
+    ])
+    #expect(!model.isLoadingMessages)
+    #expect(model.hasCompletedInitialMessageLoad)
+    #expect(model.messages.contains { $0.id == historyParityMessageID(100) })
+}
+
+@MainActor
+@Test func `a failed channel send keeps its row across a jump to unread and Jump to Present`() async throws {
+    let channelID = historyParityChannelID
+    let provider = ChannelLoadTestProvider(paginatedThreadID: channelID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    #expect(await until { model.selectedChannelID == channelID && model.hasCompletedInitialMessageLoad })
+    model.appendOutgoingMessage(Message(
+        id: MessageID(rawValue: UInt64.max - 1),
+        channelID: channelID,
+        author: User(id: UserID(rawValue: 91_000), username: "tester", displayName: "Tester"),
+        content: "unsent",
+        nonce: "failed-send",
+        outboxState: .failed
+    ))
+    #expect(model.readState.applyRemote(ChannelReadState(
+        channelID: channelID,
+        lastAcknowledgedMessageID: historyParityMessageID(100),
+        isManual: true
+    )))
+
+    model.jumpToUnreadBoundary(channelID: channelID)
+    #expect(await until { model.messageNavigationRequest != nil })
+    #expect(model.hasMoreLaterMessages)
+    #expect(model.messages.contains { $0.id == historyParityMessageID(101) })
+    var failed = try #require(model.messages.last)
+    #expect(failed.nonce == "failed-send")
+    #expect(failed.outboxState == .failed)
+
+    #expect(await model.loadNewestMessageWindow())
+    #expect(!model.hasMoreLaterMessages)
+    failed = try #require(model.messages.last)
+    #expect(failed.nonce == "failed-send")
+    #expect(failed.outboxState == .failed)
+    #expect(model.messages.filter { $0.nonce == "failed-send" }.count == 1)
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `a gateway deletion during a jump or jump to present is not undone by its read`(toPresent: Bool) async {
+    let channelID = historyParityChannelID
+    let provider = ChannelLoadTestProvider(paginatedThreadID: channelID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    #expect(await until { model.selectedChannelID == channelID && model.hasCompletedInitialMessageLoad })
+    if toPresent {
+        model.navigate(to: nil, channelID: channelID, messageID: historyParityMessageID(100))
+        #expect(await until { model.hasMoreLaterMessages })
+    }
+
+    let deleted = toPresent ? historyParityMessageID(295) : historyParityMessageID(101)
+    await provider.blockNextPaginatedRequest(toPresent ? .newest : .around)
+    let read = Task {
+        if toPresent {
+            _ = await model.loadNewestMessageWindow()
+        } else {
+            _ = await model.loadSelectedMessageWindow(
+                around: historyParityMessageID(100), channelID: channelID, session: model.accountSession()
+            )
+        }
+    }
+    await provider.waitForBlockedPaginatedRequest()
+    model.consumeImmediately(.messageDeleted(channelID: channelID, messageID: deleted))
+    await provider.releaseBlockedPaginatedRequest()
+    await read.value
+
+    #expect(!model.messages.contains { $0.id == deleted })
+}
+
+@MainActor
+@Test func `an earlier page that arrives after a jump replaced the window is discarded`() async {
+    let channelID = historyParityChannelID
+    let provider = ChannelLoadTestProvider(paginatedThreadID: channelID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    #expect(await until { model.selectedChannelID == channelID && model.hasCompletedInitialMessageLoad })
+
+    await provider.blockNextPaginatedRequest(.before)
+    let stalePage = Task { await model.loadEarlier() }
+    await provider.waitForBlockedPaginatedRequest()
+    model.navigate(to: nil, channelID: channelID, messageID: historyParityMessageID(100))
+    #expect(await until { model.messageNavigationRequest != nil })
+    await provider.releaseBlockedPaginatedRequest()
+    await stalePage.value
+
+    #expect(model.messages.map(\.id) == (85 ..< 115).map(historyParityMessageID))
+    #expect(model.hasMoreMessages)
+    #expect(model.hasMoreLaterMessages)
+    #expect(!model.isLoadingEarlier)
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `interrupted thread history reloads after navigation`(switchesDirectly: Bool) async throws {
+    let thread = MessageThreadSummary(
+        id: ChannelID(rawValue: 91_099),
+        parentID: ChannelID(rawValue: 91_001),
+        name: "Interrupted history"
+    )
+    let provider = ChannelLoadTestProvider(blockFirstMessageRequestIn: thread.id)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    let preview = Message(
+        id: MessageID(rawValue: thread.id.rawValue - 1),
+        channelID: thread.id,
+        author: User(id: UserID(rawValue: 91_000), username: "tester", displayName: "Tester"),
+        content: "Forum preview"
+    )
+    let post = ForumPost(thread: thread, firstMessage: preview)
+    model.open(post)
+    let interruptedLoad = model.threadLoadTask
+    await provider.waitForBlockedMessageRequest()
+    if switchesDirectly {
+        model.open(MessageThreadSummary(
+            id: ChannelID(rawValue: thread.id.rawValue + 1),
+            parentID: thread.parentID,
+            name: "Other thread"
+        ))
+    } else {
+        model.closeThread()
+    }
+    model.open(post)
+    await provider.releaseBlockedMessageRequest()
+    await interruptedLoad?.value
+    await model.threadLoadTask?.value
+
+    #expect(model.threadMessages.map(\.id) == [MessageID(rawValue: thread.id.rawValue)])
+    #expect(model.hasCompletedInitialThreadLoad)
+    #expect(!model.isLoadingThread)
+    #expect(await provider.requestCount(for: thread.id) == 2)
+}
+
+@MainActor
+@Test func `forum starter preview does not bridge paginated history`() async {
+    let threadID = ChannelID(rawValue: 92_099)
+    let provider = ChannelLoadTestProvider(paginatedThreadID: threadID)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    let starter = Message(
+        id: MessageID(rawValue: threadID.rawValue),
+        channelID: threadID,
+        author: User(id: UserID(rawValue: 91_000), username: "tester", displayName: "Tester"),
+        content: "Forum starter"
+    )
+    let post = ForumPost(
+        thread: MessageThreadSummary(
+            id: threadID,
+            parentID: ChannelID(rawValue: 91_001),
+            name: "Long thread",
+            messageCount: 106
+        ),
+        firstMessage: starter
+    )
+    model.open(post)
+    #expect(model.threadMessages.map(\.id) == [starter.id])
+    await model.threadLoadTask?.value
+
+    #expect(model.threadMessages.count == 10)
+    #expect(model.threadMessages.first?.id == MessageID(rawValue: threadID.rawValue + 96))
+    #expect(model.hasMoreThreadMessages)
+
+    model.closeThread()
+    // Gateway may not deliver a closed thread's replies.
+    await provider.appendPaginatedThreadMessages(2)
+    model.open(post)
+    // The cached window appears at once and its newest page is revalidated.
+    #expect(!model.isLoadingThread)
+    #expect(model.threadMessages.count == 10)
+    #expect(model.threadMessages.first?.id == MessageID(rawValue: threadID.rawValue + 96))
+    await model.threadLoadTask?.value
+    #expect(await provider.requestCount(for: threadID) == 2)
+    #expect(model.threadMessages.map(\.id) == (96 ..< 108).map { MessageID(rawValue: threadID.rawValue + UInt64($0)) })
+    #expect(model.hasMoreThreadMessages)
+
+    for _ in 0 ..< 5 {
+        await model.loadEarlierThread()
+    }
+
+    #expect(model.threadMessages.count == 108)
+    #expect(model.threadMessages.first?.id == starter.id)
+    #expect(!model.hasMoreThreadMessages)
+}
+
+@MainActor
+@Test func `jumping into thread history pages forward to the newest reply without a gap`() async {
+    let threadID = ChannelID(rawValue: 93_099)
+    let provider = ChannelLoadTestProvider(paginatedThreadID: threadID, paginatedThreadMessageCount: 290)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    let thread = MessageThreadSummary(id: threadID, parentID: ChannelID(rawValue: 91_001), name: "Linked")
+    let author = User(id: UserID(rawValue: 91_000), username: "tester", displayName: "Tester")
+    func id(_ offset: Int) -> MessageID { MessageID(rawValue: threadID.rawValue + UInt64(offset)) }
+    func message(_ offset: Int) -> Message {
+        Message(id: id(offset), channelID: threadID, author: author, content: "message \(offset)")
+    }
+    func receiveLiveReply(_ offset: Int) async {
+        await provider.appendPaginatedThreadMessages(1)
+        model.consumeImmediately(.messageCreated(message(offset)))
+    }
+    // A cached newest window does not contain the old target.
+    model.open(thread)
+    await model.threadLoadTask?.value
+    model.closeThread()
+
+    // A reply arriving while the target's window loads lies beyond it.
+    await provider.blockNextPaginatedRequest(.around)
+    model.openThreadConversation(
+        thread,
+        starter: nil,
+        startedAt: nil,
+        initialMessages: [message(20)],
+        historyTarget: id(20)
+    )
+    #expect(model.threadMessages.map(\.id) == [id(20)])
+    await provider.waitForBlockedPaginatedRequest()
+    await receiveLiveReply(290)
+    await provider.releaseBlockedPaginatedRequest()
+    await model.threadLoadTask?.value
+    #expect(model.threadMessages.map(\.id) == (5 ..< 35).map(id))
+    #expect(model.hasMoreLaterThreadMessages)
+
+    for _ in 0 ..< 12 {
+        await model.loadLaterThread()
+    }
+    #expect(model.threadMessages.last?.id == id(274))
+    #expect(model.hasMoreLaterThreadMessages)
+    guard model.hasMoreLaterThreadMessages else { return }
+
+    // The final forward page reconciles a reply and a deletion made while
+    // it was in flight.
+    await provider.blockNextPaginatedRequest(.after)
+    let finalPage = Task { await model.loadLaterThread() }
+    await provider.waitForBlockedPaginatedRequest()
+    await receiveLiveReply(291)
+    model.consumeImmediately(.messageDeleted(channelID: threadID, messageID: id(260)))
+    await provider.releaseBlockedPaginatedRequest()
+    await finalPage.value
+
+    #expect(model.threadMessages.map(\.id) == (5 ..< 292).filter { $0 != 260 }.map(id))
+    #expect(!model.hasMoreLaterThreadMessages)
+    #expect(model.hasMoreThreadMessages)
+    #expect(!model.isLoadingLaterThread)
+}
+
+@MainActor
+@Test func `a failed thread send keeps its row across a jump to older history and back`() async {
+    let threadID = ChannelID(rawValue: 95_099)
+    let provider = ChannelLoadTestProvider(paginatedThreadID: threadID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    let thread = MessageThreadSummary(id: threadID, parentID: ChannelID(rawValue: 91_001), name: "Failed send")
+    model.open(thread)
+    await model.threadLoadTask?.value
+    model.appendOutgoingMessage(Message(
+        id: MessageID(rawValue: UInt64.max - 1),
+        channelID: threadID,
+        author: User(id: UserID(rawValue: 91_000), username: "tester", displayName: "Tester"),
+        content: "unsent",
+        nonce: "failed-send",
+        outboxState: .failed
+    ))
+
+    model.openThreadConversation(
+        thread,
+        starter: nil,
+        startedAt: nil,
+        initialMessages: [],
+        historyTarget: MessageID(rawValue: threadID.rawValue + 20)
+    )
+    await model.threadLoadTask?.value
+    #expect(model.hasMoreLaterThreadMessages)
+    #expect(model.threadMessages.last?.nonce == "failed-send")
+
+    #expect(await model.loadNewestThreadWindow())
+    #expect(model.threadMessages.dropLast().map(\.id) == (290 ..< 300).map {
+        MessageID(rawValue: threadID.rawValue + UInt64($0))
+    })
+    #expect(model.threadMessages.last?.nonce == "failed-send")
+    #expect(model.threadMessages.last?.outboxState == .failed)
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `a late send confirmation outside the thread window stays out of it and its cache`(arrivesWhileClosed: Bool) async {
+    let threadID = ChannelID(rawValue: 95_199)
+    let provider = ChannelLoadTestProvider(paginatedThreadID: threadID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    let thread = MessageThreadSummary(id: threadID, parentID: ChannelID(rawValue: 91_001), name: "Late")
+    let author = User(id: UserID(rawValue: 91_000), username: "tester", displayName: "Tester")
+    func ids(_ offsets: Range<Int>) -> [MessageID] {
+        offsets.map { MessageID(rawValue: threadID.rawValue + UInt64($0)) }
+    }
+    model.open(thread)
+    await model.threadLoadTask?.value
+    model.appendOutgoingMessage(Message(
+        id: MessageID(rawValue: UInt64.max - 1),
+        channelID: threadID,
+        author: author,
+        content: "accepted long ago",
+        nonce: "late-send",
+        outboxState: .failed
+    ))
+    if arrivesWhileClosed { model.closeThread() }
+
+    // Discord accepted the send as message 100, below the loaded window.
+    model.consumeImmediately(.messageCreated(Message(
+        id: ids(100 ..< 101)[0],
+        channelID: threadID,
+        author: author,
+        content: "accepted long ago",
+        nonce: "late-send"
+    )))
+    if !arrivesWhileClosed {
+        #expect(model.threadMessages.map(\.id) == ids(290 ..< 300))
+        model.closeThread()
+    }
+
+    model.open(thread)
+    await model.threadLoadTask?.value
+    #expect(model.threadMessages.map(\.id) == ids(290 ..< 300))
+    await model.loadEarlierThread()
+    #expect(model.threadMessages.map(\.id) == ids(270 ..< 300))
+}
+
+@MainActor
+@Test func `a send while reconnect revalidation is pending still recovers the missed replies`() async throws {
+    let threadID = ChannelID(rawValue: 96_199)
+    let provider = ChannelLoadTestProvider(paginatedThreadID: threadID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    model.consumeImmediately(.connectionChanged(.ready))
+    let thread = MessageThreadSummary(id: threadID, parentID: try #require(model.selectedChannelID), name: "Pending")
+    func ids(_ offsets: Range<Int>) -> [MessageID] {
+        offsets.map { MessageID(rawValue: threadID.rawValue + UInt64($0)) }
+    }
+    model.open(thread)
+    await model.threadLoadTask?.value
+
+    // Replies are missed during the outage; the revalidation read is held.
+    await provider.blockNextPaginatedRequest(.newest)
+    model.consumeImmediately(.connectionChanged(.disconnected))
+    await provider.appendPaginatedThreadMessages(5)
+    model.consumeImmediately(.connectionChanged(.ready))
+    await provider.waitForBlockedPaginatedRequest()
+    let revalidation = model.threadLoadTask
+    #expect(model.isThreadWindowAwayFromNewest)
+
+    model.threadDraft = "sent during revalidation"
+    let result = await model.submitThreadComposerMessage(attachments: [])
+    await provider.releaseBlockedPaginatedRequest()
+    await revalidation?.value
+
+    #expect(result.consumedComposer)
+    #expect(!model.isThreadWindowAwayFromNewest)
+    let confirmedIDs = model.threadMessages.filter { $0.outboxState == .confirmed }.map(\.id)
+    #expect(Array(confirmedIDs.suffix(5)) == ids(300 ..< 305))
+    #expect(confirmedIDs == ids(295 ..< 305))
+}
+
+@MainActor
+@Test func `retrying a failed thread link jump reloads and scrolls to its target`() async throws {
+    let threadID = ChannelID(rawValue: 96_399)
+    let provider = ChannelLoadTestProvider(paginatedThreadID: threadID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let thread = MessageThreadSummary(id: threadID, parentID: try #require(model.selectedChannelID), name: "Jump retry")
+    model.forumCataloguePosts = [ForumPost(thread: thread)]
+    let target = MessageID(rawValue: threadID.rawValue + 20)
+    await provider.failNextPaginatedRequest(.around)
+    model.navigate(to: nil, linkedChannelID: threadID, messageID: target)
+    #expect(await eventually { model.threadErrorScope == .initialPage })
+    await model.guildActivationTask?.value
+    // The failed read is not repeated; Retry keeps the target.
+    #expect(await provider.requestCount(for: threadID) == 1)
+
+    model.retryThreadLoad()
+    #expect(await eventually { model.messageNavigationRequest?.messageID == target })
+    #expect(model.threadMessages.map(\.id) == (5 ..< 35).map { MessageID(rawValue: threadID.rawValue + UInt64($0)) })
+}
+
+@MainActor
+@Test func `a send while a thread jump loads returns to the newest messages`() async {
+    let threadID = ChannelID(rawValue: 96_499)
+    let provider = ChannelLoadTestProvider(paginatedThreadID: threadID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    let thread = MessageThreadSummary(id: threadID, parentID: ChannelID(rawValue: 91_001), name: "Jump send")
+    let author = User(id: UserID(rawValue: 91_000), username: "tester", displayName: "Tester")
+    func id(_ offset: Int) -> MessageID { MessageID(rawValue: threadID.rawValue + UInt64(offset)) }
+    await provider.blockNextPaginatedRequest(.around)
+    model.openThreadConversation(thread, starter: nil, startedAt: nil, initialMessages: [], historyTarget: id(20))
+    let jump = model.threadLoadTask
+    await provider.waitForBlockedPaginatedRequest()
+
+    // An immediate send, such as a sticker, while the jump's window loads.
+    await provider.appendPaginatedThreadMessages(1)
+    model.appendOutgoingMessage(Message(
+        id: MessageID(rawValue: UInt64.max - 1),
+        channelID: threadID,
+        author: author,
+        content: "sticker",
+        nonce: "jump-send",
+        outboxState: .sending
+    ))
+    #expect(await eventually { !model.isThreadWindowAwayFromNewest })
+    model.consumeImmediately(.messageCreated(Message(
+        id: id(300),
+        channelID: threadID,
+        author: author,
+        content: "sticker",
+        nonce: "jump-send"
+    )))
+    await provider.releaseBlockedPaginatedRequest()
+    await jump?.value
+
+    #expect(model.threadMessages.map(\.id) == (291 ..< 301).map(id))
+    #expect(!model.isThreadWindowAwayFromNewest)
+    #expect(!model.isLoadingThread)
+}
+
+@MainActor
+@Test func `retrying a failed newest thread read repairs an unverified window`() async throws {
+    let threadID = ChannelID(rawValue: 96_299)
+    let provider = ChannelLoadTestProvider(paginatedThreadID: threadID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    model.consumeImmediately(.connectionChanged(.ready))
+    let thread = MessageThreadSummary(id: threadID, parentID: try #require(model.selectedChannelID), name: "Retry")
+    model.open(thread)
+    await model.threadLoadTask?.value
+
+    await provider.blockNextPaginatedRequest(.newest)
+    model.consumeImmediately(.connectionChanged(.disconnected))
+    await provider.appendPaginatedThreadMessages(5)
+    model.consumeImmediately(.connectionChanged(.ready))
+    await provider.waitForBlockedPaginatedRequest()
+    let obsoleteRevalidation = model.threadLoadTask
+
+    // A send supersedes the held revalidation with a newest read that fails.
+    await provider.failNextPaginatedRequest(.newest)
+    model.threadDraft = "sent during revalidation"
+    #expect(await !model.submitThreadComposerMessage(attachments: []).consumedComposer)
+    #expect(model.threadErrorScope == .newestWindow)
+    await provider.releaseBlockedPaginatedRequest()
+    await obsoleteRevalidation?.value
+    #expect(model.isThreadWindowAwayFromNewest)
+
+    let requestsBeforeRetry = await provider.requestCount(for: threadID)
+    model.retryThreadLoad()
+    #expect(await eventually { !model.isThreadWindowAwayFromNewest })
+    #expect(await provider.requestCount(for: threadID) == requestsBeforeRetry + 1)
+    #expect(model.threadErrorMessage == nil)
+    #expect(Array(model.threadMessages.map(\.id).suffix(5)) == (300 ..< 305).map {
+        MessageID(rawValue: threadID.rawValue + UInt64($0))
+    })
+}
+
+@MainActor
+@Test func `sending from older thread history sends what was submitted before the newest messages load`() async throws {
+    let threadID = ChannelID(rawValue: 96_099)
+    let provider = ChannelLoadTestProvider(paginatedThreadID: threadID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let thread = MessageThreadSummary(
+        id: threadID,
+        parentID: try #require(model.selectedChannelID),
+        name: "Detached send"
+    )
+    model.openThreadConversation(
+        thread,
+        starter: nil,
+        startedAt: nil,
+        initialMessages: [],
+        historyTarget: MessageID(rawValue: threadID.rawValue + 20)
+    )
+    await model.threadLoadTask?.value
+    #expect(model.hasMoreLaterThreadMessages)
+    #expect(model.openThreadAccess.canSend)
+
+    guard model.hasMoreLaterThreadMessages else { return }
+    model.threadDraft = "submitted text"
+    await provider.blockNextPaginatedRequest(.newest)
+    let submission = Task { await model.submitThreadComposerMessage(attachments: []) }
+    await provider.waitForBlockedPaginatedRequest()
+    model.threadDraft = "edited while loading"
+    await provider.releaseBlockedPaginatedRequest()
+
+    #expect(await submission.value.consumedComposer)
+    #expect(!model.hasMoreLaterThreadMessages)
+    #expect(model.threadMessages.contains { $0.content == "submitted text" && $0.nonce != nil })
+    #expect(model.threadDraft == "edited while loading")
+}
+
+@MainActor
+@Test func `a newest thread page read before a Gateway gap does not claim the newest messages`() async throws {
+    let threadID = ChannelID(rawValue: 97_099)
+    let provider = ChannelLoadTestProvider(paginatedThreadID: threadID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    model.consumeImmediately(.connectionChanged(.ready))
+    let thread = MessageThreadSummary(id: threadID, parentID: try #require(model.selectedChannelID), name: "Gap")
+    func ids(_ offsets: Range<Int>) -> [MessageID] {
+        offsets.map { MessageID(rawValue: threadID.rawValue + UInt64($0)) }
+    }
+    model.openThreadConversation(
+        thread, starter: nil, startedAt: nil, initialMessages: [],
+        historyTarget: ids(20 ..< 21)[0]
+    )
+    await model.threadLoadTask?.value
+    guard model.hasMoreLaterThreadMessages else { return }
+
+    await provider.blockNextPaginatedRequest(.newest)
+    let newest = Task { await model.loadNewestThreadWindow() }
+    await provider.waitForBlockedPaginatedRequest()
+    // Replies posted during the outage are not replayed by a fresh READY.
+    model.consumeImmediately(.connectionChanged(.disconnected))
+    await provider.appendPaginatedThreadMessages(5)
+    model.consumeImmediately(.connectionChanged(.ready))
+    // A live reply after READY lies beyond the stale page's fetched edge.
+    await provider.appendPaginatedThreadMessages(1)
+    model.consumeImmediately(.messageCreated(Message(
+        id: ids(305 ..< 306)[0],
+        channelID: threadID,
+        author: User(id: UserID(rawValue: 91_002), username: "replier", displayName: "Replier"),
+        content: "after READY"
+    )))
+    await provider.blockNextPaginatedRequest(.after)
+    await provider.releaseBlockedPaginatedRequest()
+    await newest.value
+    #expect(model.threadMessages.map(\.id) == ids(290 ..< 300))
+    #expect(model.hasMoreLaterThreadMessages)
+
+    // The deferred revalidation reads on from the fetched edge, so the
+    // missed replies arrive before the window follows the newest again.
+    await provider.waitForBlockedPaginatedRequest()
+    await provider.releaseBlockedPaginatedRequest()
+    #expect(await until { !model.hasMoreLaterThreadMessages })
+    #expect(model.threadMessages.map(\.id) == ids(290 ..< 306))
+}
+
+@MainActor
+@Test func `jumping to older thread history stops acknowledging the newest reply`() async throws {
+    let threadID = ChannelID(rawValue: 97_199)
+    let provider = ChannelLoadTestProvider(paginatedThreadID: threadID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let thread = MessageThreadSummary(id: threadID, parentID: try #require(model.selectedChannelID), name: "Read")
+    model.open(thread)
+    await model.threadLoadTask?.value
+    model.reportMainWindowActive(true)
+    model.reportTimelineInitialPosition(channelID: threadID, hasReachedReadBoundary: true)
+    #expect(model.readState.canAcknowledge(threadID))
+
+    #expect(await model.loadThreadWindow(around: MessageID(rawValue: threadID.rawValue + 20), session: model.accountSession()))
+    let acknowledged = model.readState.entries[threadID]?.lastAcknowledgedMessageID
+    model.consumeImmediately(.messageCreated(Message(
+        id: MessageID(rawValue: threadID.rawValue + 300),
+        channelID: threadID,
+        author: User(id: UserID(rawValue: 91_002), username: "replier", displayName: "Replier"),
+        content: "unseen"
+    )))
+
+    #expect(model.readState.entries[threadID]?.lastAcknowledgedMessageID == acknowledged)
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `a jump to older thread history wins over an overlapping reconnect refresh`(jumpFinishesFirst: Bool) async throws {
+    let threadID = ChannelID(rawValue: 98_099)
+    let provider = ChannelLoadTestProvider(paginatedThreadID: threadID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    model.consumeImmediately(.connectionChanged(.ready))
+    let thread = MessageThreadSummary(id: threadID, parentID: try #require(model.selectedChannelID), name: "Jump")
+    let target = MessageID(rawValue: threadID.rawValue + 20)
+    model.open(thread)
+    await model.threadLoadTask?.value
+    func reconnect() {
+        model.consumeImmediately(.connectionChanged(.disconnected))
+        model.consumeImmediately(.connectionChanged(.ready))
+    }
+
+    if jumpFinishesFirst {
+        await provider.blockNextPaginatedRequest(.around)
+        let jump = Task { await model.loadThreadWindow(around: target, session: model.accountSession()) }
+        await provider.waitForBlockedPaginatedRequest()
+        reconnect()
+        await provider.releaseBlockedPaginatedRequest()
+        #expect(await jump.value)
+    } else {
+        await provider.blockNextPaginatedRequest(.newest)
+        reconnect()
+        await provider.waitForBlockedPaginatedRequest()
+        let refresh = model.threadLoadTask
+        #expect(await model.loadThreadWindow(around: target, session: model.accountSession()))
+        await provider.releaseBlockedPaginatedRequest()
+        await refresh?.value
+    }
+    await model.threadLoadTask?.value
+
+    #expect(model.threadMessages.map(\.id) == (5 ..< 35).map { MessageID(rawValue: threadID.rawValue + UInt64($0)) })
+    #expect(model.hasMoreLaterThreadMessages)
+}
+
+@MainActor
+@Test func `an edit completing after a return to the newest thread messages stays out of the window`() async throws {
+    let threadID = ChannelID(rawValue: 99_099)
+    let provider = ChannelLoadTestProvider(paginatedThreadID: threadID, paginatedThreadMessageCount: 300)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    let thread = MessageThreadSummary(id: threadID, parentID: ChannelID(rawValue: 91_001), name: "Edit")
+    let target = MessageID(rawValue: threadID.rawValue + 20)
+    model.openThreadConversation(thread, starter: nil, startedAt: nil, initialMessages: [], historyTarget: target)
+    await model.threadLoadTask?.value
+    let edited = try #require(model.threadMessages.first { $0.id == target })
+
+    await provider.blockNextEdit()
+    let edit = Task { await model.edit(edited, content: "edited later") }
+    await provider.waitForBlockedEdit()
+    #expect(await model.loadNewestThreadWindow())
+    await provider.releaseBlockedEdit()
+    await edit.value
+
+    #expect(model.threadMessages.map(\.id) == (290 ..< 300).map { MessageID(rawValue: threadID.rawValue + UInt64($0)) })
+}
+
+@MainActor
+@Test func `an earlier page for a closed thread instance is discarded after reopening`() async {
+    let threadID = ChannelID(rawValue: 94_099)
+    let provider = ChannelLoadTestProvider(paginatedThreadID: threadID)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    let thread = MessageThreadSummary(id: threadID, parentID: ChannelID(rawValue: 91_001), name: "Stale")
+    model.open(thread)
+    await model.threadLoadTask?.value
+    #expect(model.hasMoreThreadMessages)
+
+    await provider.blockNextPaginatedRequest(.before)
+    let staleLoad = Task { await model.loadEarlierThread() }
+    await provider.waitForBlockedPaginatedRequest()
+    model.closeThread()
+    // Enough replies arrive while closed that the fresh newest page no
+    // longer reaches the cached window, which it therefore replaces.
+    await provider.appendPaginatedThreadMessages(150)
+    model.open(thread)
+    await model.threadLoadTask?.value
+    let reopenedWindow = model.threadMessages.map(\.id)
+    #expect(reopenedWindow == (246 ..< 256).map { MessageID(rawValue: threadID.rawValue + UInt64($0)) })
+
+    await provider.releaseBlockedPaginatedRequest()
+    await staleLoad.value
+
+    #expect(model.threadMessages.map(\.id) == reopenedWindow)
+    #expect(model.hasMoreThreadMessages)
+    #expect(!model.isLoadingEarlierThread)
+}
+
+@MainActor
+@Test func `failed earlier thread page retries inside the shared conversation`() async throws {
+    let provider = ChannelLoadTestProvider(failsFirstEarlierPage: true)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let parentID = try #require(model.selectedChannelID)
+    let thread = MessageThreadSummary(
+        id: ChannelID(rawValue: 91_099),
+        parentID: parentID,
+        name: "Pagination retry"
+    )
+
+    model.open(thread)
+    #expect(await until {
+        model.hasCompletedInitialThreadLoad
+            && model.hasMoreThreadMessages
+            && model.threadMessages.count == 1
+    })
+
+    await model.loadEarlierThread()
+    #expect(model.threadErrorMessage != nil)
+    #expect(model.canRetryThreadLoad)
+    #expect(model.hasMoreThreadMessages)
+
+    model.retryThreadLoad()
+
+    #expect(await until {
+        model.threadErrorMessage == nil
+            && !model.isLoadingEarlierThread
+            && !model.hasMoreThreadMessages
+            && model.threadMessages.count == 2
+    })
+    #expect(await provider.requestCount(for: thread.id) == 3)
+}
+
+@MainActor
+@Test func `reaction preview enrichment waits for live timeline scrolling to end`() async throws {
+    let provider = ChannelLoadTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+
+    let message = try #require(model.messages.first)
+    let reaction = try #require(message.reactions.first)
+    let primaryID = message.channelID
+    let supplementaryID = ChannelID(rawValue: 910_002)
+    model.reportTimelineLiveScrolling(
+        true,
+        conversationID: primaryID
+    )
+    model.reportTimelineLiveScrolling(
+        true,
+        conversationID: supplementaryID
+    )
+    let load = Task {
+        await model.loadReactionReactors(reaction, on: message)
+    }
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(await provider.reactorRequestCount() == 0)
+    #expect(model.messages.first?.reactions.first?.reactors.isEmpty == true)
+
+    model.reportTimelineLiveScrolling(
+        false,
+        conversationID: primaryID
+    )
+    try await Task.sleep(for: .milliseconds(80))
+
+    #expect(await provider.reactorRequestCount() == 0)
+    #expect(model.messages.first?.reactions.first?.reactors.isEmpty == true)
+
+    model.reportTimelineLiveScrolling(
+        false,
+        conversationID: supplementaryID
+    )
+    await load.value
+
+    #expect(await provider.reactorRequestCount() == 1)
+    #expect(model.messages.first?.reactions.first?.reactors.count == 5)
+}
+
+@MainActor
+@Test func `unread projection waits for live timeline scrolling to end`() async {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    let channelID = model.selectedChannelID ?? ChannelID(rawValue: 1)
+
+    model.reportTimelineLiveScrolling(true, conversationID: channelID)
+    model.refreshUnreadPresentation()
+    #expect(model.hasDeferredUnreadPresentationRefresh)
+
+    model.reportTimelineLiveScrolling(false, conversationID: channelID)
+    #expect(!model.hasDeferredUnreadPresentationRefresh)
+}
+
+@MainActor
+@Test func `reading a channel mid-scroll clears its indicators before scrolling ends`() async throws {
+    let model = AppModel(launchMode: .offlineTesting, provider: StartupUnreadTestProvider())
+    await model.start()
+    let channelID = try #require(model.visibleChannels.first).id
+    let guildID = GuildID(rawValue: 77_000)
+    let cleared = {
+        model.visibleChannels.first?.unreadCount == 0
+            && model.visibleChannels.first?.mentionCount == 0
+            && model.serverRailGuildsByID[guildID]?.unreadCount == 0
+            && model.serverRailGuildsByID[guildID]?.mentionCount == 0
+    }
+
+    model.reportTimelineLiveScrolling(true, conversationID: channelID)
+    model.markConversationRead(channelID: channelID)
+    #expect(cleared())
+    #expect(model.hasDeferredUnreadPresentationRefresh)
+
+    // The full projection reconciles once scrolling ends, without reverting.
+    model.reportTimelineLiveScrolling(false, conversationID: channelID)
+    await model.waitForUnreadPresentationPreparation()
+    #expect(cleared())
+}
+
+@MainActor
+@Test func `permission revocation applies while unread publication is deferred`() async {
+    let model = AppModel(launchMode: .offlineTesting)
+    await model.start()
+    let privateChannelID = ChannelID(rawValue: 215)
+    #expect(
+        model.snapshot?.channels.contains { $0.id == privateChannelID }
+            == true
+    )
+
+    model.hiddenChannelIDs.remove(privateChannelID)
+    model.readState.applyAccessibility([privateChannelID: true])
+    model.reportTimelineLiveScrolling(true, conversationID: privateChannelID)
+    model.refreshUnreadPresentation(appliesAccessImmediately: true)
+
+    #expect(model.hasDeferredUnreadPresentationRefresh)
+    #expect(model.hiddenChannelIDs.contains(privateChannelID))
+    #expect(model.readState.entries[privateChannelID]?.isAccessible == false)
+
+    model.reportTimelineLiveScrolling(false, conversationID: privateChannelID)
+}
+
+@MainActor
+@Test func `ready role snapshot replaces stale guild role sets`() {
+    let model = AppModel(launchMode: .offlineTesting)
+    let firstGuildID = GuildID(rawValue: 91_001)
+    let secondGuildID = GuildID(rawValue: 91_002)
+    let firstRoleID = RoleID(rawValue: 92_001)
+    let secondRoleID = RoleID(rawValue: 92_002)
+
+    model.consumePresenceAndCommandEvent(
+        .currentUserRolesSnapshot([
+            firstGuildID: [firstRoleID],
+            secondGuildID: [secondRoleID]
+        ])
+    )
+
+    #expect(model.currentUserRoleIDsByGuild[firstGuildID] == [firstRoleID])
+    #expect(model.currentUserRoleIDsByGuild[secondGuildID] == [secondRoleID])
+
+    model.consumePresenceAndCommandEvent(
+        .currentUserRolesSnapshot([firstGuildID: []])
+    )
+
+    #expect(model.currentUserRoleIDsByGuild[firstGuildID] == [])
+    #expect(model.currentUserRoleIDsByGuild[secondGuildID] == nil)
+}
+
+@MainActor
+@Test func `guild role updates preserve unrelated guild access projection`() {
+    let model = AppModel(launchMode: .offlineTesting)
+    let user = User(
+        id: UserID(rawValue: 92_100), username: "member", displayName: "Member"
+    )
+    let updatedGuild = Guild(id: GuildID(rawValue: 92_101), name: "Updated")
+    let unrelatedGuild = Guild(id: GuildID(rawValue: 92_102), name: "Unrelated")
+    let updatedChannel = Channel(
+        id: ChannelID(rawValue: 92_103),
+        guildID: updatedGuild.id,
+        name: "updated",
+        kind: .text
+    )
+    let unrelatedChannel = Channel(
+        id: ChannelID(rawValue: 92_104),
+        guildID: unrelatedGuild.id,
+        name: "unrelated",
+        kind: .text
+    )
+    model.snapshot = BootstrapSnapshot(
+        currentUser: user,
+        guilds: [updatedGuild, unrelatedGuild],
+        channels: [updatedChannel, unrelatedChannel],
+        members: []
+    )
+    model.serverRailGuildsByID = [
+        updatedGuild.id: updatedGuild,
+        unrelatedGuild.id: unrelatedGuild,
+    ]
+    model.currentUserRoleIDsByGuild[updatedGuild.id] = []
+    model.hiddenChannelIDs = [unrelatedChannel.id]
+    model.selectedGuildID = updatedGuild.id
+
+    model.applyGuildRoles(
+        [
+            GuildRole(
+                id: RoleID(rawValue: updatedGuild.id.rawValue),
+                name: "@everyone",
+                position: 0,
+                permissions: DiscordPermissionBits.viewChannel
+                    | DiscordPermissionBits.sendMessages
+                    | DiscordPermissionBits.readMessageHistory
+            )
+        ],
+        to: updatedGuild.id
+    )
+
+    #expect(model.conversationAccess(for: updatedChannel).isReadable)
+    #expect(!model.hiddenChannelIDs.contains(updatedChannel.id))
+    #expect(model.hiddenChannelIDs.contains(unrelatedChannel.id))
+}
+
+@MainActor
+@Test func `role snapshot preserves unchanged guild access projection`() {
+    let model = AppModel(launchMode: .offlineTesting)
+    let user = User(
+        id: UserID(rawValue: 92_200), username: "member", displayName: "Member"
+    )
+    let changedGuild = Guild(id: GuildID(rawValue: 92_201), name: "Changed")
+    let unchangedGuild = Guild(id: GuildID(rawValue: 92_202), name: "Unchanged")
+    let changedChannel = Channel(
+        id: ChannelID(rawValue: 92_203),
+        guildID: changedGuild.id,
+        name: "changed",
+        kind: .text
+    )
+    let unchangedChannel = Channel(
+        id: ChannelID(rawValue: 92_204),
+        guildID: unchangedGuild.id,
+        name: "unchanged",
+        kind: .text
+    )
+    model.snapshot = BootstrapSnapshot(
+        currentUser: user,
+        guilds: [changedGuild, unchangedGuild],
+        channels: [changedChannel, unchangedChannel],
+        members: []
+    )
+    model.serverRailGuildsByID = [
+        changedGuild.id: changedGuild,
+        unchangedGuild.id: unchangedGuild,
+    ]
+    let readablePermissions = DiscordPermissionBits.viewChannel
+        | DiscordPermissionBits.sendMessages
+        | DiscordPermissionBits.readMessageHistory
+    model.guildRolesByGuildID = [
+        changedGuild.id: [
+            GuildRole(
+                id: RoleID(rawValue: changedGuild.id.rawValue),
+                name: "@everyone",
+                position: 0,
+                permissions: readablePermissions
+            )
+        ],
+        unchangedGuild.id: [
+            GuildRole(
+                id: RoleID(rawValue: unchangedGuild.id.rawValue),
+                name: "@everyone",
+                position: 0,
+                permissions: readablePermissions
+            )
+        ],
+    ]
+    let changedRoleID = RoleID(rawValue: 92_205)
+    model.currentUserRoleIDsByGuild = [
+        changedGuild.id: [],
+        unchangedGuild.id: [],
+    ]
+    model.hiddenChannelIDs = [unchangedChannel.id]
+
+    model.consumeCurrentUserRolesSnapshot([
+        changedGuild.id: [changedRoleID],
+        unchangedGuild.id: [],
+    ])
+
+    #expect(!model.hiddenChannelIDs.contains(changedChannel.id))
+    #expect(model.hiddenChannelIDs.contains(unchangedChannel.id))
+}
+
+@MainActor
+@Test func `channel replacement removes deleted access projection entries`() {
+    let model = AppModel(launchMode: .offlineTesting)
+    let user = User(
+        id: UserID(rawValue: 92_300), username: "member", displayName: "Member"
+    )
+    let guild = Guild(id: GuildID(rawValue: 92_301), name: "Guild")
+    let deletedChannel = Channel(
+        id: ChannelID(rawValue: 92_302),
+        guildID: guild.id,
+        name: "deleted",
+        kind: .text
+    )
+    let replacementChannel = Channel(
+        id: ChannelID(rawValue: 92_303),
+        guildID: guild.id,
+        name: "replacement",
+        kind: .text
+    )
+    model.snapshot = BootstrapSnapshot(
+        currentUser: user,
+        guilds: [guild],
+        channels: [deletedChannel],
+        members: []
+    )
+    model.serverRailGuildsByID = [guild.id: guild]
+    model.currentUserRoleIDsByGuild[guild.id] = []
+    model.hiddenChannelIDs = [deletedChannel.id]
+    model.checkingChannelIDs = [deletedChannel.id]
+
+    model.consumeChannelsChanged(
+        guildID: guild.id,
+        channels: [replacementChannel]
+    )
+
+    #expect(!model.hiddenChannelIDs.contains(deletedChannel.id))
+    #expect(!model.checkingChannelIDs.contains(deletedChannel.id))
+    #expect(model.snapshot?.channels == [replacementChannel])
+}
+
+@MainActor
+@Test func `channel access replacement preserves unchanged access projections`() {
+    let model = AppModel(launchMode: .offlineTesting)
+    let user = User(
+        id: UserID(rawValue: 92_310), username: "member", displayName: "Member"
+    )
+    let guild = Guild(
+        id: GuildID(rawValue: 92_311),
+        name: "Guild",
+        currentUserPermissions: DiscordPermissionBits.viewChannel
+            | DiscordPermissionBits.sendMessages
+            | DiscordPermissionBits.readMessageHistory
+    )
+    let changedChannel = Channel(
+        id: ChannelID(rawValue: 92_312),
+        guildID: guild.id,
+        name: "changed",
+        kind: .text
+    )
+    let unchangedChannel = Channel(
+        id: ChannelID(rawValue: 92_313),
+        guildID: guild.id,
+        name: "unchanged",
+        kind: .text
+    )
+    model.snapshot = BootstrapSnapshot(
+        currentUser: user,
+        guilds: [guild],
+        channels: [changedChannel, unchangedChannel],
+        members: []
+    )
+    model.serverRailGuildsByID = [guild.id: guild]
+    model.currentUserRoleIDsByGuild[guild.id] = []
+    model.hiddenChannelIDs = [unchangedChannel.id]
+
+    let revokedChannel = Channel(
+        id: changedChannel.id,
+        guildID: guild.id,
+        name: changedChannel.name,
+        kind: changedChannel.kind,
+        permissionOverwrites: [
+            ChannelPermissionOverwrite(
+                id: guild.id.description,
+                type: 0,
+                deny: DiscordPermissionBits.viewChannel
+            ),
+        ]
+    )
+    model.consumeChannelsChanged(
+        guildID: guild.id,
+        channels: [revokedChannel, unchangedChannel]
+    )
+
+    #expect(model.hiddenChannelIDs.contains(revokedChannel.id))
+    #expect(model.hiddenChannelIDs.contains(unchangedChannel.id))
+}
+
+@MainActor
+@Test func `gateway lifecycle projections update app workspace state`() {
+    let model = AppModel(launchMode: .offlineTesting)
+    let oldUser = User(
+        id: UserID(rawValue: 93_001), username: "before", displayName: "Before"
+    )
+    let updatedUser = User(
+        id: oldUser.id, username: "after", displayName: "After"
+    )
+    let guild = Guild(id: GuildID(rawValue: 93_002), name: "Joined Guild")
+    let role = GuildRole(
+        id: RoleID(rawValue: 93_003), name: "Member", position: 1,
+        permissions: 1_024
+    )
+    model.snapshot = BootstrapSnapshot(
+        currentUser: oldUser, guilds: [], channels: [], members: []
+    )
+
+    model.consumePresenceAndCommandEvent(
+        .guildLayoutChanged(guilds: [guild], railItems: [.guild(guild.id)])
+    )
+    model.consumePresenceAndCommandEvent(
+        .guildRolesChanged(guildID: guild.id, roles: [role])
+    )
+    model.consumePresenceAndCommandEvent(
+        .currentUserRolesSnapshot([guild.id: [role.id]])
+    )
+    model.consumePresenceAndCommandEvent(.currentUserChanged(updatedUser))
+
+    #expect(model.snapshot?.guilds == [guild])
+    #expect(model.serverRailGuildsByID[guild.id] == guild)
+    #expect(model.guildRolesByGuildID[guild.id] == [role])
+    #expect(model.currentUserRoleIDsByGuild[guild.id] == [role.id])
+    #expect(model.snapshot?.currentUser == updatedUser)
+
+    model.consumePresenceAndCommandEvent(
+        .guildLayoutChanged(guilds: [], railItems: [])
+    )
+
+    #expect(model.currentUserRoleIDsByGuild[guild.id] == nil)
+}
+
+@MainActor
+@Test func `provider member refresh revokes access during live scrolling`() async {
+    let provider = MemberRoleRevocationTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let channelID = provider.channelID
+
+    #expect(await provider.waitUntilMemberRequestStarts())
+    #expect(!model.hiddenChannelIDs.contains(channelID))
+    model.reportTimelineLiveScrolling(true, conversationID: channelID)
+    await provider.releaseRevokedMember()
+
+    #expect(await until {
+        model.hiddenChannelIDs.contains(channelID)
+            && model.readState.entries[channelID]?.isAccessible == false
+    })
+    #expect(model.hasDeferredUnreadPresentationRefresh)
+    model.reportTimelineLiveScrolling(false, conversationID: channelID)
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `visible reaction preview reads stay within the app request budget`(hasPartialPreview: Bool) async {
+    let provider = ChannelLoadTestProvider(reactionPreviewResultCount: 2)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+
+    await withTaskGroup(of: Void.self) { group in
+        for value in 0 ..< 12 {
+            let message = Message(
+                id: MessageID(rawValue: UInt64(92000 + value)),
+                channelID: ChannelID(rawValue: 91001),
+                author: User(
+                    id: UserID(rawValue: 91000),
+                    username: "tester",
+                    displayName: "Tester"
+                ),
+                content: "reaction \(value)",
+                reactions: [Reaction(
+                    emoji: "emoji-\(value)", count: 4,
+                    reactors: hasPartialPreview ? [ReactionReactor(
+                        id: UserID(rawValue: 1), displayName: "One"
+                    )] : []
+                )]
+            )
+            #expect(MessageReactionPresentation.needsPreviewLoad(message.reactions[0]))
+            group.addTask {
+                await model.loadReactionReactors(message.reactions[0], on: message)
+                // A short response must not trigger another request when the
+                // view is recreated with the same count and partial identities.
+                await model.loadReactionReactors(message.reactions[0], on: message)
+            }
+        }
+    }
+
+    #expect(await provider.reactorRequestCount() == 12)
+    let changed = Message(
+        id: MessageID(rawValue: 92000), channelID: ChannelID(rawValue: 91001),
+        author: User(id: UserID(rawValue: 91000), username: "tester", displayName: "Tester"),
+        content: "changed reaction", reactions: [Reaction(emoji: "emoji-0", count: 5)]
+    )
+    await model.loadReactionReactors(changed.reactions[0], on: changed)
+    #expect(await provider.reactorRequestCount() == 13)
+    model.clearReactionReactorLoadState(channelID: changed.channelID, messageID: changed.id)
+    await model.loadReactionReactors(changed.reactions[0], on: changed)
+    #expect(await provider.reactorRequestCount() == 14)
+    model.applyReactionUpdate(.removeAll(channelID: changed.channelID, messageID: changed.id))
+    await model.loadReactionReactors(changed.reactions[0], on: changed)
+    #expect(await provider.reactorRequestCount() == 15)
+    #expect(
+        await provider.maximumConcurrentReactorRequestCount()
+            <= AppModel.maximumConcurrentReactionReactorLoads
+    )
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `revisited messages restore reactor identities without another request`(isSelected: Bool) async throws {
+    let provider = ChannelLoadTestProvider(reactionPreviewResultCount: 2)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let channelID = ChannelID(rawValue: 91001)
+    model.selectedChannelID = isSelected ? channelID : ChannelID(rawValue: 91002)
+    let message = Message(
+        id: MessageID(rawValue: 92400), channelID: channelID,
+        author: User(id: UserID(rawValue: 91000), username: "tester", displayName: "Tester"),
+        content: "revisited reaction", reactions: [Reaction(emoji: "👍", count: 4)]
+    )
+    func replaceHistory(with messages: [Message]) {
+        if isSelected {
+            model.replaceSelectedMessages(with: messages)
+        } else {
+            model.messageCache[channelID] = messages
+        }
+    }
+    func retainedMessage() -> Message? {
+        (isSelected ? model.messages : model.messageCache[channelID] ?? []).first
+    }
+    replaceHistory(with: [message])
+    await model.loadReactionReactors(message.reactions[0], on: message)
+    let fetched = try #require(retainedMessage()?.reactions.first?.reactors)
+    #expect(fetched.count == 2)
+    #expect(await provider.reactorRequestCount() == 1)
+
+    // Leave the history window, then replace it with a fresh payload that
+    // retains the count but contains none of the previously fetched users.
+    replaceHistory(with: [])
+    replaceHistory(with: [message])
+    #expect(retainedMessage()?.reactions.first?.reactors.isEmpty == true)
+    #expect(model.retainedReactionReactors(for: message.reactions[0], on: message) == fetched)
+    #expect(model.retainedReactionReactors(for: Reaction(emoji: "👍", count: 5), on: message).isEmpty)
+    #expect(await provider.reactorRequestCount() == 1)
+    await model.loadReactionReactors(message.reactions[0], on: message)
+    #expect(retainedMessage()?.reactions.first?.reactors == fetched)
+    #expect(await provider.reactorRequestCount() == 1)
+    if isSelected {
+        #expect(model.messageRows == MessageGrouping.rows(for: model.messages))
+    }
+}
+
+@MainActor
+@Test func `reaction preview count changes await the shared load after a view cancels`() async {
+    let provider = ChannelLoadTestProvider(
+        reactionPreviewResultCount: 2, suspendsFirstReactionRequest: true
+    )
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let message = Message(
+        id: MessageID(rawValue: 92500), channelID: ChannelID(rawValue: 91001),
+        author: User(id: UserID(rawValue: 91000), username: "tester", displayName: "Tester"),
+        content: "reaction", reactions: [Reaction(emoji: "👍", count: 2)]
+    )
+    let first = Task { await model.loadReactionReactors(message.reactions[0], on: message) }
+    await provider.waitForFirstReactionRequest()
+    first.cancel()
+    let changed = Reaction(emoji: "👍", count: 4)
+    let replacement = Task { await model.loadReactionReactors(changed, on: message) }
+    await provider.releaseFirstReactionRequest()
+    await replacement.value
+    await first.value
+    #expect(await provider.reactorRequestCount() == 2)
+    await model.loadReactionReactors(changed, on: message)
+    #expect(await provider.reactorRequestCount() == 2)
+    #expect(model.reactionReactorLoadTasks.isEmpty)
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `reaction changes discard pending preview identities even if the count returns`(restoresCount: Bool) async throws {
+    let provider = ChannelLoadTestProvider(reactionPreviewResultCount: 2, suspendsFirstReactionRequest: true)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let remaining = ReactionReactor(id: UserID(rawValue: 2), displayName: "Two")
+    let newcomer = try #require(model.snapshot?.currentUser)
+    let message = Message(
+        id: MessageID(rawValue: 92501), channelID: ChannelID(rawValue: 91001),
+        author: newcomer, content: "Pending preview",
+        reactions: [Reaction(emoji: "👍", count: 2, reactors: [remaining])]
+    )
+    model.replaceSelectedMessages(with: [message])
+    let load = Task { await model.loadReactionReactors(message.reactions[0], on: message) }
+    await provider.waitForFirstReactionRequest()
+    load.cancel()
+    model.applyReactionUpdate(.remove(
+        channelID: message.channelID, messageID: message.id,
+        userID: UserID(rawValue: 1), emoji: "👍", kind: .normal
+    ))
+    if restoresCount {
+        model.applyReactionUpdate(.add(
+            channelID: message.channelID, messageID: message.id,
+            userID: newcomer.id, emoji: "👍", kind: .normal
+        ))
+    }
+    await provider.releaseFirstReactionRequest()
+    await load.value
+
+    let current = try #require(model.messages.first)
+    let reaction = try #require(current.reactions.first)
+    let expectedIDs = restoresCount ? [remaining.id, newcomer.id] : [remaining.id]
+    #expect(reaction.count == expectedIDs.count)
+    #expect(reaction.reactors.map(\.id) == expectedIDs)
+    #expect(model.retainedReactionReactors(for: reaction, on: current).map(\.id) == expectedIDs)
+    #expect(model.loadedReactionReactorPreviews.isEmpty)
+    #expect(model.reactionReactorLoadTasks.isEmpty)
+    #expect(model.reactionReactorLoadIDs.isEmpty)
+    #expect(await provider.reactorRequestCount() == 1)
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `reaction changes preserve unrelated pending and saved previews`(clearsAll: Bool) async throws {
+    let provider = ChannelLoadTestProvider(reactionPreviewResultCount: 2, suspendsFirstReactionRequest: true)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let message = Message(
+        id: MessageID(rawValue: 92502), channelID: ChannelID(rawValue: 91001),
+        author: try #require(model.snapshot?.currentUser), content: "Independent previews",
+        reactions: [Reaction(emoji: "✅", count: 2), Reaction(emoji: "👍", count: 2)]
+    )
+    model.replaceSelectedMessages(with: [message])
+    let load = Task { await model.loadReactionReactors(message.reactions[0], on: message) }
+    await provider.waitForFirstReactionRequest()
+    model.applyReactionUpdate(clearsAll
+        ? .removeAll(channelID: message.channelID, messageID: message.id)
+        : .removeEmoji(channelID: message.channelID, messageID: message.id, emoji: "👍"))
+    await provider.releaseFirstReactionRequest()
+    await load.value
+
+    let current = try #require(model.messages.first)
+    let reactors = model.retainedReactionReactors(for: message.reactions[0], on: current)
+    #expect(reactors.count == (clearsAll ? 0 : 2))
+    #expect(model.loadedReactionReactorPreviews.count == (clearsAll ? 0 : 1))
+    if !clearsAll {
+        // History replacement should restore the unaffected cache without another read.
+        model.replaceSelectedMessages(with: [message])
+        await model.loadReactionReactors(message.reactions[0], on: message)
+        #expect(model.messages.first?.reactions.first?.reactors == reactors)
+    }
+    #expect(await provider.reactorRequestCount() == 1)
+}
+
+@MainActor
+@Test func `voice server reallocation keeps the call selected and reconnects`() async throws {
+    let provider = VoiceMigrationTestProvider()
+    let sounds = RecordingAppSoundPlayer()
+    let model = AppModel(
+        launchMode: .offlineTesting,
+        provider: provider,
+        soundPlayer: sounds
+    )
+    await model.start()
+    let voiceChannel = try #require(model.visibleChannels.first)
+
+    await model.joinVoice(voiceChannel)
+    #expect(model.activeVoiceChannel?.id == voiceChannel.id)
+    #expect(model.voiceSessionState == .connected)
+    #expect(sounds.played == [.userJoin])
+
+    await provider.emit(.voiceServerChanged(nil))
+    #expect(await until { model.voiceSessionState == .reconnecting })
+    #expect(model.activeVoiceChannel?.id == voiceChannel.id)
+
+    await provider.emit(.voiceServerChanged(provider.connectionInfo(token: "replacement")))
+    #expect(await until { model.voiceSessionState == .connected })
+    #expect(model.activeVoiceChannel?.id == voiceChannel.id)
+    #expect(sounds.played == [.userJoin])
+
+    await model.leaveVoice()
+    #expect(sounds.played == [.userJoin, .disconnect])
+}
+
+@MainActor
+@Test func `newer voice join wins when prior call teardown completes out of order`() async throws {
+    let provider = SuspendedVoiceReplacementProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    let channels = provider.testChannels
+    let currentUser = provider.currentUser
+    model.snapshot = BootstrapSnapshot(
+        currentUser: currentUser,
+        guilds: [],
+        channels: channels,
+        members: []
+    )
+    model.activeVoiceChannel = channels[0]
+    model.voiceSessionState = .connected
+
+    let firstJoin = Task { await model.joinVoice(channels[1]) }
+    await provider.waitUntilLeaveStarts(call: 1)
+    let secondJoin = Task { await model.joinVoice(channels[2]) }
+    await provider.waitUntilLeaveStarts(call: 2)
+
+    await provider.releaseLeave(call: 2)
+    await secondJoin.value
+    await provider.releaseLeave(call: 1)
+    await firstJoin.value
+
+    #expect(model.activeVoiceChannel?.id == channels[2].id)
+    #expect(await provider.joinedChannelIDs == [channels[2].id])
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `private calls remain app wide and reconcile incoming ongoing and deleted state`(usesInitialSnapshot: Bool) async throws {
+    let provider = VoiceMigrationTestProvider()
+    let sounds = RecordingAppSoundPlayer()
+    let model = AppModel(
+        launchMode: .offlineTesting,
+        provider: provider,
+        soundPlayer: sounds,
+        notificationPreferences: NotificationPreferences(defaults: InMemoryPreferences())
+    )
+    model.notificationPreferences.isEnabled = false
+    model.notificationPreferences.playsSound = true
+    await model.start()
+    let currentUserID = try #require(model.snapshot?.currentUser.id)
+    let channelID = ChannelID(rawValue: 88_800)
+    let senderID = UserID(rawValue: 88_801)
+
+    await provider.emit(
+        .privateCallChanged(
+            PrivateCall(
+                channelID: channelID,
+                messageID: MessageID(rawValue: 88_802),
+                region: "rotterdam",
+                ongoingRings: [
+                    PrivateCallRing(
+                        recipientID: currentUserID,
+                        senderID: senderID
+                    )
+                ],
+                voiceStates: []
+            )
+        )
+    )
+    #expect(await until {
+        model.incomingPrivateCalls.map(\.channelID) == [channelID]
+    })
+    #expect(model.privateCall(in: channelID)?.isRinging(currentUserID) == true)
+    #expect(model.joinablePrivateCall(in: channelID) != nil)
+    #expect(sounds.looping[.callRinging] == true)
+
+    let initialVoiceStates = [
+        VoiceParticipantState(
+            userID: senderID,
+            channelID: channelID,
+            guildID: nil,
+            sessionID: "private-session"
+        )
+    ]
+    await provider.emit(
+        .privateCallChanged(
+            PrivateCall(
+                channelID: channelID,
+                messageID: MessageID(rawValue: 88_802),
+                region: "rotterdam",
+                ongoingRings: [],
+                voiceStates: usesInitialSnapshot ? [] : initialVoiceStates
+            )
+        )
+    )
+    if usesInitialSnapshot { await provider.emit(.voiceStatesReceived(initialVoiceStates)) }
+    #expect(await until {
+        model.privateCall(in: channelID)?.voiceStates?.map(\.userID) == [senderID]
+    })
+    if usesInitialSnapshot {
+        #expect(model.voiceSidebarPresentation.entry(for: channelID).participants.map(\.id) == [senderID])
+    }
+    #expect(model.incomingPrivateCalls.isEmpty)
+    #expect(model.privateCall(in: channelID)?.voiceStates?.map(\.userID) == [senderID])
+    #expect(model.joinablePrivateCall(in: channelID) != nil)
+    #expect(sounds.looping[.callRinging] == false)
+
+    let destinationChannelID = ChannelID(rawValue: 88_804)
+    await provider.emit(
+        .privateCallChanged(
+            PrivateCall(
+                channelID: destinationChannelID,
+                messageID: MessageID(rawValue: 88_805),
+                region: "rotterdam",
+                voiceStates: []
+            )
+        )
+    )
+    await provider.emit(
+        .voiceStateChanged(
+            VoiceParticipantState(
+                userID: senderID,
+                channelID: destinationChannelID,
+                guildID: nil,
+                sessionID: "private-session-b"
+            )
+        )
+    )
+    #expect(await until {
+        model.privateCall(in: channelID)?.voiceStates?.isEmpty == true
+            && model.privateCall(in: destinationChannelID)?.voiceStates?.map(\.userID)
+                == [senderID]
+    })
+    #expect(model.joinablePrivateCall(in: channelID) == nil)
+    #expect(model.joinablePrivateCall(in: destinationChannelID) != nil)
+
+    await provider.emit(.privateCallDeleted(channelID: channelID, unavailable: false))
+    #expect(await until { model.privateCall(in: channelID) == nil })
+    #expect(sounds.looping[.callRinging] == false)
+}
+
+@MainActor
+@Test(.timeLimit(.minutes(1))) func `concurrent private call actions stay within one request budget`() async throws {
+    let provider = PrivateCallActionTestProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let channel = try #require(
+        model.snapshot?.channels.first(where: {
+            $0.kind == .directMessage
+        })
+    )
+    let baselineCounts = await provider.counts()
+    model.privateCallsByChannel[channel.id] = PrivateCall(
+        channelID: channel.id,
+        messageID: MessageID(rawValue: 88_813),
+        region: "rotterdam",
+        voiceStates: []
+    )
+
+    let firstStart = Task {
+        await model.startPrivateCall(in: channel)
+    }
+    #expect(await provider.waitUntilRingabilityStarts())
+    #expect(model.isPrivateCallActionInFlight(in: channel.id))
+
+    let duplicateStarts = (0 ..< 4).map { _ in
+        Task {
+            await model.startPrivateCall(in: channel)
+        }
+    }
+    for duplicate in duplicateStarts {
+        await cancellableValue(of: duplicate)
+    }
+
+    let suspendedStartCounts = await provider.counts()
+    #expect(suspendedStartCounts.subscriptions == baselineCounts.subscriptions + 1)
+    #expect(suspendedStartCounts.ringabilityReads == 1)
+    #expect(suspendedStartCounts.voiceJoins == 0)
+    #expect(suspendedStartCounts.rings == 0)
+
+    await provider.releaseRingability()
+    await cancellableValue(of: firstStart)
+
+    let completedStartCounts = await provider.counts()
+    #expect(completedStartCounts.subscriptions == baselineCounts.subscriptions + 1)
+    #expect(completedStartCounts.ringabilityReads == 1)
+    #expect(completedStartCounts.voiceJoins == 1)
+    #expect(completedStartCounts.rings == 1)
+    #expect(!model.isPrivateCallActionInFlight(in: channel.id))
+
+    let currentUserID = try #require(model.snapshot?.currentUser.id)
+    let call = PrivateCall(
+        channelID: channel.id,
+        messageID: MessageID(rawValue: 88_803),
+        region: "rotterdam",
+        ongoingRings: [
+            PrivateCallRing(
+                recipientID: currentUserID,
+                senderID: channel.recipients[0].id
+            )
+        ]
+    )
+    let firstDecline = Task {
+        await model.declinePrivateCall(call)
+    }
+    #expect(await provider.waitUntilDeclineStarts())
+    #expect(model.isPrivateCallActionInFlight(in: channel.id))
+
+    let duplicateDeclines = (0 ..< 4).map { _ in
+        Task {
+            await model.declinePrivateCall(call)
+        }
+    }
+    for duplicate in duplicateDeclines {
+        await cancellableValue(of: duplicate)
+    }
+    #expect((await provider.counts()).declines == 1)
+
+    await provider.releaseDecline()
+    await cancellableValue(of: firstDecline)
+    #expect((await provider.counts()).declines == 1)
+    #expect(!model.isPrivateCallActionInFlight(in: channel.id))
+}
+
+private struct ReactionMutationRequest: Equatable, Sendable {
+    var messageID: MessageID
+    var emoji: String
+    var reacted: Bool
+}
+
+private actor ReactionMutationTestProvider: ChatProvider {
+    private let user = User(
+        id: UserID(rawValue: 98_001),
+        username: "reaction-tester",
+        displayName: "Reaction Tester"
+    )
+    private let channel = Channel(
+        id: ChannelID(rawValue: 98_002),
+        guildID: nil,
+        name: "reaction-tests"
+    )
+    private let blocksFirstRequest: Bool
+    private let failingEmoji: String?
+    private let initialReaction: Reaction?
+    private var failures: [ChatProviderError]
+    private var recordedRequests: [ReactionMutationRequest] = []
+    private var continuation: AsyncStream<ClientEvent>.Continuation?
+    private var didBlockFirstRequest = false
+    private var firstRequestContinuation: CheckedContinuation<Void, Never>?
+
+    init(
+        blocksFirstRequest: Bool = false,
+        failingEmoji: String? = nil,
+        initialReaction: Reaction? = nil,
+        failures: [ChatProviderError] = []
+    ) {
+        self.blocksFirstRequest = blocksFirstRequest
+        self.failingEmoji = failingEmoji
+        self.initialReaction = initialReaction
+        self.failures = failures
+    }
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        BootstrapSnapshot(currentUser: user, guilds: [], channels: [channel], members: [])
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        [channel]
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] {
+        []
+    }
+
+    func profile(for userID: UserID, in guildID: GuildID?) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest("Profiles are not part of this test.")
+    }
+
+    func currentStatus() async -> PresenceStatus {
+        .online
+    }
+
+    func updateStatus(_ status: PresenceStatus) async throws {}
+
+    func messages(in channelID: ChannelID, before: MessageID?, limit: Int) async throws
+        -> MessagePage
+    {
+        MessagePage(
+            messages: [
+                Message(
+                    id: MessageID(rawValue: 98_100),
+                    channelID: channel.id,
+                    author: user,
+                    content: "First",
+                    reactions: initialReaction.map { [$0] } ?? []
+                ),
+                Message(
+                    id: MessageID(rawValue: 98_101),
+                    channelID: channel.id,
+                    author: user,
+                    content: "Second"
+                ),
+            ],
+            hasMoreBefore: false
+        )
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Sending is not part of this test.")
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Editing is not part of this test.")
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+
+    func toggleReaction(_ emoji: String, messageID: MessageID, channelID: ChannelID) async throws {}
+
+    func setReaction(
+        _ emoji: String,
+        reacted: Bool,
+        messageID: MessageID,
+        channelID: ChannelID
+    ) async throws {
+        recordedRequests.append(
+            ReactionMutationRequest(messageID: messageID, emoji: emoji, reacted: reacted)
+        )
+        if blocksFirstRequest, !didBlockFirstRequest {
+            didBlockFirstRequest = true
+            await withCheckedContinuation { continuation in
+                firstRequestContinuation = continuation
+            }
+        }
+        if failingEmoji == emoji {
+            throw ChatProviderError.invalidRequest("Synthetic reaction failure.")
+        }
+        if !failures.isEmpty {
+            throw failures.removeFirst()
+        }
+    }
+
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        AsyncStream { continuation = $0 }
+    }
+
+    func disconnect() async {
+        firstRequestContinuation?.resume()
+        firstRequestContinuation = nil
+        continuation?.finish()
+        continuation = nil
+    }
+
+    func resumeFirstRequest() {
+        firstRequestContinuation?.resume()
+        firstRequestContinuation = nil
+    }
+
+    func requests() -> [ReactionMutationRequest] {
+        recordedRequests
+    }
+
+    func emit(_ event: ClientEvent) {
+        continuation?.yield(event)
+    }
+}
+
+private enum PaginatedRequestKind: Sendable {
+    case newest, before, after, around
+
+    init(_ anchor: MessageHistoryAnchor) {
+        switch anchor {
+        case .newest: self = .newest
+        case .before: self = .before
+        case .after: self = .after
+        case .around: self = .around
+        }
+    }
+}
+
+private struct ChannelLoadMessageRequest: Equatable, Sendable {
+    let anchor: MessageHistoryAnchor
+    let limit: Int
+}
+
+private actor SuspendedVoiceReplacementProvider: ChatProvider {
+    let currentUser = User(
+        id: UserID(rawValue: 90_000),
+        username: "voice-user",
+        displayName: "Voice User"
+    )
+    let testChannels = [
+        Channel(
+            id: ChannelID(rawValue: 90_001),
+            guildID: nil,
+            name: "Existing call",
+            kind: .directMessage
+        ),
+        Channel(
+            id: ChannelID(rawValue: 90_002),
+            guildID: nil,
+            name: "First replacement",
+            kind: .directMessage
+        ),
+        Channel(
+            id: ChannelID(rawValue: 90_003),
+            guildID: nil,
+            name: "Second replacement",
+            kind: .directMessage
+        ),
+    ]
+    private var leaveRequestCount = 0
+    private(set) var joinedChannelIDs: [ChannelID] = []
+    private var leaveContinuations: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var leaveStartedContinuations: [Int: CheckedContinuation<Void, Never>] = [:]
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        BootstrapSnapshot(
+            currentUser: currentUser,
+            guilds: [],
+            channels: testChannels,
+            members: []
+        )
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] { testChannels }
+    func members(in guildID: GuildID?) async throws -> [Member] { [] }
+
+    func profile(for userID: UserID, in guildID: GuildID?) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest("Profiles are not part of this test.")
+    }
+
+    func currentStatus() async -> PresenceStatus { .online }
+    func updateStatus(_ status: PresenceStatus) async throws {}
+
+    func messages(
+        in channelID: ChannelID,
+        before: MessageID?,
+        limit: Int
+    ) async throws -> MessagePage {
+        MessagePage(messages: [], hasMoreBefore: false)
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Sending is not part of this test.")
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Editing is not part of this test.")
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+    func toggleReaction(
+        _ emoji: String,
+        messageID: MessageID,
+        channelID: ChannelID
+    ) async throws {}
+
+    func joinVoice(
+        channelID: ChannelID,
+        guildID: GuildID?,
+        selfMute: Bool,
+        selfDeaf: Bool
+    ) async throws -> VoiceConnectionInfo {
+        joinedChannelIDs.append(channelID)
+        return VoiceConnectionInfo(
+            serverID: channelID.description,
+            channelID: channelID,
+            guildID: nil,
+            userID: currentUser.id,
+            sessionID: "voice-replacement-test",
+            token: "synthetic",
+            endpoint: "mock.sakuracord.invalid"
+        )
+    }
+
+    func updateVoiceState(
+        channelID: ChannelID?,
+        guildID: GuildID?,
+        selfMute: Bool,
+        selfDeaf: Bool,
+        selfVideo: Bool
+    ) async throws {
+        guard channelID == nil else { return }
+        leaveRequestCount += 1
+        let call = leaveRequestCount
+        await withCheckedContinuation { continuation in
+            leaveContinuations[call] = continuation
+            leaveStartedContinuations.removeValue(forKey: call)?.resume()
+        }
+    }
+
+    func waitUntilLeaveStarts(call: Int) async {
+        guard leaveRequestCount < call else { return }
+        await withCheckedContinuation { continuation in
+            leaveStartedContinuations[call] = continuation
+        }
+    }
+
+    func releaseLeave(call: Int) {
+        leaveContinuations.removeValue(forKey: call)?.resume()
+    }
+
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    func disconnect() async {}
+}
+
+private actor InaccessibleChannelRequestCountingProvider: ChatProvider {
+    private let base = MockChatProvider()
+    private var messageRequests: [ChannelID: Int] = [:]
+    private var forumRequests: [ChannelID: Int] = [:]
+    private var voiceJoinRequests = 0
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        try await base.bootstrap()
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        try await base.channels(in: guildID)
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] {
+        try await base.members(in: guildID)
+    }
+
+    func profile(
+        for userID: UserID,
+        in guildID: GuildID?
+    ) async throws -> UserProfile {
+        try await base.profile(for: userID, in: guildID)
+    }
+
+    func currentStatus() async -> PresenceStatus {
+        await base.currentStatus()
+    }
+
+    func updateStatus(_ status: PresenceStatus) async throws {
+        try await base.updateStatus(status)
+    }
+
+    func messages(
+        in channelID: ChannelID,
+        before: MessageID?,
+        limit: Int
+    ) async throws -> MessagePage {
+        messageRequests[channelID, default: 0] += 1
+        return try await base.messages(
+            in: channelID,
+            before: before,
+            limit: limit
+        )
+    }
+
+    func forumPosts(
+        in channelID: ChannelID,
+        query: ForumPostQuery
+    ) async throws -> ForumPostPage {
+        forumRequests[channelID, default: 0] += 1
+        return try await base.forumPosts(in: channelID, query: query)
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Sending is not part of this test.")
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Editing is not part of this test.")
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+    func toggleReaction(
+        _ emoji: String,
+        messageID: MessageID,
+        channelID: ChannelID
+    ) async throws {}
+
+    func joinVoice(
+        channelID: ChannelID,
+        guildID: GuildID?,
+        selfMute: Bool,
+        selfDeaf: Bool
+    ) async throws -> VoiceConnectionInfo {
+        voiceJoinRequests += 1
+        throw ChatProviderError.invalidRequest(
+            "Voice joining should be suppressed for this test."
+        )
+    }
+
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        await base.eventStream()
+    }
+
+    func disconnect() async {
+        await base.disconnect()
+    }
+
+    func messageRequestCount(for channelID: ChannelID) -> Int {
+        messageRequests[channelID, default: 0]
+    }
+
+    func forumRequestCount(for channelID: ChannelID) -> Int {
+        forumRequests[channelID, default: 0]
+    }
+
+    func voiceJoinRequestCount() -> Int {
+        voiceJoinRequests
+    }
+}
+
+private actor ChannelLoadTestProvider: ChatProvider {
+    private let user = User(id: UserID(rawValue: 91000), username: "tester", displayName: "Tester")
+    private let testChannels = [
+        Channel(id: ChannelID(rawValue: 91001), guildID: nil, name: "general"),
+        Channel(id: ChannelID(rawValue: 91002), guildID: nil, name: "other"),
+        Channel(
+            id: ChannelID(rawValue: 91003),
+            guildID: nil,
+            name: "Voice Room",
+            kind: .voice
+        ),
+    ]
+    private var messageRequests: [ChannelID: Int] = [:]
+    private var messageRequestParameters:
+        [ChannelID: [ChannelLoadMessageRequest]] = [:]
+    private var cancelledMessageRequests: Set<ChannelID> = []
+    private let reactionPreviewResultCount: Int
+    private let suspendsFirstReactionRequest: Bool
+    private var firstReactionRequestGate: CheckedContinuation<Void, Never>?
+    private var firstReactionRequestStarted: CheckedContinuation<Void, Never>?
+    private var reactorRequests = 0
+    private var activeReactorRequests = 0
+    private var maximumActiveReactorRequests = 0
+    private let failsFirstEarlierPage: Bool
+    private let blockedFirstMessageRequestChannelID: ChannelID?
+    private let paginatedThreadID: ChannelID?
+    private var paginatedThreadMessageCount: Int
+    private var blocksNextEdit = false
+    private var blockedEdit: CheckedContinuation<Void, Never>?
+    private var failedPaginatedRequestKind: PaginatedRequestKind?
+    private var blockedPaginatedRequestKind: PaginatedRequestKind?
+    private var blockedPaginatedRequest: CheckedContinuation<Void, Never>?
+    private var blockedPaginatedRequestStarted: CheckedContinuation<Void, Never>?
+    private var blockedMessageRequest: CheckedContinuation<Void, Never>?
+    private var blockedMessageRequestStarted: CheckedContinuation<Void, Never>?
+    private var hasStartedBlockedMessageRequest = false
+    private var earlierRequests = 0
+
+    init(
+        failsFirstEarlierPage: Bool = false,
+        blockFirstMessageRequestIn channelID: ChannelID? = nil,
+        paginatedThreadID: ChannelID? = nil,
+        paginatedThreadMessageCount: Int = 106,
+        reactionPreviewResultCount: Int = 5,
+        suspendsFirstReactionRequest: Bool = false
+    ) {
+        self.reactionPreviewResultCount = reactionPreviewResultCount
+        self.suspendsFirstReactionRequest = suspendsFirstReactionRequest
+        self.failsFirstEarlierPage = failsFirstEarlierPage
+        blockedFirstMessageRequestChannelID = channelID
+        self.paginatedThreadID = paginatedThreadID
+        self.paginatedThreadMessageCount = paginatedThreadMessageCount
+    }
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        BootstrapSnapshot(currentUser: user, guilds: [], channels: testChannels, members: [])
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        testChannels
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] {
+        []
+    }
+
+    func profile(for userID: UserID, in guildID: GuildID?) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest("Profiles are not part of this test.")
+    }
+
+    func currentStatus() async -> PresenceStatus {
+        .online
+    }
+
+    func updateStatus(_ status: PresenceStatus) async throws {}
+
+    func messages(in channelID: ChannelID, before: MessageID?, limit: Int) async throws
+        -> MessagePage
+    {
+        messageRequests[channelID, default: 0] += 1
+        messageRequestParameters[channelID, default: []].append(
+            ChannelLoadMessageRequest(anchor: before.map(MessageHistoryAnchor.before) ?? .newest, limit: limit)
+        )
+        if channelID == paginatedThreadID {
+            return try await paginatedThreadPage(
+                in: channelID,
+                anchoredAt: before.map(MessageHistoryAnchor.before) ?? .newest,
+                limit: limit
+            )
+        }
+        if channelID == blockedFirstMessageRequestChannelID,
+           messageRequests[channelID] == 1
+        {
+            hasStartedBlockedMessageRequest = true
+            blockedMessageRequestStarted?.resume()
+            blockedMessageRequestStarted = nil
+            await withCheckedContinuation { blockedMessageRequest = $0 }
+        }
+        if failsFirstEarlierPage, before != nil {
+            earlierRequests += 1
+            if earlierRequests == 1 {
+                throw ChatProviderError.invalidRequest(
+                    "Synthetic earlier-page timeout."
+                )
+            }
+            return MessagePage(
+                messages: [
+                    Message(
+                        id: MessageID(rawValue: channelID.rawValue - 1),
+                        channelID: channelID,
+                        author: user,
+                        content: "earlier"
+                    )
+                ],
+                hasMoreBefore: false
+            )
+        }
+        // Intentionally ignore cancellation to prove the model's generation guard works.
+        let delay: Duration =
+            channelID == testChannels[1].id ? .milliseconds(100) : .milliseconds(20)
+        try? await Task.sleep(for: delay)
+        if Task.isCancelled {
+            cancelledMessageRequests.insert(channelID)
+        }
+        let message = Message(
+            id: MessageID(rawValue: channelID.rawValue),
+            channelID: channelID,
+            author: user,
+            content: "channel \(channelID)",
+            reactions: [Reaction(emoji: "🔥", count: 8)]
+        )
+        return MessagePage(
+            messages: [message],
+            hasMoreBefore: failsFirstEarlierPage
+        )
+    }
+
+    func messages(
+        in channelID: ChannelID,
+        anchoredAt anchor: MessageHistoryAnchor,
+        limit: Int
+    ) async throws -> MessagePage {
+        switch anchor {
+        case .newest:
+            return try await messages(in: channelID, before: nil, limit: limit)
+        case .before(let messageID):
+            return try await messages(in: channelID, before: messageID, limit: limit)
+        case .after, .around:
+            guard channelID == paginatedThreadID else {
+                throw ChatProviderError.invalidRequest("Bidirectional history is not part of this test.")
+            }
+            messageRequests[channelID, default: 0] += 1
+            messageRequestParameters[channelID, default: []].append(
+                ChannelLoadMessageRequest(anchor: anchor, limit: limit)
+            )
+            return try await paginatedThreadPage(in: channelID, anchoredAt: anchor, limit: limit)
+        }
+    }
+
+    /// A thread whose message at offset `n` has ID `threadID + n`.
+    /// The page is read before a blocked request waits, so events during
+    /// the wait arrive after the server's snapshot.
+    private func paginatedThreadPage(
+        in channelID: ChannelID,
+        anchoredAt anchor: MessageHistoryAnchor,
+        limit: Int
+    ) async throws -> MessagePage {
+        if let kind = failedPaginatedRequestKind, kind == PaginatedRequestKind(anchor) {
+            failedPaginatedRequestKind = nil
+            throw ChatProviderError.invalidRequest("Synthetic history failure.")
+        }
+        let page = paginatedThreadSnapshot(in: channelID, anchoredAt: anchor, limit: limit)
+        if let kind = blockedPaginatedRequestKind, kind == PaginatedRequestKind(anchor) {
+            blockedPaginatedRequestKind = nil
+            blockedPaginatedRequestStarted?.resume()
+            blockedPaginatedRequestStarted = nil
+            await withCheckedContinuation { blockedPaginatedRequest = $0 }
+        }
+        return page
+    }
+
+    private func paginatedThreadSnapshot(
+        in channelID: ChannelID,
+        anchoredAt anchor: MessageHistoryAnchor,
+        limit: Int
+    ) -> MessagePage {
+        let all = (0 ..< paginatedThreadMessageCount).map { offset in
+            Message(
+                id: MessageID(rawValue: channelID.rawValue + UInt64(offset)),
+                channelID: channelID,
+                author: user,
+                content: "message \(offset)",
+                timestamp: Date(timeIntervalSince1970: 1_700_000_000 + TimeInterval(offset))
+            )
+        }
+        let start: Int
+        let end: Int
+        switch anchor {
+        case .newest:
+            end = all.count
+            start = max(0, end - limit)
+        case .before(let messageID):
+            end = all.firstIndex { $0.id >= messageID } ?? all.count
+            start = max(0, end - limit)
+        case .after(let messageID):
+            start = all.firstIndex { $0.id > messageID } ?? all.count
+            end = min(all.count, start + limit)
+        case .around(let messageID):
+            let target = all.firstIndex { $0.id >= messageID } ?? all.count
+            end = min(all.count, max(0, target - limit / 2) + limit)
+            start = max(0, end - limit)
+        }
+        return MessagePage(
+            messages: Array(all[start ..< end]),
+            hasMoreBefore: start > 0,
+            hasMoreAfter: end < all.count
+        )
+    }
+
+    func appendPaginatedThreadMessages(_ count: Int) {
+        paginatedThreadMessageCount += count
+    }
+
+    func failNextPaginatedRequest(_ kind: PaginatedRequestKind) {
+        failedPaginatedRequestKind = kind
+    }
+
+    func blockNextPaginatedRequest(_ kind: PaginatedRequestKind) {
+        blockedPaginatedRequestKind = kind
+    }
+
+    func waitForBlockedPaginatedRequest() async {
+        if blockedPaginatedRequest != nil { return }
+        await withCheckedContinuation { blockedPaginatedRequestStarted = $0 }
+    }
+
+    func releaseBlockedPaginatedRequest() {
+        blockedPaginatedRequest?.resume()
+        blockedPaginatedRequest = nil
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Sending is not part of this test.")
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        guard blocksNextEdit else {
+            throw ChatProviderError.invalidRequest("Editing is not part of this test.")
+        }
+        blocksNextEdit = false
+        await withCheckedContinuation { blockedEdit = $0 }
+        return Message(id: message.id, channelID: message.channelID, author: user, content: content)
+    }
+
+    func blockNextEdit() {
+        blocksNextEdit = true
+    }
+
+    func waitForBlockedEdit() async {
+        while blockedEdit == nil {
+            await Task.yield()
+        }
+    }
+
+    func releaseBlockedEdit() {
+        blockedEdit?.resume()
+        blockedEdit = nil
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+    func toggleReaction(_ emoji: String, messageID: MessageID, channelID: ChannelID) async throws {}
+    func reactionReactors(
+        for emoji: String,
+        messageID: MessageID,
+        channelID: ChannelID,
+        reactionCount: Int
+    ) async throws -> [ReactionReactor] {
+        reactorRequests += 1
+        activeReactorRequests += 1
+        maximumActiveReactorRequests = max(
+            maximumActiveReactorRequests,
+            activeReactorRequests
+        )
+        defer { activeReactorRequests -= 1 }
+        if suspendsFirstReactionRequest, reactorRequests == 1 {
+            await withCheckedContinuation { continuation in
+                firstReactionRequestGate = continuation
+                firstReactionRequestStarted?.resume()
+                firstReactionRequestStarted = nil
+            }
+            // Return this response even after cancellation to exercise stale-load guards.
+        } else {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        return (1 ... reactionPreviewResultCount).map {
+            ReactionReactor(
+                id: UserID(rawValue: UInt64($0)),
+                displayName: ["One", "Two", "Three", "Four", "Five"][$0 - 1]
+            )
+        }
+    }
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    func disconnect() async {}
+
+    func requestCount(for channelID: ChannelID) -> Int {
+        messageRequests[channelID, default: 0]
+    }
+
+    func waitForBlockedMessageRequest() async {
+        if hasStartedBlockedMessageRequest { return }
+        await withCheckedContinuation { blockedMessageRequestStarted = $0 }
+    }
+
+    func releaseBlockedMessageRequest() {
+        blockedMessageRequest?.resume()
+        blockedMessageRequest = nil
+    }
+
+    func requests(
+        for channelID: ChannelID
+    ) -> [ChannelLoadMessageRequest] {
+        messageRequestParameters[channelID, default: []]
+    }
+
+    func earlierRequestCount() -> Int {
+        earlierRequests
+    }
+
+    func requestWasCancelled(for channelID: ChannelID) -> Bool {
+        cancelledMessageRequests.contains(channelID)
+    }
+
+    func waitForFirstReactionRequest() async {
+        guard reactorRequests == 0 else { return }
+        await withCheckedContinuation { firstReactionRequestStarted = $0 }
+    }
+
+    func releaseFirstReactionRequest() {
+        firstReactionRequestGate?.resume()
+        firstReactionRequestGate = nil
+    }
+
+    func reactorRequestCount() -> Int {
+        reactorRequests
+    }
+
+    func maximumConcurrentReactorRequestCount() -> Int {
+        maximumActiveReactorRequests
+    }
+}
+
+private actor LocalHistoryMemberTestProvider: ChatProvider {
+    private let guild = Guild(
+        id: GuildID(rawValue: 76_000),
+        name: "History Guild",
+        currentUserPermissions: .max
+    )
+    private let currentUser = User(
+        id: UserID(rawValue: 76_001),
+        username: "current",
+        displayName: "Current"
+    )
+    private let author = User(
+        id: UserID(rawValue: 76_101),
+        username: "cached-author",
+        displayName: "Cached Author"
+    )
+    private let channel = Channel(
+        id: ChannelID(rawValue: 76_002),
+        guildID: GuildID(rawValue: 76_000),
+        name: "general"
+    )
+    private let role = GuildRole(
+        id: RoleID(rawValue: 76_200),
+        name: "Orange",
+        position: 10,
+        colorHex: 0xFF7900
+    )
+    private var requests: [[UserID]] = []
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        BootstrapSnapshot(currentUser: currentUser, guilds: [guild], channels: [channel], members: [])
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        guildID == guild.id ? [channel] : []
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] { [] }
+
+    func resolveMembers(in guildID: GuildID, userIDs: [UserID]) async throws -> [Member] {
+        requests.append(userIDs)
+        guard guildID == guild.id, userIDs.contains(author.id) else { return [] }
+        return [
+            Member(
+                user: author,
+                roleName: role.name,
+                status: .offline,
+                roleID: role.id,
+                rolePosition: role.position,
+                isRoleCategory: true,
+                roleIDs: [role.id],
+                roles: [role]
+            )
+        ]
+    }
+
+    func roles(in guildID: GuildID) async throws -> [GuildRole] {
+        guildID == guild.id ? [role] : []
+    }
+
+    func currentStatus() async -> PresenceStatus { .online }
+    func updateStatus(_ status: PresenceStatus) async throws {}
+
+    func profile(for userID: UserID, in guildID: GuildID?) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest("Profiles are not part of this test.")
+    }
+
+    func messages(in channelID: ChannelID, before: MessageID?, limit: Int) async throws
+        -> MessagePage
+    {
+        MessagePage(
+            messages: [
+                Message(
+                    id: MessageID(rawValue: 76_300),
+                    channelID: channel.id,
+                    author: author,
+                    content: "Cached history",
+                    guildID: guild.id
+                )
+            ],
+            hasMoreBefore: false
+        )
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Sending is not part of this test.")
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Editing is not part of this test.")
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+    func toggleReaction(_ emoji: String, messageID: MessageID, channelID: ChannelID) async throws {}
+    func eventStream() async -> AsyncStream<ClientEvent> { AsyncStream { $0.finish() } }
+    func disconnect() async {}
+
+    func resolutionRequests() -> [[UserID]] { requests }
+}
+
+private actor MemberRoleRevocationTestProvider: ChatProvider {
+    private let guildID = GuildID(rawValue: 76_700)
+    private let user = User(
+        id: UserID(rawValue: 76_701),
+        username: "role-refresh-user",
+        displayName: "Role Refresh User"
+    )
+    private let allowedRole = GuildRole(
+        id: RoleID(rawValue: 76_702),
+        name: "Private Reader"
+    )
+    let channelID = ChannelID(rawValue: 76_703)
+    private var memberContinuation: CheckedContinuation<[Member], Never>?
+
+    private var guild: Guild {
+        Guild(
+            id: guildID,
+            name: "Role Refresh Guild",
+            currentUserPermissions: DiscordPermissionBits.readMessageHistory
+        )
+    }
+
+    private var channel: Channel {
+        Channel(
+            id: channelID,
+            guildID: guildID,
+            name: "private-role-channel",
+            permissionOverwrites: [
+                ChannelPermissionOverwrite(
+                    id: allowedRole.id.description,
+                    type: 0,
+                    allow: DiscordPermissionBits.viewChannel
+                ),
+            ]
+        )
+    }
+
+    private var initialMember: Member {
+        Member(
+            user: user,
+            roleName: allowedRole.name,
+            isOnline: true,
+            roles: [allowedRole]
+        )
+    }
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        BootstrapSnapshot(
+            currentUser: user,
+            guilds: [guild],
+            channels: [channel],
+            members: [initialMember]
+        )
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        guildID == self.guildID ? [channel] : []
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] {
+        guard guildID == self.guildID else { return [] }
+        return await withCheckedContinuation { continuation in
+            memberContinuation = continuation
+        }
+    }
+
+    func roles(in guildID: GuildID) async throws -> [GuildRole] {
+        guildID == self.guildID ? [allowedRole] : []
+    }
+
+    func waitUntilMemberRequestStarts() async -> Bool {
+        await eventually { memberContinuation != nil }
+    }
+
+    func releaseRevokedMember() {
+        memberContinuation?.resume(returning: [
+            Member(
+                user: user,
+                roleName: "Member",
+                isOnline: true,
+                roles: []
+            ),
+        ])
+        memberContinuation = nil
+    }
+
+    func profile(
+        for userID: UserID,
+        in guildID: GuildID?
+    ) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest("Profiles are not part of this test.")
+    }
+
+    func currentStatus() async -> PresenceStatus { .online }
+    func updateStatus(_ status: PresenceStatus) async throws {}
+
+    func messages(
+        in channelID: ChannelID,
+        before: MessageID?,
+        limit: Int
+    ) async throws -> MessagePage {
+        MessagePage(messages: [], hasMoreBefore: false)
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Sending is not part of this test.")
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Editing is not part of this test.")
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+    func toggleReaction(
+        _ emoji: String,
+        messageID: MessageID,
+        channelID: ChannelID
+    ) async throws {}
+
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    func disconnect() async {}
+}
+
+@MainActor
+@Test(arguments: [0, 1, 2])
+func `delayed DM creation respects newer navigation`(subsequentChoice: Int) async throws {
+    let provider = SuspendedAccountOperationTestProvider(suspendsOperations: true)
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    model.snapshot = try await provider.bootstrap()
+    let user = User(id: UserID(rawValue: 96_004), username: "recipient", displayName: "Recipient")
+    model.openDirectMessage(with: user)
+    let navigation = model.guildActivationTask
+    await provider.waitUntilPrivateChannelRequestStarts()
+    if subsequentChoice == 1 { model.openFriends() }
+    if subsequentChoice == 2 { model.channelSidebarSelection = provider.channelID }
+    await provider.releasePrivateChannelRequest()
+    await navigation?.value
+    if subsequentChoice == 0 {
+        #expect(model.selectedChannelID == ChannelID(rawValue: 96_004))
+    } else if subsequentChoice == 1 {
+        #expect(model.isFriendsPresented)
+        #expect(model.selectedChannelID == nil)
+    } else {
+        #expect(model.selectedChannelID == provider.channelID)
+    }
+}
+
+private actor SuspendedAccountOperationTestProvider: ChatProvider {
+    nonisolated let channelID = ChannelID(rawValue: 96_001)
+    nonisolated let threadID = ChannelID(rawValue: 96_002)
+    nonisolated let thread: MessageThreadSummary
+    nonisolated let editTarget: Message
+    nonisolated let selectedNewest: Message
+    nonisolated let threadNewest: Message
+
+    private let user = User(
+        id: UserID(rawValue: 96_003),
+        username: "account-race",
+        displayName: "Account Race"
+    )
+    private let suspendsOperations: Bool
+    private let failsSend: Bool
+    private(set) var sentDraft: SendMessageDraft?
+    private var sendStarted = false
+    private let sendStarts = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+    private var sendReleased = false
+    private var editStarted = false
+    private let editStarts = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+    private var editReleased = false
+    private var earlierPageRequestCount = 0
+    private let earlierPageStarts = AsyncStream<Int>.makeStream(bufferingPolicy: .bufferingNewest(1))
+    private var earlierPagesReleased = false
+    private(set) var channelRequestCount = 0
+    private(set) var newestMessageRequestCount = 0
+    private(set) var applicationCommandRequestCount = 0
+    private(set) var privateCallSubscriptionRequestCount = 0
+    private(set) var voiceStateUpdateRequestCount = 0
+    private var sendContinuation: CheckedContinuation<Void, Never>?
+    private var editContinuation: CheckedContinuation<Void, Never>?
+    private var earlierContinuations: [CheckedContinuation<Void, Never>] = []
+    private let privateChannelStarts = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+    private var privateChannelContinuation: CheckedContinuation<Void, Never>?
+
+    func ensurePrivateChannel(for userID: UserID) async throws -> Channel {
+        privateChannelStarts.continuation.yield(())
+        await withCheckedContinuation { privateChannelContinuation = $0 }
+        return Channel(id: ChannelID(rawValue: 96_004), guildID: nil, name: "Recipient", kind: .directMessage)
+    }
+
+    func waitUntilPrivateChannelRequestStarts() async {
+        for await _ in privateChannelStarts.stream { return }
+    }
+
+    func releasePrivateChannelRequest() {
+        privateChannelContinuation?.resume()
+        privateChannelContinuation = nil
+    }
+
+    init(suspendsOperations: Bool, failsSend: Bool = false) {
+        self.suspendsOperations = suspendsOperations
+        self.failsSend = failsSend
+        thread = MessageThreadSummary(
+            id: threadID,
+            parentID: channelID,
+            name: "Shared thread"
+        )
+        editTarget = Message(
+            id: MessageID(rawValue: 96_010),
+            channelID: channelID,
+            author: user,
+            content: "old editable value"
+        )
+        selectedNewest = Message(
+            id: MessageID(rawValue: 96_020),
+            channelID: channelID,
+            author: user,
+            content: "old selected newest"
+        )
+        threadNewest = Message(
+            id: MessageID(rawValue: 96_021),
+            channelID: threadID,
+            author: user,
+            content: "old thread newest"
+        )
+    }
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        BootstrapSnapshot(
+            currentUser: user,
+            guilds: [],
+            channels: [Channel(id: channelID, guildID: nil, name: "shared")],
+            members: []
+        )
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        channelRequestCount += 1
+        return [Channel(id: channelID, guildID: nil, name: "shared")]
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] { [] }
+
+    func profile(
+        for userID: UserID,
+        in guildID: GuildID?
+    ) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest("Profiles are not part of this test.")
+    }
+
+    func currentStatus() async -> PresenceStatus { .online }
+    func updateStatus(_ status: PresenceStatus) async throws {}
+
+    func messages(
+        in requestedChannelID: ChannelID,
+        before: MessageID?,
+        limit: Int
+    ) async throws -> MessagePage {
+        guard before != nil else {
+            newestMessageRequestCount += 1
+            return MessagePage(messages: [], hasMoreBefore: false)
+        }
+        earlierPageRequestCount += 1
+        earlierPageStarts.continuation.yield(earlierPageRequestCount)
+        if suspendsOperations, !earlierPagesReleased {
+            await withCheckedContinuation { earlierContinuations.append($0) }
+        }
+        let message = Message(
+            id: MessageID(rawValue: requestedChannelID == channelID ? 96_005 : 96_006),
+            channelID: requestedChannelID,
+            author: user,
+            content: "old account earlier page"
+        )
+        return MessagePage(messages: [message], hasMoreBefore: false)
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        sentDraft = draft
+        sendStarted = true
+        sendStarts.continuation.yield(())
+        if suspendsOperations, !sendReleased {
+            await withCheckedContinuation { sendContinuation = $0 }
+        }
+        if failsSend { throw ChatProviderError.invalidRequest("Fixture send failure") }
+        return Message(
+            id: MessageID(rawValue: 96_011),
+            channelID: draft.channelID,
+            author: user,
+            content: draft.content,
+            nonce: draft.nonce
+        )
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        editStarted = true
+        editStarts.continuation.yield(())
+        if suspendsOperations, !editReleased {
+            await withCheckedContinuation { editContinuation = $0 }
+        }
+        var edited = editTarget
+        edited.content = content
+        return edited
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+
+    func toggleReaction(
+        _ emoji: String,
+        messageID: MessageID,
+        channelID: ChannelID
+    ) async throws {}
+
+    func applicationCommandCatalog(
+        for target: ApplicationCommandIndexTarget
+    ) async throws -> ApplicationCommandCatalog {
+        applicationCommandRequestCount += 1
+        return ApplicationCommandCatalog(target: target)
+    }
+
+    func subscribeToPrivateCall(channelID: ChannelID) async throws {
+        privateCallSubscriptionRequestCount += 1
+    }
+
+    func updateVoiceState(
+        channelID: ChannelID?,
+        guildID: GuildID?,
+        selfMute: Bool,
+        selfDeaf: Bool,
+        selfVideo: Bool
+    ) async throws {
+        voiceStateUpdateRequestCount += 1
+    }
+
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    func disconnect() async {}
+
+    func waitUntilMutationRequestsStart() async -> Bool {
+        guard await waitUntilSendRequestStarts() else { return false }
+        if editStarted { return true }
+        for await _ in editStarts.stream { return true }
+        return false
+    }
+
+    func releaseMutationRequests() {
+        releaseSendRequest()
+        editReleased = true
+        editStarts.continuation.finish()
+        editContinuation?.resume()
+        editContinuation = nil
+    }
+
+    func waitUntilSendRequestStarts() async -> Bool {
+        if sendStarted { return true }
+        for await _ in sendStarts.stream { return true }
+        return false
+    }
+
+    func sendRequestHasStarted() -> Bool {
+        sendStarted
+    }
+
+    func releaseSendRequest() {
+        sendReleased = true
+        sendContinuation?.resume()
+        sendContinuation = nil
+    }
+
+    func waitUntilEarlierPageRequestsStart(expected: Int) async -> Bool {
+        // Wait for the actual requests, not a polling deadline that can expire
+        // while parallel App tests are occupying the main actor.
+        for await count in earlierPageStarts.stream where count >= expected {
+            return true
+        }
+        return false
+    }
+
+    func releaseEarlierPageRequests() {
+        // Latch the release so cancellation cannot leave a late request suspended.
+        earlierPagesReleased = true
+        earlierPageStarts.continuation.finish()
+        earlierContinuations.forEach { $0.resume() }
+        earlierContinuations.removeAll()
+    }
+}
+
+private actor SuspendedAccountLoadTestProvider: ChatProvider {
+    nonisolated let guildID = GuildID(rawValue: 91_000)
+    nonisolated let forumID = ChannelID(rawValue: 91_001)
+    nonisolated let post: ForumPost
+    nonisolated let snapshot: BootstrapSnapshot
+
+    private let member: Member
+    private let suspendsLoads: Bool
+    private var memberContinuation: CheckedContinuation<[Member], Never>?
+    private var forumContinuation: CheckedContinuation<ForumPostPage, Never>?
+    private var memberLoadStarted = false
+    private var forumLoadStarted = false
+    private var memberLoadReturned = false
+    private var forumLoadReturned = false
+
+    init(label: String, suspendsLoads: Bool) {
+        self.suspendsLoads = suspendsLoads
+        let guild = Guild(
+            id: guildID,
+            name: "Shared guild",
+            currentUserPermissions: .max
+        )
+        let forum = Channel(
+            id: forumID,
+            guildID: guildID,
+            name: "shared-forum",
+            kind: .forum
+        )
+        let currentUser = User(
+            id: UserID(rawValue: 91_002),
+            username: "account-load-user",
+            displayName: "Account Load User"
+        )
+        member = Member(
+            user: User(
+                id: UserID(rawValue: 91_003),
+                username: "shared-member",
+                displayName: "\(label) member"
+            ),
+            roleName: "Member",
+            isOnline: true
+        )
+        post = ForumPost(
+            thread: MessageThreadSummary(
+                id: ChannelID(rawValue: 91_004),
+                guildID: guildID,
+                parentID: forumID,
+                name: "\(label) post",
+                createdAt: Date(timeIntervalSince1970: 91_004)
+            )
+        )
+        snapshot = BootstrapSnapshot(
+            currentUser: currentUser,
+            guilds: [guild],
+            channels: [forum],
+            members: []
+        )
+    }
+
+    func bootstrap() async throws -> BootstrapSnapshot { snapshot }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        snapshot.channels.filter { $0.guildID == guildID }
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] {
+        guard guildID == self.guildID else { return [] }
+        memberLoadStarted = true
+        let value: [Member]
+        if suspendsLoads {
+            value = await withCheckedContinuation { memberContinuation = $0 }
+        } else {
+            value = [member]
+        }
+        memberLoadReturned = true
+        return value
+    }
+
+    func roles(in guildID: GuildID) async throws -> [GuildRole] { [] }
+
+    func forumPosts(
+        in channelID: ChannelID,
+        query _: ForumPostQuery
+    ) async throws -> ForumPostPage {
+        guard channelID == forumID else {
+            throw ChatProviderError.channelNotFound
+        }
+        forumLoadStarted = true
+        let page: ForumPostPage
+        if suspendsLoads {
+            page = await withCheckedContinuation { forumContinuation = $0 }
+        } else {
+            page = ForumPostPage(posts: [post], hasMore: false, nextOffset: nil)
+        }
+        forumLoadReturned = true
+        return page
+    }
+
+    func waitUntilLoadsStart() async -> Bool {
+        await eventually { memberLoadStarted && forumLoadStarted }
+    }
+
+    func releaseSuspendedLoads() {
+        memberContinuation?.resume(returning: [member])
+        memberContinuation = nil
+        forumContinuation?.resume(returning: ForumPostPage(
+            posts: [post],
+            hasMore: false,
+            nextOffset: nil
+        ))
+        forumContinuation = nil
+    }
+
+    func waitUntilLoadsReturn() async -> Bool {
+        await eventually { memberLoadReturned && forumLoadReturned }
+    }
+
+    func profile(
+        for userID: UserID,
+        in guildID: GuildID?
+    ) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest("Profiles are not part of this test.")
+    }
+
+    func currentStatus() async -> PresenceStatus { .online }
+    func updateStatus(_ status: PresenceStatus) async throws {}
+
+    func messages(
+        in channelID: ChannelID,
+        before: MessageID?,
+        limit: Int
+    ) async throws -> MessagePage {
+        MessagePage(messages: [], hasMoreBefore: false)
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Sending is not part of this test.")
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Editing is not part of this test.")
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+    func toggleReaction(
+        _ emoji: String,
+        messageID: MessageID,
+        channelID: ChannelID
+    ) async throws {}
+
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    func disconnect() async {}
+}
+
+private actor FirstGuildVisitPermissionTestProvider: ChatProvider {
+    nonisolated let guildID = GuildID(rawValue: 77_200)
+    nonisolated let channelID = ChannelID(rawValue: 77_202)
+
+    private let user = User(
+        id: UserID(rawValue: 77_201),
+        username: "permission-loading-user",
+        displayName: "Permission Loading User"
+    )
+    private var roleContinuation: CheckedContinuation<[GuildRole], Never>?
+    private var recordedMessageRequestCount = 0
+
+    private var guild: Guild {
+        Guild(id: guildID, name: "Permission Loading Guild")
+    }
+
+    private var channel: Channel {
+        Channel(id: channelID, guildID: guildID, name: "general")
+    }
+
+    private var everyoneRole: GuildRole {
+        GuildRole(
+            id: RoleID(rawValue: guildID.rawValue),
+            name: "@everyone",
+            permissions: DiscordPermissionBits.viewChannel
+                | DiscordPermissionBits.readMessageHistory
+                | DiscordPermissionBits.sendMessages
+        )
+    }
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        BootstrapSnapshot(
+            currentUser: user,
+            guilds: [guild],
+            channels: [channel],
+            members: []
+        )
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        guildID == self.guildID ? [channel] : []
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] {
+        guard guildID == self.guildID else { return [] }
+        return [Member(user: user, roleName: "Member", status: .online)]
+    }
+
+    func roles(in guildID: GuildID) async throws -> [GuildRole] {
+        guard guildID == self.guildID else { return [] }
+        return await withCheckedContinuation { continuation in
+            roleContinuation = continuation
+        }
+    }
+
+    func waitUntilRoleRequestStarts() async -> Bool {
+        await eventually { roleContinuation != nil }
+    }
+
+    func releaseRoles() {
+        roleContinuation?.resume(returning: [everyoneRole])
+        roleContinuation = nil
+    }
+
+    func profile(for userID: UserID, in guildID: GuildID?) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest("Profiles are not part of this test.")
+    }
+
+    func currentStatus() async -> PresenceStatus { .online }
+    func updateStatus(_ status: PresenceStatus) async throws {}
+
+    func messages(
+        in channelID: ChannelID,
+        before: MessageID?,
+        limit: Int
+    ) async throws -> MessagePage {
+        recordedMessageRequestCount += 1
+        return MessagePage(
+            messages: [
+                Message(
+                    id: MessageID(rawValue: 77_203),
+                    channelID: channelID,
+                    author: user,
+                    content: "Loaded automatically",
+                    guildID: guildID
+                ),
+            ],
+            hasMoreBefore: false
+        )
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Sending is not part of this test.")
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Editing is not part of this test.")
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+    func toggleReaction(
+        _ emoji: String,
+        messageID: MessageID,
+        channelID: ChannelID
+    ) async throws {}
+
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    func disconnect() async {
+        releaseRoles()
+    }
+
+    func messageRequestCount() -> Int {
+        recordedMessageRequestCount
+    }
+}
+
+private actor StartupUnreadTestProvider: ChatProvider {
+    private let guild = Guild(
+        id: GuildID(rawValue: 77_000),
+        name: "Startup Guild",
+        currentUserPermissions: .max
+    )
+    private let user = User(
+        id: UserID(rawValue: 77_001),
+        username: "startup-tester",
+        displayName: "Startup Tester"
+    )
+    private let channel = Channel(
+        id: ChannelID(rawValue: 77_002),
+        guildID: GuildID(rawValue: 77_000),
+        name: "general",
+        lastMessageID: MessageID(rawValue: 77_200)
+    )
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        BootstrapSnapshot(
+            currentUser: user,
+            guilds: [guild],
+            guildRailItems: [
+                .folder(
+                    GuildFolder(id: 77, name: "Startup", guildIDs: [guild.id])
+                )
+            ],
+            channels: [channel],
+            members: [],
+            readStates: [
+                ChannelReadState(
+                    channelID: channel.id,
+                    lastAcknowledgedMessageID: MessageID(rawValue: 77_100),
+                    mentionCount: 2
+                )
+            ]
+        )
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        guildID == guild.id ? [channel] : []
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] {
+        []
+    }
+
+    func profile(for userID: UserID, in guildID: GuildID?) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest("Profiles are not part of this test.")
+    }
+
+    func currentStatus() async -> PresenceStatus {
+        .online
+    }
+
+    func updateStatus(_ status: PresenceStatus) async throws {}
+
+    func messages(in channelID: ChannelID, before: MessageID?, limit: Int) async throws
+        -> MessagePage
+    {
+        MessagePage(messages: [], hasMoreBefore: false)
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Sending is not part of this test.")
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Editing is not part of this test.")
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {
+        throw ChatProviderError.invalidRequest("Deleting is not part of this test.")
+    }
+
+    func toggleReaction(_ emoji: String, messageID: MessageID, channelID: ChannelID) async throws {
+        throw ChatProviderError.invalidRequest("Reactions are not part of this test.")
+    }
+
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    func disconnect() async {}
+}
+
+private actor ForumVisitAcknowledgementTestProvider: ChatProvider {
+    struct Acknowledgement: Sendable {
+        var channelID: ChannelID
+        var messageID: MessageID
+    }
+
+    nonisolated let forumID = ChannelID(rawValue: 96_002)
+    nonisolated let newPostID = ChannelID(rawValue: 96_300)
+    nonisolated let unreadPostID = ChannelID(rawValue: 96_240)
+    private let guild = Guild(
+        id: GuildID(rawValue: 96_000),
+        name: "Forum Visits",
+        currentUserPermissions: .max,
+        joinedAt: Date(timeIntervalSince1970: 1_420_070_000)
+    )
+    private let user = User(
+        id: UserID(rawValue: 96_001),
+        username: "forum-visitor",
+        displayName: "Forum Visitor"
+    )
+    private var recordedAcknowledgements: [Acknowledgement] = []
+
+    private var forum: Channel {
+        Channel(
+            id: forumID,
+            guildID: guild.id,
+            name: "forum",
+            kind: .forum,
+            lastMessageID: MessageID(rawValue: newPostID.rawValue)
+        )
+    }
+
+    private var posts: [ForumPost] {
+        [
+            ForumPost(
+                thread: MessageThreadSummary(
+                    id: newPostID,
+                    guildID: guild.id,
+                    parentID: forumID,
+                    name: "Brand new",
+                    // A reply a millisecond later, past Discord's fallback boundary.
+                    lastMessageID: MessageID(rawValue: newPostID.rawValue + (1 << 22))
+                )
+            ),
+            ForumPost(
+                thread: MessageThreadSummary(
+                    id: unreadPostID,
+                    guildID: guild.id,
+                    parentID: forumID,
+                    name: "Unread replies",
+                    lastMessageID: MessageID(rawValue: 96_500)
+                ),
+                isUnread: true
+            ),
+        ]
+    }
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        BootstrapSnapshot(
+            currentUser: user,
+            guilds: [guild],
+            channels: [forum],
+            members: [],
+            readStates: [
+                ChannelReadState(
+                    channelID: forumID,
+                    lastAcknowledgedMessageID: MessageID(rawValue: 96_250)
+                ),
+                ChannelReadState(
+                    channelID: unreadPostID,
+                    lastAcknowledgedMessageID: MessageID(rawValue: 96_450)
+                ),
+            ]
+        )
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        guildID == guild.id ? [forum] : []
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] {
+        []
+    }
+
+    func profile(for userID: UserID, in guildID: GuildID?) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest("Profiles are not part of this test.")
+    }
+
+    func currentStatus() async -> PresenceStatus {
+        .online
+    }
+
+    func updateStatus(_ status: PresenceStatus) async throws {}
+
+    func messages(in channelID: ChannelID, before: MessageID?, limit: Int) async throws
+        -> MessagePage
+    {
+        MessagePage(messages: [], hasMoreBefore: false)
+    }
+
+    func forumPosts(in channelID: ChannelID, query: ForumPostQuery) async throws
+        -> ForumPostPage
+    {
+        guard channelID == forumID else { throw ChatProviderError.channelNotFound }
+        return ForumPostPage(posts: posts, hasMore: false, nextOffset: nil)
+    }
+
+    func acknowledge(
+        channelID: ChannelID,
+        messageID: MessageID,
+        token: String?
+    ) async throws -> ReadAcknowledgementResponse {
+        recordedAcknowledgements.append(
+            Acknowledgement(channelID: channelID, messageID: messageID)
+        )
+        return ReadAcknowledgementResponse(token: token)
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Sending is not part of this test.")
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Editing is not part of this test.")
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+
+    func toggleReaction(
+        _ emoji: String,
+        messageID: MessageID,
+        channelID: ChannelID
+    ) async throws {}
+
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    func disconnect() async {}
+
+    func acknowledgements() -> [Acknowledgement] {
+        recordedAcknowledgements
+    }
+}
+
+private actor ForumPaginationTestProvider: ChatProvider {
+    private let guild = Guild(
+        id: GuildID(rawValue: 95_000),
+        name: "Forum Test",
+        currentUserPermissions: .max
+    )
+    private let user = User(
+        id: UserID(rawValue: 95_001),
+        username: "forum-tester",
+        displayName: "Forum Tester"
+    )
+    private let channel = Channel(
+        id: ChannelID(rawValue: 95_002),
+        guildID: GuildID(rawValue: 95_000),
+        name: "forum",
+        kind: .forum
+    )
+    private var paginationRequests = 0
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        BootstrapSnapshot(
+            currentUser: user,
+            guilds: [guild],
+            channels: [channel],
+            members: []
+        )
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        guildID == guild.id ? [channel] : []
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] {
+        []
+    }
+
+    func profile(for userID: UserID, in guildID: GuildID?) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest("Profiles are not part of this test.")
+    }
+
+    func currentStatus() async -> PresenceStatus {
+        .online
+    }
+
+    func updateStatus(_ status: PresenceStatus) async throws {}
+
+    func messages(in channelID: ChannelID, before: MessageID?, limit: Int) async throws
+        -> MessagePage
+    {
+        MessagePage(messages: [], hasMoreBefore: false)
+    }
+
+    func forumPosts(in channelID: ChannelID, query: ForumPostQuery) async throws
+        -> ForumPostPage
+    {
+        guard channelID == channel.id else { throw ChatProviderError.channelNotFound }
+        if query.offset == 0 {
+            return ForumPostPage(
+                posts: [
+                    ForumPost(
+                        thread: MessageThreadSummary(
+                            id: ChannelID(rawValue: 95_010),
+                            guildID: guild.id,
+                            parentID: channel.id,
+                            name: "Recent post",
+                            createdAt: Date(timeIntervalSince1970: 200)
+                        )
+                    )
+                ],
+                hasMore: true,
+                nextOffset: 1
+            )
+        }
+
+        paginationRequests += 1
+        if paginationRequests == 1 {
+            throw ChatProviderError.invalidRequest("Older posts are temporarily unavailable.")
+        }
+        return ForumPostPage(
+            posts: [
+                ForumPost(
+                    thread: MessageThreadSummary(
+                        id: ChannelID(rawValue: 95_011),
+                        guildID: guild.id,
+                        parentID: channel.id,
+                        name: "Older post",
+                        isArchived: true,
+                        archiveTimestamp: Date(timeIntervalSince1970: 100),
+                        createdAt: Date(timeIntervalSince1970: 100)
+                    )
+                )
+            ],
+            hasMore: false,
+            nextOffset: nil
+        )
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Sending is not part of this test.")
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Editing is not part of this test.")
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+
+    func toggleReaction(
+        _ emoji: String,
+        messageID: MessageID,
+        channelID: ChannelID
+    ) async throws {}
+
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    func disconnect() async {}
+
+    func paginationRequestCount() -> Int {
+        paginationRequests
+    }
+}
+
+/// Holds a private thread's member-less record; access resolution fails once
+/// and then reports the current user's membership.
+private actor ThreadAccessRecoveryTestProvider: ChatProvider {
+    private let guild = Guild(id: GuildID(rawValue: 95_000), name: "Threads")
+    private let user = User(id: UserID(rawValue: 95_200), username: "member", displayName: "Member")
+    private let channel = Channel(
+        id: ChannelID(rawValue: 95_001), guildID: GuildID(rawValue: 95_000), name: "general"
+    )
+    nonisolated let memberlessThread = MessageThreadSummary(
+        id: ChannelID(rawValue: 95_010), guildID: GuildID(rawValue: 95_000),
+        parentID: ChannelID(rawValue: 95_001), name: "Private thread", isPrivate: true
+    )
+    private var accessResolutions = 0
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        BootstrapSnapshot(currentUser: user, guilds: [guild], channels: [channel], members: [])
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        guildID == guild.id ? [channel] : []
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] { [] }
+
+    func profile(for userID: UserID, in guildID: GuildID?) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest("Profiles are not part of this test.")
+    }
+
+    func currentStatus() async -> PresenceStatus { .online }
+
+    func updateStatus(_ status: PresenceStatus) async throws {}
+
+    func messages(in channelID: ChannelID, before: MessageID?, limit: Int) async throws -> MessagePage {
+        MessagePage(messages: [], hasMoreBefore: false)
+    }
+
+    func forumPost(threadID: ChannelID) async throws -> ForumPost {
+        ForumPost(thread: memberlessThread)
+    }
+
+    func resolveThreadAccess(threadID: ChannelID) async throws -> ForumPost {
+        accessResolutions += 1
+        guard accessResolutions > 1 else { throw ChatProviderError.transport(status: 503, requestID: nil) }
+        var thread = memberlessThread
+        thread.notificationSettings = ThreadNotificationSettings()
+        return ForumPost(thread: thread)
+    }
+
+    func accessResolutionCount() -> Int { accessResolutions }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Sending is not part of this test.")
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Editing is not part of this test.")
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+
+    func toggleReaction(_ emoji: String, messageID: MessageID, channelID: ChannelID) async throws {}
+
+    func eventStream() async -> AsyncStream<ClientEvent> { AsyncStream { $0.finish() } }
+
+    func disconnect() async {}
+}
+
+private actor LinkedChannelNavigationTestProvider: ChatProvider {
+    private let firstGuild = Guild(id: GuildID(rawValue: 94_000), name: "First")
+    private let secondGuild = Guild(id: GuildID(rawValue: 94_100), name: "Second")
+    private let user = User(
+        id: UserID(rawValue: 94_200),
+        username: "navigator",
+        displayName: "Navigator"
+    )
+    private let firstChannel = Channel(
+        id: ChannelID(rawValue: 94_001),
+        guildID: GuildID(rawValue: 94_000),
+        name: "general"
+    )
+    let targetChannel = Channel(
+        id: ChannelID(rawValue: 94_101),
+        guildID: GuildID(rawValue: 94_100),
+        name: "linked-channel"
+    )
+    private var forumPostRequests = 0
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        BootstrapSnapshot(
+            currentUser: user,
+            guilds: [firstGuild, secondGuild],
+            channels: [],
+            members: []
+        )
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        switch guildID {
+        case firstGuild.id: [firstChannel]
+        case secondGuild.id: [targetChannel]
+        default: []
+        }
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] {
+        []
+    }
+
+    func profile(for userID: UserID, in guildID: GuildID?) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest("Profiles are not part of this test.")
+    }
+
+    func currentStatus() async -> PresenceStatus {
+        .online
+    }
+
+    func updateStatus(_ status: PresenceStatus) async throws {}
+
+    func messages(in channelID: ChannelID, before: MessageID?, limit: Int) async throws
+        -> MessagePage
+    {
+        MessagePage(messages: [], hasMoreBefore: false)
+    }
+
+    func forumPost(threadID: ChannelID) async throws -> ForumPost {
+        forumPostRequests += 1
+        throw ChatProviderError.invalidRequest("Ordinary channels are not forum posts.")
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Sending is not part of this test.")
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Editing is not part of this test.")
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+    func toggleReaction(
+        _ emoji: String,
+        messageID: MessageID,
+        channelID: ChannelID
+    ) async throws {}
+
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    func disconnect() async {}
+
+    func forumPostRequestCount() -> Int {
+        forumPostRequests
+    }
+}
+
+private actor SuspendedBootstrapTestProvider: PendingCredentialChatProvider {
+    private let capabilities: Set<ChatCapability>
+    private let user: User
+    private let channel = Channel(id: ChannelID(rawValue: 93001), guildID: nil, name: "general")
+    private var bootstrapStarted = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var bootstrapContinuation: CheckedContinuation<Void, Never>?
+    private let bootstrapError: ChatProviderError?
+    private let pendingCredential: PendingDiscordCredential?
+    private let suspendsAuthentication: Bool
+    private var authenticationStarted = false
+    private var authenticationStartWaiters: [CheckedContinuation<Void, Never>] = []
+    private var authenticationReleased = false
+    private var authenticationContinuation: CheckedContinuation<Void, Never>?
+    private let suspendsMessages: Bool
+    private let messagePage: MessagePage
+    private var messageLoadStarted = false
+    private var messageLoadStartWaiters: [CheckedContinuation<Void, Never>] = []
+    private var messageLoadContinuation: CheckedContinuation<Void, Never>?
+    private var nextSentMessageID: UInt64 = 94_000
+    private var reactionRequestCount = 0
+    private var reactionRequestWaiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var disconnectCount = 0
+
+    init(
+        bootstrapError: ChatProviderError? = nil,
+        pendingCredential: PendingDiscordCredential? = nil,
+        capabilities: Set<ChatCapability> = [],
+        suspendsAuthentication: Bool = false,
+        suspendsMessages: Bool = false,
+        messagePage: MessagePage = MessagePage(messages: [], hasMoreBefore: false),
+        user: User = User(
+            id: UserID(rawValue: 93000),
+            username: "tester",
+            displayName: "Tester"
+        )
+    ) {
+        self.user = user
+        self.bootstrapError = bootstrapError
+        self.pendingCredential = pendingCredential
+        self.capabilities = capabilities
+        self.suspendsAuthentication = suspendsAuthentication
+        self.suspendsMessages = suspendsMessages
+        self.messagePage = messagePage
+    }
+
+    func supports(_ capability: ChatCapability) async -> Bool {
+        capabilities.contains(capability)
+    }
+
+    func prepareAuthentication() async {
+        guard suspendsAuthentication else { return }
+        authenticationStarted = true
+        authenticationStartWaiters.forEach { $0.resume() }
+        authenticationStartWaiters.removeAll()
+        guard !authenticationReleased else { return }
+        await withCheckedContinuation { authenticationContinuation = $0 }
+    }
+
+    func persistPendingCredential(
+        to store: any CredentialStore,
+        accountID: String
+    ) async throws -> CredentialHandle {
+        guard let pendingCredential else {
+            throw PendingDiscordCredentialError.unavailable
+        }
+        return try await pendingCredential.persist(to: store, accountID: accountID)
+    }
+
+    func discardPendingCredential() async {
+        await pendingCredential?.discard()
+    }
+
+    func waitUntilAuthenticationStarts() async {
+        if authenticationStarted {
+            return
+        }
+        await withCheckedContinuation { authenticationStartWaiters.append($0) }
+    }
+
+    func releaseAuthentication() {
+        authenticationReleased = true
+        authenticationContinuation?.resume()
+        authenticationContinuation = nil
+    }
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        bootstrapStarted = true
+        startWaiters.forEach { $0.resume() }
+        startWaiters.removeAll()
+        await withCheckedContinuation { bootstrapContinuation = $0 }
+        if let bootstrapError {
+            throw bootstrapError
+        }
+        return BootstrapSnapshot(currentUser: user, guilds: [], channels: [channel], members: [])
+    }
+
+    func waitUntilBootstrapStarts() async {
+        if bootstrapStarted {
+            return
+        }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func releaseBootstrap() {
+        bootstrapContinuation?.resume()
+        bootstrapContinuation = nil
+    }
+
+    func waitUntilMessageLoadStarts() async {
+        if messageLoadStarted {
+            return
+        }
+        await withCheckedContinuation { messageLoadStartWaiters.append($0) }
+    }
+
+    func releaseMessageLoad() {
+        messageLoadContinuation?.resume()
+        messageLoadContinuation = nil
+    }
+
+    func waitUntilReactionRequest() async {
+        if reactionRequestCount > 0 {
+            return
+        }
+        await withCheckedContinuation { reactionRequestWaiters.append($0) }
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        [channel]
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] {
+        []
+    }
+
+    func profile(for userID: UserID, in guildID: GuildID?) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest("Profiles are not part of this test.")
+    }
+
+    func currentStatus() async -> PresenceStatus {
+        .online
+    }
+
+    func updateStatus(_ status: PresenceStatus) async throws {}
+    func messages(in channelID: ChannelID, before: MessageID?, limit: Int) async throws
+        -> MessagePage
+    {
+        if suspendsMessages {
+            messageLoadStarted = true
+            messageLoadStartWaiters.forEach { $0.resume() }
+            messageLoadStartWaiters.removeAll()
+            await withCheckedContinuation { messageLoadContinuation = $0 }
+        }
+        return messagePage
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        nextSentMessageID &+= 1
+        return Message(
+            id: MessageID(rawValue: nextSentMessageID),
+            channelID: draft.channelID,
+            author: user,
+            content: draft.content,
+            nonce: draft.nonce
+        )
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        guard var stored = messagePage.messages.first(where: { $0.id == message.id }) else {
+            throw ChatProviderError.invalidRequest("The synthetic message does not exist.")
+        }
+        stored.content = content
+        return stored
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+    func toggleReaction(_ emoji: String, messageID: MessageID, channelID: ChannelID) async throws {
+        reactionRequestCount += 1
+        reactionRequestWaiters.forEach { $0.resume() }
+        reactionRequestWaiters.removeAll()
+    }
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    func disconnect() async {
+        disconnectCount += 1
+    }
+}
+
+private actor RestoredCredentialHandleStore: CredentialStore {
+    private let handle: CredentialHandle
+
+    init(handle: CredentialHandle) {
+        self.handle = handle
+    }
+
+    func store(_ credential: Data, accountID: String) async throws -> CredentialHandle {
+        CredentialHandle(accountID: accountID)
+    }
+
+    func credential(for handle: CredentialHandle) async throws -> Data {
+        Data("credential".utf8)
+    }
+
+    func remove(_ handle: CredentialHandle) async throws {}
+
+    func handles() async throws -> [CredentialHandle] {
+        [handle]
+    }
+}
+
+@MainActor
+private final class PermissionRecordingNotificationService: NativeNotificationService {
+    private(set) var authorizationRequestCount = 0
+    private var status: UNAuthorizationStatus = .notDetermined
+
+    func requestAuthorization() async throws -> Bool {
+        authorizationRequestCount += 1
+        status = .authorized
+        return true
+    }
+
+    func authorizationStatus() async -> UNAuthorizationStatus {
+        status
+    }
+
+    func deliver(
+        message: Message,
+        channel: Channel?,
+        guild: Guild?,
+        accountID: String,
+        preferences: NotificationPreferences
+    ) async {}
+
+    func cancel(accountID: String, channelID: ChannelID) async {}
+
+    func setDockBadge(_ count: Int, enabled: Bool) {}
+}
+
+@MainActor
+private final class SuspendedAccountNotificationService: NativeNotificationService {
+    private(set) var publishedMessageIDs: [MessageID] = []
+    private var deliveryStarted = false
+    private var deliveryContinuation: CheckedContinuation<Void, Never>?
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func requestAuthorization() async throws -> Bool { true }
+    func authorizationStatus() async -> UNAuthorizationStatus { .authorized }
+
+    func deliver(
+        message: Message,
+        channel: Channel?,
+        guild: Guild?,
+        accountID: String,
+        preferences: NotificationPreferences
+    ) async {
+        deliveryStarted = true
+        for waiter in startWaiters {
+            waiter.resume()
+        }
+        startWaiters = []
+        await withCheckedContinuation { continuation in
+            deliveryContinuation = continuation
+        }
+        guard !Task.isCancelled else { return }
+        publishedMessageIDs.append(message.id)
+    }
+
+    func cancel(accountID: String, channelID: ChannelID) async {}
+    func setDockBadge(_ count: Int, enabled: Bool) {}
+
+    func waitUntilDeliveryStarts() async {
+        guard !deliveryStarted else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func releaseDelivery() {
+        deliveryContinuation?.resume()
+        deliveryContinuation = nil
+    }
+}
+
+private actor VoiceMigrationTestProvider: ChatProvider {
+    private let guild = Guild(
+        id: GuildID(rawValue: 92000),
+        name: "Voice Test",
+        currentUserPermissions: .max
+    )
+    private let user = User(id: UserID(rawValue: 92001), username: "tester", displayName: "Tester")
+    private let channel = Channel(
+        id: ChannelID(rawValue: 92002),
+        guildID: GuildID(rawValue: 92000),
+        name: "Lounge",
+        kind: .voice
+    )
+    private var continuation: AsyncStream<ClientEvent>.Continuation?
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        BootstrapSnapshot(currentUser: user, guilds: [guild], channels: [channel], members: [])
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        [channel]
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] {
+        []
+    }
+
+    func profile(for userID: UserID, in guildID: GuildID?) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest("Profiles are not part of this test.")
+    }
+
+    func currentStatus() async -> PresenceStatus {
+        .online
+    }
+
+    func updateStatus(_ status: PresenceStatus) async throws {}
+    func messages(in channelID: ChannelID, before: MessageID?, limit: Int) async throws
+        -> MessagePage
+    {
+        MessagePage(messages: [], hasMoreBefore: false)
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Sending is not part of this test.")
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Editing is not part of this test.")
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+    func toggleReaction(_ emoji: String, messageID: MessageID, channelID: ChannelID) async throws {}
+    func joinVoice(
+        channelID: ChannelID,
+        guildID: GuildID?,
+        selfMute: Bool,
+        selfDeaf: Bool
+    ) async throws -> VoiceConnectionInfo {
+        connectionInfo(token: "initial")
+    }
+
+    func updateVoiceState(
+        channelID: ChannelID?,
+        guildID: GuildID?,
+        selfMute: Bool,
+        selfDeaf: Bool,
+        selfVideo: Bool
+    ) async throws {}
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        AsyncStream { continuation = $0 }
+    }
+
+    func disconnect() async {
+        continuation?.finish()
+        continuation = nil
+    }
+
+    func emit(_ event: ClientEvent) {
+        continuation?.yield(event)
+    }
+
+    func connectionInfo(token: String) -> VoiceConnectionInfo {
+        VoiceConnectionInfo(
+            serverID: guild.id.description,
+            channelID: channel.id,
+            guildID: guild.id,
+            userID: user.id,
+            sessionID: "session",
+            token: token,
+            endpoint: "mock.sakuracord.invalid"
+        )
+    }
+}
+
+private struct PrivateCallActionRequestCounts: Equatable, Sendable {
+    var subscriptions = 0
+    var ringabilityReads = 0
+    var voiceJoins = 0
+    var rings = 0
+    var declines = 0
+}
+
+private actor PrivateCallActionTestProvider: ChatProvider {
+    private let currentUser = User(
+        id: UserID(rawValue: 88_810),
+        username: "call-tester",
+        displayName: "Call Tester"
+    )
+    private let recipient = User(
+        id: UserID(rawValue: 88_811),
+        username: "recipient",
+        displayName: "Recipient"
+    )
+    private var requestCounts = PrivateCallActionRequestCounts()
+    private var ringabilityContinuation: CheckedContinuation<Void, Never>?
+    private var declineContinuation: CheckedContinuation<Void, Never>?
+
+    private var channel: Channel {
+        Channel(
+            id: ChannelID(rawValue: 88_812),
+            guildID: nil,
+            name: "Recipient",
+            kind: .directMessage,
+            recipients: [recipient]
+        )
+    }
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        BootstrapSnapshot(
+            currentUser: currentUser,
+            guilds: [],
+            channels: [channel],
+            members: []
+        )
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        [channel]
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] {
+        []
+    }
+
+    func profile(
+        for userID: UserID,
+        in guildID: GuildID?
+    ) async throws -> UserProfile {
+        throw ChatProviderError.invalidRequest(
+            "Profiles are not part of this test."
+        )
+    }
+
+    func currentStatus() async -> PresenceStatus {
+        .online
+    }
+
+    func updateStatus(_ status: PresenceStatus) async throws {}
+
+    func messages(
+        in channelID: ChannelID,
+        before: MessageID?,
+        limit: Int
+    ) async throws -> MessagePage {
+        MessagePage(messages: [], hasMoreBefore: false)
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest(
+            "Sending is not part of this test."
+        )
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        throw ChatProviderError.invalidRequest(
+            "Editing is not part of this test."
+        )
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+
+    func toggleReaction(
+        _ emoji: String,
+        messageID: MessageID,
+        channelID: ChannelID
+    ) async throws {}
+
+    func subscribeToPrivateCall(channelID: ChannelID) async throws {
+        requestCounts.subscriptions += 1
+    }
+
+    func privateCallIsRingable(channelID: ChannelID) async throws -> Bool {
+        requestCounts.ringabilityReads += 1
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                ringabilityContinuation = continuation
+            }
+        } onCancel: {
+            Task { await self.releaseRingability() }
+        }
+        try Task.checkCancellation()
+        return true
+    }
+
+    func joinVoice(
+        channelID: ChannelID,
+        guildID: GuildID?,
+        selfMute: Bool,
+        selfDeaf: Bool
+    ) async throws -> VoiceConnectionInfo {
+        requestCounts.voiceJoins += 1
+        return VoiceConnectionInfo(
+            serverID: channelID.description,
+            channelID: channelID,
+            guildID: nil,
+            userID: currentUser.id,
+            sessionID: "private-call-action-test",
+            token: "synthetic",
+            endpoint: "mock.sakuracord.invalid"
+        )
+    }
+
+    func ringPrivateCall(
+        channelID: ChannelID,
+        recipients: [UserID]?
+    ) async throws {
+        requestCounts.rings += 1
+    }
+
+    func stopRingingPrivateCall(
+        channelID: ChannelID,
+        recipients: [UserID]
+    ) async throws {
+        requestCounts.declines += 1
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                declineContinuation = continuation
+            }
+        } onCancel: {
+            Task { await self.releaseDecline() }
+        }
+        try Task.checkCancellation()
+    }
+
+    func updateVoiceState(
+        channelID: ChannelID?,
+        guildID: GuildID?,
+        selfMute: Bool,
+        selfDeaf: Bool,
+        selfVideo: Bool
+    ) async throws {}
+
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        AsyncStream { _ in }
+    }
+
+    func disconnect() async {}
+
+    func counts() -> PrivateCallActionRequestCounts {
+        requestCounts
+    }
+
+    func waitUntilRingabilityStarts() async -> Bool {
+        await eventually { requestCounts.ringabilityReads > 0 }
+    }
+
+    func releaseRingability() {
+        ringabilityContinuation?.resume()
+        ringabilityContinuation = nil
+    }
+
+    func waitUntilDeclineStarts() async -> Bool {
+        await eventually { requestCounts.declines > 0 }
+    }
+
+    func releaseDecline() {
+        declineContinuation?.resume()
+        declineContinuation = nil
+    }
+}
+
+private actor DelayedMemberViewportTestProvider: ChatProvider {
+    struct ViewportRequest: Equatable, Sendable {
+        let guildID: GuildID
+        let channelID: ChannelID
+        let visibleRange: ClosedRange<Int>
+    }
+
+    private let base = MockChatProvider()
+    private var memberLoadStarted = false
+    private var memberLoadReleased = false
+    private var memberSubscriptionArmed = false
+    private var memberLoadContinuation: CheckedContinuation<Void, Never>?
+    private var viewportAttempts: [ViewportRequest] = []
+    private var acceptedViewports: [ViewportRequest] = []
+
+    func bootstrap() async throws -> BootstrapSnapshot {
+        try await base.bootstrap()
+    }
+
+    func channels(in guildID: GuildID?) async throws -> [Channel] {
+        try await base.channels(in: guildID)
+    }
+
+    func members(in guildID: GuildID?) async throws -> [Member] {
+        memberLoadStarted = true
+        if !memberLoadReleased {
+            await withCheckedContinuation { continuation in
+                memberLoadContinuation = continuation
+            }
+        }
+        memberSubscriptionArmed = true
+        return try await base.members(in: guildID)
+    }
+
+    func updateMemberListViewport(
+        in guildID: GuildID,
+        channelID: ChannelID,
+        visibleRange: ClosedRange<Int>
+    ) async throws {
+        let request = ViewportRequest(
+            guildID: guildID,
+            channelID: channelID,
+            visibleRange: visibleRange
+        )
+        viewportAttempts.append(request)
+        if memberSubscriptionArmed {
+            acceptedViewports.append(request)
+        }
+    }
+
+    func profile(
+        for userID: UserID,
+        in guildID: GuildID?
+    ) async throws -> UserProfile {
+        try await base.profile(for: userID, in: guildID)
+    }
+
+    func currentStatus() async -> PresenceStatus {
+        await base.currentStatus()
+    }
+
+    func updateStatus(_ status: PresenceStatus) async throws {
+        try await base.updateStatus(status)
+    }
+
+    func messages(
+        in channelID: ChannelID,
+        before: MessageID?,
+        limit: Int
+    ) async throws -> MessagePage {
+        try await base.messages(in: channelID, before: before, limit: limit)
+    }
+
+    func send(_ draft: SendMessageDraft) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Sending is not part of this test.")
+    }
+
+    func edit(_ message: Message, content: String) async throws -> Message {
+        throw ChatProviderError.invalidRequest("Editing is not part of this test.")
+    }
+
+    func delete(messageID: MessageID, channelID: ChannelID) async throws {}
+
+    func toggleReaction(
+        _ emoji: String,
+        messageID: MessageID,
+        channelID: ChannelID
+    ) async throws {}
+
+    func eventStream() async -> AsyncStream<ClientEvent> {
+        await base.eventStream()
+    }
+
+    func disconnect() async {
+        memberLoadContinuation?.resume()
+        memberLoadContinuation = nil
+        await base.disconnect()
+    }
+
+    func waitUntilMemberLoadStarts() async -> Bool {
+        await eventually { memberLoadStarted }
+    }
+
+    func waitUntilViewportAttemptCount(_ expectedCount: Int) async -> Bool {
+        await eventually { viewportAttempts.count >= expectedCount }
+    }
+
+    func waitUntilAcceptedViewportCount(_ expectedCount: Int) async -> Bool {
+        await eventually { acceptedViewports.count >= expectedCount }
+    }
+
+    func acceptedViewportRequests() -> [ViewportRequest] {
+        acceptedViewports
+    }
+
+    func disarmMemberSubscription() {
+        memberSubscriptionArmed = false
+    }
+
+    func releaseMemberLoad() {
+        memberLoadReleased = true
+        memberLoadContinuation?.resume()
+        memberLoadContinuation = nil
+    }
+}
+
+@MainActor
+@Test func `thread previews clear on deletion and replacement but preserve other parents`() {
+    let model = AppModel(launchMode: .offlineTesting)
+    let parent = ChannelID(rawValue: 200)
+    let thread = MessageThreadSummary(id: ChannelID(rawValue: 201), parentID: parent, name: "Thread")
+    let other = MessageThreadSummary(id: ChannelID(rawValue: 301), parentID: ChannelID(rawValue: 300), name: "Other")
+    let author = User(id: UserID(rawValue: 1), username: "author", displayName: "Author")
+    let preview = Message(id: MessageID(rawValue: 202), channelID: thread.id, author: author, content: "Deleted")
+    let otherPreview = Message(id: MessageID(rawValue: 302), channelID: other.id, author: author, content: "Retained")
+    let post = ForumPost(thread: thread, mostRecentMessage: preview)
+    model.refreshTimelineThreadCards(parentID: ChannelID(rawValue: 300), posts: [ForumPost(thread: other, mostRecentMessage: otherPreview)])
+    model.refreshTimelineThreadCards(parentID: parent, posts: [post])
+    model.consumeMessageDeleted(channelID: thread.id, messageID: preview.id)
+    #expect(model.threadPreviewMessages[thread.id] == nil)
+    model.refreshTimelineThreadCards(parentID: parent, posts: [post])
+    model.refreshTimelineThreadCards(parentID: parent, posts: [ForumPost(thread: thread)])
+    #expect(model.threadPreviewMessages[thread.id] == nil)
+    model.refreshTimelineThreadCards(parentID: parent, posts: [post])
+    model.refreshTimelineThreadCards(parentID: parent, posts: [])
+    #expect(model.threadPreviewMessages[thread.id] == nil)
+    #expect(model.threadPreviewMessages[other.id] == otherPreview)
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func `resource thread permissions belong to its parent rather than the selected channel`(parentAllows: Bool) {
+    let user = User(id: UserID(rawValue: 1), username: "reader", displayName: "Reader")
+    let guildID = GuildID(rawValue: 100)
+    let permissions = DiscordPermissionBits.sendMessagesInThreads | DiscordPermissionBits.pinMessages
+        | DiscordPermissionBits.manageMessages | DiscordPermissionBits.attachFiles | (UInt64(1) << 49)
+        | DiscordPermissionBits.viewChannel | DiscordPermissionBits.readMessageHistory
+    let guild = Guild(id: guildID, name: "Community", isOwnedByCurrentUser: false,
+        currentUserPermissions: permissions)
+    let selected = Channel(id: ChannelID(rawValue: 200), guildID: guildID, name: "Previous",
+        permissionOverwrites: [.init(id: guildID.description, type: 0, deny: parentAllows ? permissions : 0)])
+    let resource = Channel(id: ChannelID(rawValue: 201), guildID: guildID, name: "Resource",
+        permissionOverwrites: [.init(id: guildID.description, type: 0, deny: parentAllows ? 0 : permissions)])
+    let model = AppModel(launchMode: .offlineTesting, provider: MockChatProvider())
+    model.snapshot = BootstrapSnapshot(currentUser: user, guilds: [guild], channels: [selected, resource], members: [])
+    model.serverRailGuildsByID[guildID] = guild
+    model.currentUserRoleIDsByGuild[guildID] = []
+    model.selectedChannel = selected
+    let thread = MessageThreadSummary(id: ChannelID(rawValue: 202), parentID: resource.id, name: "Resource thread")
+    model.openThread = thread
+    let message = Message(id: MessageID(rawValue: 203), channelID: thread.id,
+        author: User(id: UserID(rawValue: 2), username: "author", displayName: "Author"), content: "Thread message")
+    #expect(model.openThreadAccess.canSend == parentAllows)
+    #expect(model.canCreatePoll(in: thread.id) == parentAllows)
+    #expect(model.canManagePins(for: message) == parentAllows)
+    #expect(model.canDeleteMessage(message) == parentAllows)
+    #expect(model.isComposerDropEligible(.thread) == parentAllows)
+    model.sessionState = .workspace
+    model.presentPinnedMessages()
+    #expect(model.pinnedMessages.hasReadPermission == parentAllows)
+    model.dismissPinnedMessages()
+}
+
+/// A thread under `parent` whose history already holds a message.
+private func threadWithHistory(in parent: Channel, provider: MockChatProvider) async throws -> MessageThreadSummary {
+    let thread = MessageThreadSummary(
+        id: ChannelID(rawValue: 999_101), guildID: parent.guildID, parentID: parent.id, name: "Seeded thread"
+    )
+    _ = try await provider.send(SendMessageDraft(channelID: thread.id, content: "Seeded message"))
+    return thread
+}
+
+@MainActor
+@Test func `a cached thread reopened in the pane shows its messages from the first frame`() async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let parent = try #require(model.snapshot?.channels.first { $0.id == ChannelID(rawValue: 210) })
+    model.selectedChannelID = parent.id
+    let thread = try await threadWithHistory(in: parent, provider: provider)
+    model.open(thread)
+    #expect(await until { model.hasCompletedInitialThreadLoad && !model.threadMessages.isEmpty })
+    model.closeSideConversation()
+
+    // Reopening slides the pane in; its cached messages are there at once,
+    // so the pane shows them rather than the loading placeholder.
+    model.open(thread)
+
+    #expect(!model.threadMessages.isEmpty)
+    #expect(!MessageTimelineLoadingPolicy.showsInitialPlaceholder(
+        isLoading: model.isLoadingThread,
+        messageCount: model.threadMessages.count
+    ))
+}
+
+@MainActor @Test func `the member list closes an open thread pane and does not bring it back`() async throws {
+    let provider = MockChatProvider()
+    let model = AppModel(launchMode: .offlineTesting, provider: provider)
+    await model.start()
+    let parent = try #require(model.snapshot?.channels.first { $0.id == ChannelID(rawValue: 210) })
+    model.selectedChannelID = parent.id
+    model.showInspector = false
+    let thread = try await threadWithHistory(in: parent, provider: provider)
+    model.open(thread)
+    #expect(await until { model.hasCompletedInitialThreadLoad && !model.threadMessages.isEmpty })
+
+    // Members beside the pane shows the member list in its place and closes
+    // the thread.
+    model.toggleMemberInspector()
+    #expect(model.workspacePresentation.supplementaryPane == .memberInspector)
+    #expect(model.openThread == nil)
+
+    // Closing the member list leaves the conversation on its own.
+    model.toggleMemberInspector()
+    #expect(!model.showInspector)
+    #expect(model.openThread == nil)
+    #expect(model.workspacePresentation.paneSideConversation == nil)
+}

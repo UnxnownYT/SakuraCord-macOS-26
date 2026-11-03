@@ -1,0 +1,204 @@
+import AppKit
+import SwiftUI
+
+@MainActor
+final class ComponentChoiceOverlayController {
+    private static var height: CGFloat { InterfaceScale.metric(360) }
+
+    private var host: ComponentChoiceOverlayHost?
+    private var escapeRegistration: PopoverEscapeKeyRegistration?
+    private var contentHeight: CGFloat = InterfaceScale.metric(320)
+    private var resizeObserver: NSObjectProtocol?
+    private var scrollObserver: NSObjectProtocol?
+    private weak var anchorView: NSView?
+    private var anchorRectProvider: (() -> CGRect?)?
+    private var resultPlacement: SelectionFieldResultPlacement = .below
+    private let initialSelection: [String]
+    private var selection: [String]
+    private let minimumSelectionCount: Int
+    private let maximumSelectionCount: Int
+    private let submit: ([String]) -> Void
+    private let onClose: () -> Void
+    private var submitted = false
+    private var closed = false
+
+    init(
+        initialSelection: [String],
+        minimumSelectionCount: Int,
+        maximumSelectionCount: Int,
+        submit: @escaping ([String]) -> Void,
+        onClose: @escaping () -> Void
+    ) {
+        self.initialSelection = initialSelection
+        selection = initialSelection
+        self.minimumSelectionCount = max(0, minimumSelectionCount)
+        self.maximumSelectionCount = max(1, maximumSelectionCount)
+        self.submit = submit
+        self.onClose = onClose
+    }
+
+    static func placement(
+        for anchorRect: CGRect,
+        in anchorView: NSView
+    ) -> SelectionFieldResultPlacement {
+        let viewport = anchorView.visibleRect
+        let spaceBelow = viewport.maxY - anchorRect.maxY
+        return spaceBelow >= height ? .below : .above
+    }
+
+    func present(
+        rootView: AnyView,
+        in anchorView: NSView,
+        placement: SelectionFieldResultPlacement,
+        anchorRectProvider: @escaping () -> CGRect?
+    ) {
+        self.anchorView = anchorView
+        self.anchorRectProvider = anchorRectProvider
+        resultPlacement = placement
+
+        guard let anchorRect = anchorRectProvider() else {
+            close()
+            return
+        }
+
+        let host = ComponentChoiceOverlayHost(rootView: AnyView(
+            rootView
+                .fixedSize(horizontal: false, vertical: true)
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { [weak self] height in
+                    guard let self, abs(contentHeight - height) > 0.5 else { return }
+                    contentHeight = height
+                    repositionWithAnchor()
+                }
+                .frame(maxHeight: .infinity, alignment: placement == .below ? .top : .bottom)
+        ))
+        host.sizingOptions = []
+        host.frame = overlayFrame(
+            relativeTo: anchorRect,
+            placement: placement
+        )
+        anchorView.addSubview(host, positioned: .above, relativeTo: nil)
+        self.host = host
+
+        if let clipView = anchorView.enclosingScrollView?.contentView {
+            clipView.postsBoundsChangedNotifications = true
+            scrollObserver = NotificationCenter.default.addObserver(
+                forName: NSView.boundsDidChangeNotification,
+                object: clipView,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.repositionWithAnchor()
+                }
+            }
+        }
+        if let window = anchorView.window {
+            escapeRegistration = PopoverEscapeKeyCoordinator.shared.register(popoverWindow: window, presentingWindow: nil) { [weak self] in self?.close() }
+            resizeObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didResizeNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.close()
+                }
+            }
+        }
+    }
+
+    func updateSelection(_ value: [String]) {
+        selection = value
+    }
+
+    func completeSelection(_ value: [String], reason: SelectionFieldCompletion) {
+        guard !closed else { return }
+        selection = value
+        switch reason {
+        case .dismissed: close(commit: true); return
+        case .cancelled: close(); return
+        case .selected: break
+        }
+        guard selectionIsValid else {
+            NSSound.beep()
+            return
+        }
+        submitted = true
+        submit(value)
+        close(commit: false)
+    }
+
+    func close(commit: Bool = false) {
+        guard !closed else { return }
+        closed = true
+        if commit,
+           !submitted,
+           selection != initialSelection,
+           selectionIsValid
+        {
+            submitted = true
+            submit(selection)
+        }
+        if let resizeObserver {
+            NotificationCenter.default.removeObserver(resizeObserver)
+            self.resizeObserver = nil
+        }
+        if let scrollObserver {
+            NotificationCenter.default.removeObserver(scrollObserver)
+            self.scrollObserver = nil
+        }
+        escapeRegistration = nil
+        host?.removeFromSuperview()
+        host = nil
+        onClose()
+    }
+
+    func repositionWithAnchor() {
+        guard let host,
+              let anchorView,
+              let anchorRect = anchorRectProvider?()
+        else {
+            close()
+            return
+        }
+        guard anchorView.visibleRect.intersects(anchorRect) else {
+            close()
+            return
+        }
+        let frame = overlayFrame(
+            relativeTo: anchorRect,
+            placement: resultPlacement
+        )
+        if host.frame != frame {
+            host.frame = frame
+        }
+    }
+
+    private var selectionIsValid: Bool {
+        selection.count >= minimumSelectionCount
+            && selection.count <= maximumSelectionCount
+    }
+
+    private func overlayFrame(
+        relativeTo anchorRect: CGRect,
+        placement: SelectionFieldResultPlacement
+    ) -> CGRect {
+        let size = CGSize(
+            width: min(anchorRect.width, anchorView?.visibleRect.width ?? anchorRect.width),
+            height: contentHeight
+        )
+        let originY = placement == .below
+            ? anchorRect.minY
+            : anchorRect.maxY - size.height
+        return CGRect(
+            origin: CGPoint(x: min(anchorRect.minX, (anchorView?.visibleRect.maxX ?? anchorRect.maxX) - size.width), y: originY),
+            size: size
+        )
+    }
+
+}
+
+@MainActor
+private final class ComponentChoiceOverlayHost: NSHostingView<AnyView> {
+    override var safeAreaInsets: NSEdgeInsets {
+        NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+    }
+}

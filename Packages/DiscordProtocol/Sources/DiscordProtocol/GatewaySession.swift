@@ -1,0 +1,1059 @@
+import Compression
+import Foundation
+import libzstd
+import OSLog
+import SakuraCordModels
+
+private let sessionLogger = Logger(subsystem: "dev.sakuracord.SakuraCord", category: "GatewaySession")
+
+enum GatewaySocketMessage: Sendable, Equatable {
+    case data(Data)
+    case text(String)
+}
+
+protocol GatewaySocket: Sendable {
+    func receive() async throws -> GatewaySocketMessage
+    func send(_ data: Data) async throws
+    func close(code: Int) async
+    func closeCode() async -> Int?
+}
+
+protocol GatewayTransport: Sendable {
+    func connect(to url: URL, maximumMessageSize: Int) async throws -> any GatewaySocket
+}
+
+protocol GatewayClock: Sendable {
+    func sleep(for duration: Duration) async throws
+}
+
+protocol GatewayRandomSource: Sendable {
+    func unitInterval() async -> Double
+}
+
+struct ContinuousGatewayClock: GatewayClock {
+    func sleep(for duration: Duration) async throws {
+        try await Task.sleep(for: duration)
+    }
+}
+
+struct SystemGatewayRandomSource: GatewayRandomSource {
+    func unitInterval() async -> Double {
+        Double.random(in: 0 ..< 1)
+    }
+}
+
+struct URLSessionGatewayTransport: GatewayTransport {
+    let session: URLSession
+
+    func connect(to url: URL, maximumMessageSize: Int) async throws -> any GatewaySocket {
+        let task = session.webSocketTask(with: url)
+        task.maximumMessageSize = maximumMessageSize
+        task.resume()
+        return URLSessionGatewaySocket(task: task)
+    }
+}
+
+private actor URLSessionGatewaySocket: GatewaySocket {
+    private let task: URLSessionWebSocketTask
+
+    init(task: URLSessionWebSocketTask) {
+        self.task = task
+    }
+
+    func receive() async throws -> GatewaySocketMessage {
+        switch try await task.receive() {
+        case let .data(data): .data(data)
+        case let .string(text): .text(text)
+        @unknown default: throw GatewaySessionError.unsupportedWebSocketMessage
+        }
+    }
+
+    func send(_ data: Data) async throws {
+        try await task.send(.data(data))
+    }
+
+    func close(code: Int) async {
+        let closeCode = URLSessionWebSocketTask.CloseCode(rawValue: code) ?? .abnormalClosure
+        task.cancel(with: closeCode, reason: nil)
+    }
+
+    func closeCode() async -> Int? {
+        let value = task.closeCode.rawValue
+        return value == URLSessionWebSocketTask.CloseCode.invalid.rawValue ? nil : value
+    }
+}
+
+enum GatewaySessionEvent: Sendable, Equatable {
+    case deliveryFailed
+    case payloadRejected(String)
+    case stateChanged(ConnectionState)
+    case dispatch(name: String, data: JSONValue)
+}
+
+enum GatewayCompression: String, Sendable {
+    case zlibStream = "zlib-stream"
+    case zstdStream = "zstd-stream"
+}
+
+actor GatewaySession {
+    enum State: Sendable, Equatable {
+        case disconnected
+        case connecting
+        case awaitingHello
+        case identifying
+        case resuming
+        case ready
+        case backingOff(attempt: Int)
+        case stopped
+    }
+
+    struct Configuration: Sendable {
+        var gatewayURL: URL
+        var identifyPayload: Data
+        var token: String
+        var gatewayEncoding: String
+        var gatewayCompression: GatewayCompression
+        var heartbeatSession: DiscordHeartbeatSession?
+        var clientLaunchID: String?
+        var qosActive: Bool
+        var qosVersion: Int
+        var maximumReconnectAttempts: Int
+        var maximumMessageSize: Int
+        var maximumCompressedBufferSize: Int
+        var maximumDecompressedPayloadSize: Int
+        var backoffBase: Duration
+        var backoffCap: Duration
+
+        init(
+            gatewayURL: URL,
+            identifyPayload: Data,
+            token: String,
+            gatewayEncoding: String = "json",
+            gatewayCompression: GatewayCompression = .zlibStream,
+            heartbeatSession: DiscordHeartbeatSession? = nil,
+            clientLaunchID: String? = nil,
+            qosActive: Bool = false,
+            qosVersion: Int = 29,
+            maximumReconnectAttempts: Int = .max,
+            maximumMessageSize: Int = 16 * 1024 * 1024,
+            maximumCompressedBufferSize: Int = 8 * 1024 * 1024,
+            // Large accounts can exceed 16 MiB in READY. Keep a per-message
+            // bound, including on fresh Identify after a failed Resume.
+            maximumDecompressedPayloadSize: Int = 64 * 1024 * 1024,
+            backoffBase: Duration = .seconds(1),
+            backoffCap: Duration = .seconds(60)
+        ) {
+            self.gatewayURL = gatewayURL
+            self.identifyPayload = identifyPayload
+            self.token = token
+            self.gatewayEncoding = gatewayEncoding
+            self.gatewayCompression = gatewayCompression
+            self.heartbeatSession = heartbeatSession
+            self.clientLaunchID = clientLaunchID
+            self.qosActive = qosActive
+            self.qosVersion = qosVersion
+            self.maximumReconnectAttempts = maximumReconnectAttempts
+            self.maximumMessageSize = maximumMessageSize
+            self.maximumCompressedBufferSize = maximumCompressedBufferSize
+            self.maximumDecompressedPayloadSize = maximumDecompressedPayloadSize
+            self.backoffBase = backoffBase
+            self.backoffCap = backoffCap
+        }
+    }
+
+    struct Snapshot: Sendable, Equatable {
+        var state: State
+        var sequence: Int?
+        var sessionID: String?
+        var resumeGatewayURL: String?
+        var reconnectAttempts: Int
+        var awaitingHeartbeatACK: Bool
+    }
+
+    private enum ConnectionOutcome {
+        case reconnectImmediately(preserveSession: Bool)
+        case reconnectAfterBackoff(preserveSession: Bool)
+        case invalidSessionDelay
+        case terminal(authenticationFailed: Bool)
+        case cancelled
+    }
+
+    private enum LifecycleDisposition {
+        case connect(isInitialConnection: Bool)
+        case finish
+        case returnImmediately
+    }
+
+    nonisolated let events: AsyncStream<GatewaySessionEvent>
+
+    private var configuration: Configuration
+    private let transport: any GatewayTransport
+    private let clock: any GatewayClock
+    private let random: any GatewayRandomSource
+    private let codec: any GatewayCodec
+    private let apiDiagnostics: DiscordAPIDiagnosticStore
+    private let eventContinuation: SessionEventBuffer<GatewaySessionEvent>
+
+    private var state: State = .disconnected
+    private var socket: (any GatewaySocket)?
+    private var diagnosticIncident = NSUUID()
+    private var lifecycleTask: Task<Void, Never>?
+    private var heartbeatTask: Task<Void, Never>?
+    private var generation = 0
+    private var intentionallyStopped = false
+    private var handshakeSentGeneration: Int?
+    private var forcedOutcome: ConnectionOutcome?
+    private var sequence: Int?
+    private var sessionID: String?
+    private var resumeGatewayURL: String?
+    private var reconnectAttempts = 0
+    private var awaitingHeartbeatACK = false
+    private var heartbeatInterval: Duration?
+    private var heartbeatSession: DiscordHeartbeatSession?
+    private var qosActive: Bool
+
+    init(
+        configuration: Configuration,
+        transport: any GatewayTransport,
+        clock: any GatewayClock = ContinuousGatewayClock(),
+        random: any GatewayRandomSource = SystemGatewayRandomSource(),
+        codec: any GatewayCodec = JSONGatewayCodec(),
+        apiDiagnostics: DiscordAPIDiagnosticStore = .shared
+    ) {
+        self.configuration = configuration
+        self.transport = transport
+        self.clock = clock
+        self.random = random
+        self.codec = codec
+        self.apiDiagnostics = apiDiagnostics
+        heartbeatSession = configuration.heartbeatSession
+        qosActive = configuration.qosActive
+        let buffer = SessionEventBuffer<GatewaySessionEvent>(overflowEvent: .deliveryFailed)
+        events = buffer.stream
+        eventContinuation = buffer
+    }
+
+    func connect() {
+        guard lifecycleTask == nil else { return }
+        intentionallyStopped = false
+        generation += 1
+        let activeGeneration = generation
+        lifecycleTask = Task { [weak self] in
+            await self?.runLifecycle(generation: activeGeneration)
+        }
+    }
+
+    func replaceCredential(_ token: String) throws {
+        guard !intentionallyStopped else { throw GatewaySessionError.stopped }
+        var identify = try codec.decode(configuration.identifyPayload)
+        guard case var .object(body) = identify.data else { throw GatewaySessionError.malformedPayload }
+        body["token"] = .string(token)
+        identify.data = .object(body)
+        let payload = try codec.encode(identify)
+        configuration.token = token
+        configuration.identifyPayload = payload
+    }
+
+    func stop() async {
+        guard state != .stopped || lifecycleTask != nil || socket != nil else { return }
+        intentionallyStopped = true
+        generation += 1
+        lifecycleTask?.cancel()
+        lifecycleTask = nil
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        let activeSocket = socket
+        socket = nil
+        await activeSocket?.close(code: 1000)
+        clearResumableState()
+        awaitingHeartbeatACK = false
+        transition(to: .stopped)
+    }
+
+    func send(_ data: Data) async throws {
+        let incident = diagnosticIncident
+        guard !intentionallyStopped, state == .ready, let socket else { throw GatewaySessionError.stopped }
+        let envelope = try JSONGatewayCodec().decode(data)
+        apiDiagnostics.recordGateway(direction: "request", envelope: envelope)
+        do {
+            try await socket.send(codec.encode(envelope))
+        } catch {
+            apiDiagnostics.recordWebSocketFailure(
+                transport: "gateway",
+                direction: "request",
+                error: error, incident: incident
+            )
+            throw error
+        }
+    }
+
+    func updateQOS(active: Bool, heartbeatSession: DiscordHeartbeatSession?) async {
+        let incident = diagnosticIncident
+        let becameActive = active && !qosActive
+        qosActive = active
+        let sessionChanged = heartbeatSession?.sessionID != self.heartbeatSession?.sessionID
+        self.heartbeatSession = heartbeatSession
+        guard state == .ready, socket != nil, sessionChanged || becameActive else { return }
+        do {
+            if sessionChanged {
+                try await sendTimeSpentSessionUpdate()
+            }
+            try await sendHeartbeat(generation: generation, restartCadence: false)
+        } catch {
+            apiDiagnostics.recordWebSocketFailure(
+                transport: "gateway",
+                direction: "request",
+                error: error, incident: incident
+            )
+        }
+    }
+
+    func announceDesktopSession() async throws {
+        guard state == .ready, heartbeatSession != nil, configuration.clientLaunchID != nil else {
+            return
+        }
+        try await sendTimeSpentSessionUpdate()
+        try await sendHeartbeat(generation: generation, restartCadence: false)
+    }
+
+    func snapshot() -> Snapshot {
+        Snapshot(
+            state: state,
+            sequence: sequence,
+            sessionID: sessionID,
+            resumeGatewayURL: resumeGatewayURL,
+            reconnectAttempts: reconnectAttempts,
+            awaitingHeartbeatACK: awaitingHeartbeatACK
+        )
+    }
+
+    private func runLifecycle(generation activeGeneration: Int) async {
+        var nextOutcome: ConnectionOutcome = .reconnectImmediately(preserveSession: true)
+        var isInitialConnection = true
+
+        lifecycle: while isActive(activeGeneration) {
+            switch await prepareForConnection(
+                after: nextOutcome,
+                generation: activeGeneration,
+                isInitialConnection: isInitialConnection
+            ) {
+            case let .connect(nextIsInitialConnection):
+                isInitialConnection = nextIsInitialConnection
+            case .finish:
+                break lifecycle
+            case .returnImmediately:
+                return
+            }
+
+            guard isActive(activeGeneration) else { break }
+            nextOutcome = await runConnection(generation: activeGeneration)
+        }
+
+        if generation == activeGeneration {
+            lifecycleTask = nil
+            if !intentionallyStopped {
+                transition(to: .disconnected)
+                eventContinuation.yield(.stateChanged(.disconnected))
+            }
+        }
+    }
+
+    private func prepareForConnection(
+        after outcome: ConnectionOutcome,
+        generation activeGeneration: Int,
+        isInitialConnection: Bool
+    ) async -> LifecycleDisposition {
+        switch outcome {
+        case let .reconnectImmediately(preserveSession):
+            if !preserveSession {
+                clearResumableState()
+            }
+            if isInitialConnection {
+                return .connect(isInitialConnection: false)
+            }
+            reconnectAttempts += 1
+            guard reconnectAttempts <= configuration.maximumReconnectAttempts else {
+                return .finish
+            }
+            return .connect(isInitialConnection: false)
+        case let .reconnectAfterBackoff(preserveSession):
+            if !preserveSession {
+                clearResumableState()
+            }
+            guard await waitForReconnectBackoff(generation: activeGeneration) else {
+                return .finish
+            }
+            return .connect(isInitialConnection: isInitialConnection)
+        case .invalidSessionDelay:
+            clearResumableState()
+            reconnectAttempts += 1
+            guard reconnectAttempts <= configuration.maximumReconnectAttempts else {
+                return .finish
+            }
+            transition(to: .backingOff(attempt: reconnectAttempts))
+            do {
+                let unit = await random.unitInterval()
+                try await clock.sleep(for: .seconds(1 + (max(0, min(unit, 0.999_999)) * 4)))
+                return .connect(isInitialConnection: isInitialConnection)
+            } catch {
+                return .finish
+            }
+        case let .terminal(authenticationFailed):
+            transition(to: .stopped)
+            eventContinuation.yield(
+                .stateChanged(authenticationFailed ? .authenticationFailed : .disconnected)
+            )
+            lifecycleTask = nil
+            return .returnImmediately
+        case .cancelled:
+            lifecycleTask = nil
+            return .returnImmediately
+        }
+    }
+
+    private func runConnection(generation activeGeneration: Int) async -> ConnectionOutcome {
+        diagnosticIncident = NSUUID()
+        let incident = diagnosticIncident
+        transition(to: .connecting)
+        eventContinuation.yield(.stateChanged(.connecting))
+        forcedOutcome = nil
+        handshakeSentGeneration = nil
+        heartbeatInterval = nil
+        awaitingHeartbeatACK = false
+
+        let targetURL = connectionURL()
+        let activeSocket: any GatewaySocket
+        do {
+            activeSocket = try await transport.connect(
+                to: targetURL,
+                maximumMessageSize: configuration.maximumMessageSize
+            )
+        } catch is CancellationError {
+            return .cancelled
+        } catch {
+            guard isActive(activeGeneration) else { return .cancelled }
+            apiDiagnostics.recordWebSocketFailure(
+                transport: "gateway", direction: "connect", error: error, incident: incident
+            )
+            return .reconnectAfterBackoff(preserveSession: true)
+        }
+
+        guard isActive(activeGeneration) else {
+            await activeSocket.close(code: 1000)
+            return .cancelled
+        }
+        socket = activeSocket
+        transition(to: .awaitingHello)
+        var framer: GatewayPayloadFramer
+        do {
+            framer = try GatewayPayloadFramer(
+                compression: configuration.gatewayCompression,
+                maximumCompressedBufferSize: configuration.maximumCompressedBufferSize,
+                maximumDecompressedPayloadSize: configuration.maximumDecompressedPayloadSize
+            )
+        } catch {
+            apiDiagnostics.recordWebSocketFailure(
+                transport: "gateway", direction: "framing", error: error, incident: incident
+            )
+            await activeSocket.close(code: 4002)
+            socket = nil
+            return .terminal(authenticationFailed: false)
+        }
+
+        defer {
+            heartbeatTask?.cancel()
+            heartbeatTask = nil
+            awaitingHeartbeatACK = false
+            heartbeatInterval = nil
+            if generation == activeGeneration {
+                socket = nil
+            }
+        }
+
+        do {
+            return try await receiveConnectionMessages(
+                from: activeSocket,
+                framer: framer,
+                generation: activeGeneration
+            )
+        } catch is CancellationError {
+            return .cancelled
+        } catch {
+            guard isActive(activeGeneration) else { return .cancelled }
+            let closeCode = await activeSocket.closeCode()
+            var failureMetadata = (error as? GatewaySessionError)?.diagnosticIntegers ?? [:]
+            if let closeCode { failureMetadata["close_code"] = closeCode }
+            apiDiagnostics.recordWebSocketFailure(
+                transport: "gateway",
+                direction: "response",
+                error: error, incident: incident,
+                integers: failureMetadata
+            )
+            if let forcedOutcome {
+                self.forcedOutcome = nil
+                return forcedOutcome
+            }
+            if error is GatewaySessionError || error is DecodingError {
+                sessionLogger.fault("Gateway payload was rejected; stopping the session")
+                if let message = (error as? GatewaySessionError)?.payloadLimitMessage {
+                    eventContinuation.yield(.payloadRejected(message))
+                }
+                await activeSocket.close(code: 4002)
+                return .terminal(authenticationFailed: false)
+            }
+            apiDiagnostics.recordWebSocketLifecycle(
+                transport: "gateway",
+                operation: "socket_closed",
+                integers: closeCode.map { ["close_code": $0] } ?? [:],
+                incident: incident
+            )
+            return classify(closeCode: closeCode)
+        }
+    }
+
+    // The receive loop deliberately owns framing and decoding so a malformed
+    // payload closes one exact socket in `runConnection`.
+    private func receiveConnectionMessages(
+        from activeSocket: any GatewaySocket,
+        framer initialFramer: GatewayPayloadFramer,
+        generation activeGeneration: Int
+    ) async throws -> ConnectionOutcome {
+        var framer = initialFramer
+        while isActive(activeGeneration) {
+            let message = try await activeSocket.receive()
+            let framing = discordPerformanceSignposter.beginInterval(
+                "GatewayPayloadFraming",
+                id: discordPerformanceSignposter.makeSignpostID()
+            )
+            let payloads = try framer.append(message)
+            discordPerformanceSignposter.endInterval(
+                "GatewayPayloadFraming", framing
+            )
+            for payload in payloads {
+                let envelope = try decodeGatewayPayload(payload)
+                apiDiagnostics.recordGateway(direction: "response", envelope: envelope)
+                if let outcome = try await process(envelope, generation: activeGeneration) {
+                    await activeSocket.close(code: 4000)
+                    return outcome
+                }
+            }
+        }
+        return .cancelled
+    }
+
+    private func decodeGatewayPayload(_ payload: Data) throws -> GatewayEnvelope {
+        do {
+            let decoding = discordPerformanceSignposter.beginInterval(
+                "GatewayEnvelopeDecode",
+                id: discordPerformanceSignposter.makeSignpostID()
+            )
+            defer {
+                discordPerformanceSignposter.endInterval(
+                    "GatewayEnvelopeDecode", decoding
+                )
+            }
+            return try codec.decode(payload)
+        } catch {
+            apiDiagnostics.recordGatewayData(
+                transport: "gateway",
+                direction: "response",
+                data: payload
+            )
+            throw error
+        }
+    }
+
+    private func process(_ envelope: GatewayEnvelope, generation activeGeneration: Int) async throws -> ConnectionOutcome? {
+        if let incomingSequence = envelope.sequence {
+            sequence = incomingSequence
+        }
+
+        switch envelope.op {
+        case 0:
+            try await processDispatch(envelope)
+        case 1:
+            try await sendHeartbeat(generation: activeGeneration, restartCadence: true)
+        case 7:
+            return .reconnectImmediately(preserveSession: true)
+        case 9:
+            guard case let .bool(canResume)? = envelope.data else {
+                throw GatewaySessionError.malformedPayload
+            }
+            return canResume ? .reconnectImmediately(preserveSession: true) : .invalidSessionDelay
+        case 10:
+            try await processHello(envelope, generation: activeGeneration)
+        case 11:
+            awaitingHeartbeatACK = false
+        default:
+            break
+        }
+        return nil
+    }
+
+    private func processDispatch(_ envelope: GatewayEnvelope) async throws {
+        guard let name = envelope.eventName, let data = envelope.data else {
+            throw GatewaySessionError.malformedPayload
+        }
+        if name == "READY" {
+            guard case let .object(object) = data,
+                  case let .string(readySessionID)? = object["session_id"],
+                  case let .string(readyResumeURL)? = object["resume_gateway_url"]
+            else {
+                throw GatewaySessionError.malformedPayload
+            }
+            sessionID = readySessionID
+            resumeGatewayURL = readyResumeURL
+            reconnectAttempts = 0
+            eventContinuation.yield(.dispatch(name: name, data: data))
+            transition(to: .ready)
+            eventContinuation.yield(.stateChanged(.ready))
+        } else if name == "RESUMED" {
+            reconnectAttempts = 0
+            eventContinuation.yield(.dispatch(name: name, data: data))
+            transition(to: .ready)
+            eventContinuation.yield(.stateChanged(.ready))
+        } else {
+            eventContinuation.yield(.dispatch(name: name, data: data))
+        }
+    }
+
+    private func processHello(
+        _ envelope: GatewayEnvelope,
+        generation activeGeneration: Int
+    ) async throws {
+        let incident = diagnosticIncident
+        guard handshakeSentGeneration != activeGeneration,
+              case let .object(hello)? = envelope.data,
+              case let .number(milliseconds)? = hello["heartbeat_interval"],
+              milliseconds > 0
+        else {
+            if handshakeSentGeneration == activeGeneration { return }
+            throw GatewaySessionError.malformedPayload
+        }
+        handshakeSentGeneration = activeGeneration
+        let interval = Duration.seconds(milliseconds / 1000)
+        heartbeatInterval = interval
+        let initialUnit = await random.unitInterval()
+        startHeartbeatLoop(
+            generation: activeGeneration,
+            initialDelay: scaled(interval, by: max(0, min(initialUnit, 0.999_999))),
+            interval: interval
+        )
+        if canResume {
+            transition(to: .resuming)
+            eventContinuation.yield(.stateChanged(.resuming))
+            try await sendResume()
+        } else {
+            transition(to: .identifying)
+            let identifyEnvelope = try codec.decode(configuration.identifyPayload)
+            apiDiagnostics.recordGateway(direction: "request", envelope: identifyEnvelope)
+            do {
+                try await socket?.send(configuration.identifyPayload)
+            } catch {
+                apiDiagnostics.recordWebSocketFailure(
+                    transport: "gateway",
+                    direction: "request",
+                    error: error, incident: incident
+                )
+                throw error
+            }
+        }
+    }
+
+    private var canResume: Bool {
+        sessionID != nil && resumeGatewayURL != nil && sequence != nil
+    }
+
+    private func sendResume() async throws {
+        let incident = diagnosticIncident
+        guard let sessionID, let sequence else { throw GatewaySessionError.malformedPayload }
+        let envelope = GatewayEnvelope(op: 6, data: .object([
+            "token": .string(configuration.token),
+            "session_id": .string(sessionID),
+            "seq": .number(Double(sequence))
+        ]))
+        apiDiagnostics.recordGateway(direction: "request", envelope: envelope)
+        do {
+            try await socket?.send(codec.encode(envelope))
+        } catch {
+            apiDiagnostics.recordWebSocketFailure(
+                transport: "gateway",
+                direction: "request",
+                error: error, incident: incident
+            )
+            throw error
+        }
+    }
+
+    private func startHeartbeatLoop(generation activeGeneration: Int, initialDelay: Duration, interval: Duration) {
+        heartbeatTask?.cancel()
+        heartbeatTask = Task { [weak self, clock] in
+            do {
+                try await clock.sleep(for: initialDelay)
+                while !Task.isCancelled {
+                    guard await self?.scheduledHeartbeat(generation: activeGeneration) == true else { return }
+                    try await clock.sleep(for: interval)
+                }
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func scheduledHeartbeat(generation activeGeneration: Int) async -> Bool {
+        let incident = diagnosticIncident
+        guard isActive(activeGeneration), socket != nil else { return false }
+        if awaitingHeartbeatACK {
+            apiDiagnostics.recordWebSocketLifecycle(transport: "gateway", operation: "heartbeat_ack_missed", incident: incident)
+            forcedOutcome = .reconnectAfterBackoff(preserveSession: true)
+            let activeSocket = socket
+            await activeSocket?.close(code: 4000)
+            return false
+        }
+        do {
+            try await sendHeartbeat(generation: activeGeneration, restartCadence: false)
+            return true
+        } catch {
+            forcedOutcome = .reconnectAfterBackoff(preserveSession: true)
+            let activeSocket = socket
+            await activeSocket?.close(code: 4000)
+            return false
+        }
+    }
+
+    private func sendHeartbeat(generation activeGeneration: Int, restartCadence: Bool) async throws {
+        let incident = diagnosticIncident
+        guard isActive(activeGeneration), let socket else { throw GatewaySessionError.stopped }
+        let sequenceValue: JSONValue = sequence.map { .number(Double($0)) } ?? .null
+        let envelope: GatewayEnvelope
+        if heartbeatSession != nil, configuration.clientLaunchID != nil {
+            let reasons: [JSONValue] = qosActive ? [.string("foregrounded")] : []
+            envelope = GatewayEnvelope(op: 40, data: .object([
+                "seq": sequenceValue,
+                "qos": .object([
+                    "ver": .number(Double(configuration.qosVersion)),
+                    "active": .bool(qosActive),
+                    "reasons": .array(reasons),
+                ]),
+            ]))
+        } else {
+            envelope = GatewayEnvelope(op: 1, data: sequenceValue)
+        }
+        apiDiagnostics.recordGateway(direction: "request", envelope: envelope)
+        do {
+            try await socket.send(codec.encode(envelope))
+        } catch {
+            apiDiagnostics.recordWebSocketFailure(
+                transport: "gateway",
+                direction: "request",
+                error: error, incident: incident
+            )
+            throw error
+        }
+        awaitingHeartbeatACK = true
+        if restartCadence, let interval = heartbeatInterval {
+            startHeartbeatLoop(generation: activeGeneration, initialDelay: interval, interval: interval)
+        }
+    }
+
+    private func sendTimeSpentSessionUpdate() async throws {
+        let incident = diagnosticIncident
+        guard let socket, let heartbeatSession, let clientLaunchID = configuration.clientLaunchID else {
+            return
+        }
+        let envelope = GatewayEnvelope(op: 41, data: .object([
+            "initialization_timestamp": .number(Double(heartbeatSession.initializationTimestamp)),
+            "session_id": .string(heartbeatSession.sessionID),
+            "client_launch_id": .string(clientLaunchID),
+        ]))
+        apiDiagnostics.recordGateway(direction: "request", envelope: envelope)
+        do {
+            try await socket.send(codec.encode(envelope))
+        } catch {
+            apiDiagnostics.recordWebSocketFailure(
+                transport: "gateway",
+                direction: "request",
+                error: error, incident: incident
+            )
+            throw error
+        }
+    }
+
+    private func waitForReconnectBackoff(generation activeGeneration: Int) async -> Bool {
+        reconnectAttempts += 1
+        guard reconnectAttempts <= configuration.maximumReconnectAttempts else { return false }
+        transition(to: .backingOff(attempt: reconnectAttempts))
+        eventContinuation.yield(.stateChanged(.backingOff))
+        let exponent = min(reconnectAttempts - 1, 20)
+        let baseSeconds = durationSeconds(configuration.backoffBase) * pow(2, Double(exponent))
+        let cappedSeconds = min(baseSeconds, durationSeconds(configuration.backoffCap))
+        let jitter = await 0.8 + (max(0, min(random.unitInterval(), 0.999_999)) * 0.4)
+        do {
+            try await clock.sleep(for: .seconds(cappedSeconds * jitter))
+            return isActive(activeGeneration)
+        } catch {
+            return false
+        }
+    }
+
+    private func classify(closeCode: Int?) -> ConnectionOutcome {
+        switch closeCode {
+        case 4004:
+            .terminal(authenticationFailed: true)
+        case 4001, 4002, 4003, 4005, 4010, 4011, 4012, 4013, 4014:
+            .terminal(authenticationFailed: false)
+        case 1000, 1001, 4007, 4009:
+            .reconnectAfterBackoff(preserveSession: false)
+        default:
+            .reconnectAfterBackoff(preserveSession: true)
+        }
+    }
+
+    private func connectionURL() -> URL {
+        let base = canResume ? (resumeGatewayURL.flatMap(URL.init(string:)) ?? configuration.gatewayURL) : configuration.gatewayURL
+        var components = URLComponents(url: base, resolvingAgainstBaseURL: false)!
+        var items = components.queryItems ?? []
+        func set(_ name: String, _ value: String) {
+            items.removeAll { $0.name == name }
+            items.append(URLQueryItem(name: name, value: value))
+        }
+        set("v", "9")
+        set("encoding", configuration.gatewayEncoding)
+        set("compress", configuration.gatewayCompression.rawValue)
+        components.queryItems = items
+        return components.url ?? base
+    }
+
+    private func clearResumableState() {
+        sequence = nil
+        sessionID = nil
+        resumeGatewayURL = nil
+    }
+
+    private func isActive(_ activeGeneration: Int) -> Bool {
+        generation == activeGeneration && !intentionallyStopped && !Task.isCancelled
+    }
+
+    private func transition(to newState: State) {
+        state = newState
+    }
+}
+
+private func durationSeconds(_ duration: Duration) -> Double {
+    let components = duration.components
+    return Double(components.seconds) + (Double(components.attoseconds) / 1e18)
+}
+
+private func scaled(_ duration: Duration, by multiplier: Double) -> Duration {
+    .seconds(durationSeconds(duration) * multiplier)
+}
+
+struct GatewayPayloadFramer {
+    private let maximumDecompressedPayloadSize: Int
+    private enum Decoder {
+        case zlib(GatewayZlibStreamDecoder)
+        case zstd(GatewayZstdStreamDecoder)
+    }
+
+    private var decoder: Decoder
+
+    init(
+        compression: GatewayCompression = .zlibStream,
+        maximumCompressedBufferSize: Int,
+        maximumDecompressedPayloadSize: Int
+    ) throws {
+        self.maximumDecompressedPayloadSize = maximumDecompressedPayloadSize
+        switch compression {
+        case .zlibStream:
+            decoder = try .zlib(GatewayZlibStreamDecoder(
+                maximumCompressedBufferSize: maximumCompressedBufferSize,
+                maximumDecompressedPayloadSize: maximumDecompressedPayloadSize
+            ))
+        case .zstdStream:
+            decoder = try .zstd(GatewayZstdStreamDecoder(
+                maximumCompressedBufferSize: maximumCompressedBufferSize,
+                maximumDecompressedPayloadSize: maximumDecompressedPayloadSize
+            ))
+        }
+    }
+
+    mutating func append(_ message: GatewaySocketMessage) throws -> [Data] {
+        switch message {
+        case let .text(text):
+            let count = text.utf8.count
+            guard count <= maximumDecompressedPayloadSize else {
+                throw GatewaySessionError.decompressedPayloadLimitExceeded(
+                    limit: maximumDecompressedPayloadSize, observed: count
+                )
+            }
+            return [Data(text.utf8)]
+        case let .data(data):
+            return switch decoder {
+            case let .zlib(decoder): try decoder.append(data)
+            case let .zstd(decoder): try decoder.append(data)
+            }
+        }
+    }
+}
+
+private final class GatewayZstdStreamDecoder {
+    private let context: OpaquePointer
+    private let maximumCompressedBufferSize: Int
+    private let maximumDecompressedPayloadSize: Int
+
+    init(maximumCompressedBufferSize: Int, maximumDecompressedPayloadSize: Int) throws {
+        guard let context = ZSTD_createDCtx() else {
+            throw GatewaySessionError.decompressionFailed
+        }
+        self.context = context
+        self.maximumCompressedBufferSize = maximumCompressedBufferSize
+        self.maximumDecompressedPayloadSize = maximumDecompressedPayloadSize
+    }
+
+    deinit {
+        ZSTD_freeDCtx(context)
+    }
+
+    func append(_ data: Data) throws -> [Data] {
+        guard data.count <= maximumCompressedBufferSize else {
+            throw GatewaySessionError.compressedBufferLimitExceeded(
+                limit: maximumCompressedBufferSize, observed: data.count
+            )
+        }
+        guard !data.isEmpty else { return [] }
+
+        var output = Data()
+        try data.withUnsafeBytes { sourceBytes in
+            var input = ZSTD_inBuffer(
+                src: sourceBytes.baseAddress,
+                size: sourceBytes.count,
+                pos: 0
+            )
+            let destinationCapacity = 64 * 1024
+            let destination = UnsafeMutablePointer<UInt8>.allocate(capacity: destinationCapacity)
+            defer { destination.deallocate() }
+
+            while true {
+                let previousInputPosition = input.pos
+                var destinationBuffer = ZSTD_outBuffer(
+                    dst: destination,
+                    size: destinationCapacity,
+                    pos: 0
+                )
+                let result = ZSTD_decompressStream(context, &destinationBuffer, &input)
+                guard ZSTD_isError(result) == 0 else {
+                    throw GatewaySessionError.decompressionFailed
+                }
+                let produced = destinationBuffer.pos
+                guard output.count + produced <= maximumDecompressedPayloadSize else {
+                    throw GatewaySessionError.decompressedPayloadLimitExceeded(
+                        limit: maximumDecompressedPayloadSize, observed: output.count + produced
+                    )
+                }
+                if produced > 0 {
+                    output.append(destination, count: produced)
+                }
+
+                // ZSTD may consume the final compressed byte while still
+                // filling the output buffer. Drain that buffered output before
+                // treating this WebSocket message as a complete Gateway
+                // payload. A return value of zero is not a message boundary
+                // for Discord's shared zstd-stream context.
+                if input.pos == input.size, produced < destinationCapacity {
+                    break
+                }
+                guard input.pos > previousInputPosition || produced > 0 else {
+                    throw GatewaySessionError.decompressionFailed
+                }
+            }
+        }
+        return output.isEmpty ? [] : [output]
+    }
+}
+
+private final class GatewayZlibStreamDecoder {
+    private static let flushMarker = Data([0x00, 0x00, 0xFF, 0xFF])
+
+    private var stream = compression_stream(
+        dst_ptr: UnsafeMutablePointer<UInt8>(bitPattern: 0x1)!,
+        dst_size: 0,
+        src_ptr: UnsafePointer<UInt8>(bitPattern: 0x1)!,
+        src_size: 0,
+        state: nil
+    )
+    private var compressedBuffer = Data()
+    private let maximumCompressedBufferSize: Int
+    private let maximumDecompressedPayloadSize: Int
+
+    init(maximumCompressedBufferSize: Int, maximumDecompressedPayloadSize: Int) throws {
+        self.maximumCompressedBufferSize = maximumCompressedBufferSize
+        self.maximumDecompressedPayloadSize = maximumDecompressedPayloadSize
+        guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB) != COMPRESSION_STATUS_ERROR else {
+            throw GatewaySessionError.decompressionFailed
+        }
+    }
+
+    deinit {
+        compression_stream_destroy(&stream)
+    }
+
+    func append(_ data: Data) throws -> [Data] {
+        guard data.count <= maximumCompressedBufferSize - compressedBuffer.count else {
+            throw GatewaySessionError.compressedBufferLimitExceeded(
+                limit: maximumCompressedBufferSize, observed: compressedBuffer.count + data.count
+            )
+        }
+        compressedBuffer.append(data)
+
+        var payloads: [Data] = []
+        while let range = compressedBuffer.range(of: Self.flushMarker) {
+            let frameEnd = range.upperBound
+            let frame = Data(compressedBuffer[..<frameEnd])
+            compressedBuffer.removeSubrange(..<frameEnd)
+            try payloads.append(decompress(frame))
+        }
+        return payloads
+    }
+
+    private func decompress(_ frame: Data) throws -> Data {
+        var output = Data()
+        let sourceFrame: Data = if frame.starts(with: [0x78, 0x9C]) || frame.starts(with: [0x78, 0xDA]) || frame.starts(with: [0x78, 0x01]) {
+            Data(frame.dropFirst(2))
+        } else {
+            frame
+        }
+        let destinationCapacity = 64 * 1024
+        let destination = UnsafeMutablePointer<UInt8>.allocate(capacity: destinationCapacity)
+        defer { destination.deallocate() }
+
+        try sourceFrame.withUnsafeBytes { sourceBytes in
+            guard let source = sourceBytes.bindMemory(to: UInt8.self).baseAddress else {
+                throw GatewaySessionError.decompressionFailed
+            }
+            stream.src_ptr = source
+            stream.src_size = sourceFrame.count
+
+            repeat {
+                stream.dst_ptr = destination
+                stream.dst_size = destinationCapacity
+                let status = compression_stream_process(&stream, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
+                let produced = destinationCapacity - stream.dst_size
+                if produced > 0 {
+                    guard output.count + produced <= maximumDecompressedPayloadSize else {
+                        throw GatewaySessionError.decompressedPayloadLimitExceeded(
+                            limit: maximumDecompressedPayloadSize, observed: output.count + produced
+                        )
+                    }
+                    output.append(destination, count: produced)
+                }
+                if status == COMPRESSION_STATUS_ERROR, produced == 0, stream.src_size > 0 {
+                    throw GatewaySessionError.decompressionFailed
+                }
+                if status == COMPRESSION_STATUS_END {
+                    break
+                }
+            } while stream.src_size > 0 || stream.dst_size == 0
+        }
+        return output
+    }
+}

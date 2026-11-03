@@ -1,0 +1,1273 @@
+import AppKit
+import AVFoundation
+import Combine
+import CoreText
+import ImageIO
+import Lottie
+import QuartzCore
+import SakuraCordModels
+import SwiftUI
+
+final class NativeTimelineMenuAction: NSObject {
+    let handler: () -> Void
+
+    init(_ handler: @escaping () -> Void) {
+        self.handler = handler
+    }
+
+    @objc func performAction() {
+        handler()
+    }
+}
+
+struct NativeTimelineTextHit {
+    let characterIndex: Int
+    let url: URL?
+    let mention: MentionPresentation?
+    let spoilerRange: NSRange?
+    var displayedText: String?
+}
+
+private struct NativeTimelineTextLinkHitRegion {
+    let characterIndex: Int
+    let url: URL
+    let spoilerRange: NSRange?
+    let frame: CGRect
+}
+
+struct NativeTimelineTextSpoilerHitRegion {
+    let range: NSRange
+    let frame: CGRect
+}
+
+enum NativeTimelineTextGeometry {
+    static func messageContentDrawingFrame(_ frame: CGRect) -> CGRect {
+        var drawingFrame = frame
+        drawingFrame.size.height = max(drawingFrame.height + 1, 20)
+        return drawingFrame
+    }
+}
+
+enum NativeTimelineLinkAppearance {
+    static let hoverUnderlineStyle = NSUnderlineStyle.single.rawValue
+
+    static func applyHover(
+        to value: NSMutableAttributedString,
+        characterIndex: Int?,
+        underlinesAllLinks: Bool = false
+    ) {
+        if underlinesAllLinks {
+            value.enumerateAttribute(.link, in: NSRange(location: 0, length: value.length)) { link, range, _ in
+                guard link != nil else { return }
+                value.addAttribute(.underlineStyle, value: hoverUnderlineStyle, range: range)
+            }
+            return
+        }
+        guard let characterIndex,
+              characterIndex >= 0,
+              characterIndex < value.length
+        else { return }
+        var linkRange = NSRange(location: 0, length: 0)
+        guard value.attribute(
+            .link,
+            at: characterIndex,
+            longestEffectiveRange: &linkRange,
+            in: NSRange(location: 0, length: value.length)
+        ) != nil, linkRange.length > 0
+        else { return }
+        value.addAttribute(
+            .underlineStyle,
+            value: hoverUnderlineStyle,
+            range: linkRange
+        )
+    }
+}
+
+enum NativeTimelineBeginningText {
+    static func title(
+        _ beginning: NativeTimelineBeginning
+    ) -> NativeTimelineAttributedTextBox {
+        box(
+            beginning.title,
+            font: .interfaceSystemFont(
+                ofSize: NSFont.preferredFont(
+                    forTextStyle: .largeTitle
+                ).pointSize,
+                weight: .bold
+            ),
+            color: .labelColor
+        )
+    }
+
+    static func description(
+        _ beginning: NativeTimelineBeginning
+    ) -> NativeTimelineAttributedTextBox {
+        box(
+            beginning.description,
+            font: .interfacePreferredFont(forTextStyle: .body),
+            color: .secondaryLabelColor
+        )
+    }
+
+    static func box(
+        _ value: String,
+        font: NSFont,
+        color: NSColor
+    ) -> NativeTimelineAttributedTextBox {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byWordWrapping
+        return NativeTimelineAttributedTextBox(
+            NSAttributedString(
+                string: value,
+                attributes: [
+                    .font: font,
+                    .foregroundColor: color,
+                    .paragraphStyle: paragraph,
+                ]
+            )
+        )
+    }
+}
+
+nonisolated enum NativeTimelineTextSelectionGeometry {
+    static func interactionFrame(
+        contentFrame: CGRect,
+        rowOrigin: CGFloat,
+        canvasWidth: CGFloat
+    ) -> CGRect {
+        CGRect(
+            x: contentFrame.minX,
+            y: rowOrigin + contentFrame.minY,
+            width: max(1, canvasWidth - contentFrame.minX),
+            height: max(1, contentFrame.height)
+        )
+    }
+
+    static func intersects(
+        characterRange: CFRange,
+        selectionRange: NSRange?
+    ) -> Bool {
+        guard let selectionRange else { return false }
+        return NSIntersectionRange(
+            selectionRange,
+            NSRange(
+                location: characterRange.location,
+                length: max(1, characterRange.length)
+            )
+        ).length > 0
+    }
+
+    static func backgroundRanges(
+        in value: NSAttributedString,
+        selectionRange: NSRange
+    ) -> [NSRange] {
+        let available = NSRange(location: 0, length: value.length)
+        let selection = NSIntersectionRange(selectionRange, available)
+        guard selection.length > 0 else { return [] }
+
+        var attachments: [NSRange] = []
+        value.enumerateAttributes(in: selection) { attributes, range, _ in
+            guard attributes[.discordEmojiToken] != nil
+                    || attributes[.nativeTimelineMention] != nil
+            else { return }
+            let clipped = NSIntersectionRange(range, selection)
+            if clipped.length > 0 {
+                attachments.append(clipped)
+            }
+        }
+        guard !attachments.isEmpty else { return [selection] }
+        attachments.sort {
+            $0.location == $1.location
+                ? $0.length < $1.length
+                : $0.location < $1.location
+        }
+
+        var result: [NSRange] = []
+        var cursor = selection.location
+        let selectionEnd = NSMaxRange(selection)
+        for attachment in attachments {
+            if attachment.location > cursor {
+                result.append(NSRange(
+                    location: cursor,
+                    length: attachment.location - cursor
+                ))
+            }
+            cursor = max(cursor, NSMaxRange(attachment))
+        }
+        if cursor < selectionEnd {
+            result.append(NSRange(
+                location: cursor,
+                length: selectionEnd - cursor
+            ))
+        }
+        return result
+    }
+
+    static func glyphBounds(in line: CTLine, range: NSRange) -> ClosedRange<CGFloat>? {
+        var lower = CGFloat.infinity
+        var upper = -CGFloat.infinity
+        for value in CTLineGetGlyphRuns(line) as NSArray {
+            let run = unsafeDowncast(value as AnyObject, to: CTRun.self)
+            let runRange = CTRunGetStringRange(run)
+            guard NSIntersectionRange(range, NSRange(location: runRange.location, length: runRange.length)).length > 0 else { continue }
+            let count = CTRunGetGlyphCount(run)
+            var positions = Array(repeating: CGPoint.zero, count: count)
+            var advances = Array(repeating: CGSize.zero, count: count)
+            var indices = Array(repeating: CFIndex(0), count: count)
+            CTRunGetPositions(run, CFRange(), &positions)
+            CTRunGetAdvances(run, CFRange(), &advances)
+            CTRunGetStringIndices(run, CFRange(), &indices)
+            for index in 0 ..< count where NSLocationInRange(indices[index], range) {
+                let start = positions[index].x
+                let end = start + advances[index].width
+                lower = min(lower, min(start, end))
+                upper = max(upper, max(start, end))
+            }
+        }
+        // Caret offsets split kerning adjustments at range boundaries. Glyph
+        // advances match TextKit's enclosed glyph range without changing text.
+        return lower.isFinite && upper > lower ? lower ... upper : nil
+    }
+
+    /// `fitsGlyphs` bounds each fragment by its glyphs' advances instead of
+    /// caret offsets, keeping kerning at the range's edges inside it.
+    static func rects(
+        in textFrame: CTFrame,
+        outerFrame: CGRect,
+        range: NSRange,
+        fitsGlyphs: Bool = false
+    ) -> [CGRect] {
+        guard range.length > 0 else { return [] }
+        let lines = CTFrameGetLines(textFrame) as NSArray
+        guard lines.count > 0 else { return [] }
+        var origins = Array(
+            repeating: CGPoint.zero,
+            count: lines.count
+        )
+        CTFrameGetLineOrigins(
+            textFrame,
+            CFRange(location: 0, length: lines.count),
+            &origins
+        )
+        let selectionStart = range.location
+        let selectionEnd = NSMaxRange(range)
+        var result: [CGRect] = []
+        result.reserveCapacity(lines.count)
+
+        for index in 0 ..< lines.count {
+            let line = coreTextLine(lines[index])
+            let lineRange = CTLineGetStringRange(line)
+            let lineStart = lineRange.location
+            let lineEnd = lineRange.location + lineRange.length
+            let start = max(selectionStart, lineStart)
+            let end = min(selectionEnd, lineEnd)
+            guard start < end else { continue }
+
+            let origin = origins[index]
+            var ascent: CGFloat = 0
+            var descent: CGFloat = 0
+            var leading: CGFloat = 0
+            _ = CTLineGetTypographicBounds(
+                line,
+                &ascent,
+                &descent,
+                &leading
+            )
+            let horizontal: ClosedRange<CGFloat>
+            if fitsGlyphs {
+                guard let bounds = glyphBounds(in: line, range: NSRange(location: start, length: end - start))
+                else { continue }
+                horizontal = bounds
+            } else {
+                let startOffset = CTLineGetOffsetForStringIndex(line, start, nil)
+                let endOffset = CTLineGetOffsetForStringIndex(line, end, nil)
+                horizontal = min(startOffset, endOffset) ... max(startOffset, endOffset)
+            }
+            let minX = outerFrame.minX + origin.x + horizontal.lowerBound
+            let width = max(1, horizontal.upperBound - horizontal.lowerBound)
+            result.append(CGRect(
+                x: minX,
+                y: outerFrame.maxY - origin.y - ascent - 0.5,
+                width: width,
+                height: max(1, ascent + descent + 1)
+            ))
+        }
+        return result
+    }
+}
+
+nonisolated struct NativeTimelineCodeBlockRegion: Equatable {
+    let range: NSRange
+    let backgroundFrame: CGRect
+    let copyButtonFrame: CGRect
+    let content: String
+}
+
+nonisolated enum NativeTimelineCodeBlockGeometry {
+    static func regions(
+        value: NSAttributedString,
+        framesetter: CTFramesetter,
+        frame: CGRect
+    ) -> [NativeTimelineCodeBlockRegion] {
+        guard value.length > 0,
+              frame.width > 0,
+              frame.height > 0,
+              containsCodeBlock(value)
+        else { return [] }
+        let path = CGPath(
+            rect: CGRect(origin: .zero, size: frame.size),
+            transform: nil
+        )
+        let textFrame = CTFramesetterCreateFrame(
+            framesetter,
+            CFRange(location: 0, length: value.length),
+            path,
+            nil
+        )
+        return regions(
+            in: textFrame,
+            outerFrame: frame,
+            value: value
+        )
+    }
+
+    static func regions(
+        in textFrame: CTFrame,
+        outerFrame: CGRect,
+        value: NSAttributedString
+    ) -> [NativeTimelineCodeBlockRegion] {
+        guard value.length > 0 else { return [] }
+        let fullRange = NSRange(location: 0, length: value.length)
+        let source = value.string as NSString
+        var blocks: [NSRange] = []
+        value.enumerateAttribute(
+            .discordMarkdownBlock,
+            in: fullRange
+        ) { rawValue, range, _ in
+            guard rawValue as? String == "code",
+                  range.length > 0
+            else { return }
+            // A blank code line's newline coalesces with the next line's
+            // run, which can open another block, so check each line in it.
+            var lineStart = range.location
+            while lineStart < NSMaxRange(range) {
+                let newline = source.range(
+                    of: "\n",
+                    range: NSRange(location: lineStart, length: NSMaxRange(range) - lineStart)
+                )
+                let lineEnd = newline.location == NSNotFound ? NSMaxRange(range) : NSMaxRange(newline)
+                let line = NSRange(location: lineStart, length: lineEnd - lineStart)
+                let paragraph = value.attribute(
+                    .paragraphStyle,
+                    at: lineStart,
+                    effectiveRange: nil
+                ) as? NSParagraphStyle
+                if let last = blocks.last, (paragraph?.paragraphSpacingBefore ?? 0) <= 0 {
+                    blocks[blocks.count - 1] = NSUnionRange(last, line)
+                } else {
+                    blocks.append(line)
+                }
+                lineStart = lineEnd
+            }
+        }
+
+        return blocks.compactMap { range in
+            let rects = NativeTimelineTextSelectionGeometry.rects(
+                in: textFrame,
+                outerFrame: outerFrame,
+                range: range
+            )
+            guard let firstRect = rects.first else { return nil }
+            let union = rects.dropFirst().reduce(firstRect) {
+                $0.union($1)
+            }
+            let inset = NativeTimelineMarkdownChromeMetrics.codeBlockInset(in: value, at: range.location)
+            let backgroundFrame = CGRect(
+                x: outerFrame.minX,
+                y: union.minY - inset,
+                width: outerFrame.width,
+                height: union.height + inset * 2
+            )
+            // The button fills a one-line block's height less its inset, so
+            // it sits centred on the first line with equal room on every
+            // side, in the room the first lines' tail indents leave for it.
+            let buttonInset = NativeTimelineMarkdownChromeMetrics.codeCopyButtonInset
+            let buttonSide = firstRect.height + (inset - buttonInset) * 2
+            let buttonFrame = CGRect(
+                x: max(
+                    backgroundFrame.minX,
+                    backgroundFrame.maxX - buttonSide - buttonInset
+                ),
+                y: backgroundFrame.minY + buttonInset,
+                width: buttonSide,
+                height: buttonSide
+            )
+            return NativeTimelineCodeBlockRegion(
+                range: range,
+                backgroundFrame: backgroundFrame,
+                copyButtonFrame: buttonFrame,
+                content: source.substring(with: range)
+            )
+        }
+    }
+
+    static func containsCodeBlock(
+        _ value: NSAttributedString
+    ) -> Bool {
+        var result = false
+        value.enumerateAttribute(
+            .discordMarkdownBlock,
+            in: NSRange(location: 0, length: value.length),
+            options: .longestEffectiveRangeNotRequired
+        ) { rawValue, _, stop in
+            guard rawValue as? String == "code" else { return }
+            result = true
+            stop.pointee = true
+        }
+        return result
+    }
+}
+
+enum NativeTimelineTextHitTester {
+    static func spoilerRegions(
+        value: NSAttributedString,
+        framesetter: CTFramesetter,
+        frame: CGRect
+    ) -> [NativeTimelineTextSpoilerHitRegion] {
+        guard value.length > 0,
+              frame.width > 0,
+              frame.height > 0
+        else { return [] }
+        let path = CGPath(
+            rect: CGRect(origin: .zero, size: frame.size),
+            transform: nil
+        )
+        let textFrame = CTFramesetterCreateFrame(
+            framesetter,
+            CFRange(location: 0, length: value.length),
+            path,
+            nil
+        )
+        return spoilerRegions(
+            value: value,
+            textFrame: textFrame,
+            frame: frame
+        )
+    }
+
+    private static func spoilerRegions(
+        value: NSAttributedString,
+        textFrame: CTFrame,
+        frame: CGRect
+    ) -> [NativeTimelineTextSpoilerHitRegion] {
+        NativeTimelineTextSpoilers.ranges(in: value).flatMap { range in
+            NativeTimelineTextSpoilerGeometry.rects(
+                in: textFrame,
+                outerFrame: frame,
+                range: range
+            ).map {
+                NativeTimelineTextSpoilerHitRegion(
+                    range: range,
+                    frame: $0
+                )
+            }
+        }
+    }
+
+    static func linkFrames(
+        value: NSAttributedString,
+        framesetter: CTFramesetter,
+        frame: CGRect
+    ) -> [CGRect] {
+        guard value.length > 0,
+              frame.width > 0,
+              frame.height > 0
+        else { return [] }
+        let path = CGPath(
+            rect: CGRect(origin: .zero, size: frame.size),
+            transform: nil
+        )
+        let textFrame = CTFramesetterCreateFrame(
+            framesetter,
+            CFRange(location: 0, length: value.length),
+            path,
+            nil
+        )
+        return linkRegions(
+            value: value,
+            textFrame: textFrame,
+            outerFrame: frame
+        ).map(\.frame)
+    }
+
+    private static func linkRegions(
+        value: NSAttributedString,
+        textFrame: CTFrame,
+        outerFrame: CGRect
+    ) -> [NativeTimelineTextLinkHitRegion] {
+        var result: [NativeTimelineTextLinkHitRegion] = []
+        value.enumerateAttribute(
+            .link,
+            in: NSRange(location: 0, length: value.length)
+        ) { rawLink, range, _ in
+            guard let url = linkURL(from: rawLink) else { return }
+            let spoilerRange = NativeTimelineTextSpoilers.range(
+                at: range.location,
+                in: value
+            )
+            let frames = bridgedLinkFrames(
+                NativeTimelineTextSelectionGeometry.rects(
+                    in: textFrame,
+                    outerFrame: outerFrame,
+                    range: range
+                )
+            )
+            result.append(contentsOf: frames.map {
+                NativeTimelineTextLinkHitRegion(
+                    characterIndex: range.location,
+                    url: url,
+                    spoilerRange: spoilerRange,
+                    frame: $0
+                )
+            })
+        }
+        return result
+    }
+
+    private static func bridgedLinkFrames(
+        _ frames: [CGRect]
+    ) -> [CGRect] {
+        let frames = frames.sorted {
+            $0.minY == $1.minY
+                ? $0.minX < $1.minX
+                : $0.minY < $1.minY
+        }
+        guard var previous = frames.first else { return [] }
+        var result = [previous]
+        for current in frames.dropFirst() {
+            let gapHeight = current.minY - previous.maxY
+            if gapHeight > 0 {
+                let minX = min(previous.minX, current.minX)
+                let maxX = max(previous.maxX, current.maxX)
+                result.append(CGRect(
+                    x: minX,
+                    y: previous.maxY,
+                    width: max(1, maxX - minX),
+                    height: gapHeight
+                ))
+            }
+            result.append(current)
+            previous = current
+        }
+        return result
+    }
+
+    private static func linkURL(from rawLink: Any?) -> URL? {
+        switch rawLink {
+        case let value as URL:
+            value
+        case let value as NSURL:
+            value as URL
+        case let value as String:
+            URL(string: value)
+        default:
+            nil
+        }
+    }
+
+    static func mention(
+        value: NSAttributedString,
+        framesetter: CTFramesetter,
+        frame: CGRect,
+        point: CGPoint
+    ) -> MentionPresentation? {
+        hit(
+            value: value,
+            framesetter: framesetter,
+            frame: frame,
+            point: point
+        )?.mention
+    }
+
+    static func mentionRegions(
+        value: NSAttributedString,
+        framesetter: CTFramesetter,
+        frame: CGRect
+    ) -> [NativeTimelineMentionHitRegion] {
+        guard value.length > 0,
+              frame.width > 0,
+              frame.height > 0
+        else { return [] }
+        let path = CGPath(
+            rect: CGRect(origin: .zero, size: frame.size),
+            transform: nil
+        )
+        let textFrame = CTFramesetterCreateFrame(
+            framesetter,
+            CFRange(location: 0, length: value.length),
+            path,
+            nil
+        )
+        let lines = CTFrameGetLines(textFrame) as NSArray
+        guard lines.count > 0 else { return [] }
+        var origins = Array(
+            repeating: CGPoint.zero,
+            count: lines.count
+        )
+        CTFrameGetLineOrigins(
+            textFrame,
+            CFRange(location: 0, length: lines.count),
+            &origins
+        )
+        var result: [NativeTimelineMentionHitRegion] = []
+        for index in 0 ..< lines.count {
+            let line = coreTextLine(lines[index])
+            let lineOrigin = origins[index]
+            for case let run as CTRun
+                in CTLineGetGlyphRuns(line) as NSArray
+            {
+                let range = CTRunGetStringRange(run)
+                guard range.location >= 0,
+                      range.location < value.length,
+                      let mention = (
+                          value.attribute(
+                              .nativeTimelineMention,
+                              at: range.location,
+                              effectiveRange: nil
+                          ) as? NativeTimelineMentionBox
+                      )?.presentation
+                else { continue }
+                result.append(NativeTimelineMentionHitRegion(
+                    characterIndex: range.location,
+                    presentation: mention,
+                    frame: inlineAttachmentFrame(
+                        run: run,
+                        line: line,
+                        lineOrigin: lineOrigin,
+                        outerFrame: frame
+                    )
+                ))
+            }
+        }
+        return result
+    }
+
+    static func mentionAnchorFrame(
+        box: NativeTimelineAttributedTextBox,
+        frame: CGRect,
+        characterIndex: Int,
+        rawToken: String
+    ) -> CGRect? {
+        var drawingFrame = frame
+        drawingFrame.size.height += box.layoutHeightAdjustment
+        return mentionAnchorFrame(
+            value: box.value,
+            framesetter: box.framesetter,
+            frame: drawingFrame,
+            characterIndex: characterIndex,
+            rawToken: rawToken
+        )
+    }
+
+    static func rangeFrame(
+        value: NSAttributedString,
+        framesetter: CTFramesetter,
+        frame: CGRect,
+        range: NSRange
+    ) -> CGRect? {
+        guard value.length > 0,
+              range.location >= 0,
+              range.length > 0,
+              NSMaxRange(range) <= value.length,
+              frame.width > 0,
+              frame.height > 0
+        else { return nil }
+        let path = CGPath(
+            rect: CGRect(origin: .zero, size: frame.size),
+            transform: nil
+        )
+        let textFrame = CTFramesetterCreateFrame(
+            framesetter,
+            CFRange(location: 0, length: value.length),
+            path,
+            nil
+        )
+        let lines = CTFrameGetLines(textFrame) as NSArray
+        guard lines.count > 0 else { return nil }
+        var origins = Array(repeating: CGPoint.zero, count: lines.count)
+        CTFrameGetLineOrigins(
+            textFrame,
+            CFRange(location: 0, length: lines.count),
+            &origins
+        )
+        var result: CGRect?
+        for lineIndex in 0 ..< lines.count {
+            let line = coreTextLine(lines[lineIndex])
+            let lineRange = NSRange(
+                location: CTLineGetStringRange(line).location,
+                length: CTLineGetStringRange(line).length
+            )
+            let intersection = NSIntersectionRange(lineRange, range)
+            guard intersection.length > 0 else { continue }
+            var ascent: CGFloat = 0
+            var descent: CGFloat = 0
+            var leading: CGFloat = 0
+            _ = CTLineGetTypographicBounds(
+                line,
+                &ascent,
+                &descent,
+                &leading
+            )
+            let lineOrigin = origins[lineIndex]
+            let startX = lineOrigin.x + CTLineGetOffsetForStringIndex(
+                line,
+                intersection.location,
+                nil
+            )
+            let endX = lineOrigin.x + CTLineGetOffsetForStringIndex(
+                line,
+                NSMaxRange(intersection),
+                nil
+            )
+            let height = max(1, ascent + descent + leading)
+            let localBottom = lineOrigin.y - descent
+            let segment = CGRect(
+                x: frame.minX + min(startX, endX),
+                y: frame.maxY - localBottom - height,
+                width: max(1, abs(endX - startX)),
+                height: height
+            )
+            result = result.map { $0.union(segment) } ?? segment
+        }
+        guard let result,
+              [result.minX, result.minY, result.width, result.height]
+                .allSatisfy(\.isFinite),
+              !result.isEmpty
+        else { return nil }
+        return result
+    }
+
+    static func mentionAnchorFrame(
+        value: NSAttributedString,
+        framesetter: CTFramesetter,
+        frame: CGRect,
+        characterIndex: Int,
+        rawToken: String
+    ) -> CGRect? {
+        guard value.length > 0,
+              value.string.indices.isEmpty == false,
+              value.length > characterIndex,
+              characterIndex >= 0,
+              frame.width > 0,
+              frame.height > 0
+        else { return nil }
+        var effectiveRange = NSRange(location: 0, length: 0)
+        guard let mention = value.attribute(
+            .nativeTimelineMention,
+            at: characterIndex,
+            effectiveRange: &effectiveRange
+        ) as? NativeTimelineMentionBox,
+            mention.presentation.rawToken == rawToken,
+            effectiveRange.length > 0
+        else { return nil }
+
+        let path = CGPath(
+            rect: CGRect(origin: .zero, size: frame.size),
+            transform: nil
+        )
+        let textFrame = CTFramesetterCreateFrame(
+            framesetter,
+            CFRange(location: 0, length: value.length),
+            path,
+            nil
+        )
+        let lines = CTFrameGetLines(textFrame) as NSArray
+        guard lines.count > 0 else { return nil }
+        var origins = Array(repeating: CGPoint.zero, count: lines.count)
+        CTFrameGetLineOrigins(
+            textFrame,
+            CFRange(location: 0, length: lines.count),
+            &origins
+        )
+        var anchor: CGRect?
+        for lineIndex in 0 ..< lines.count {
+            let line = coreTextLine(lines[lineIndex])
+            let lineOrigin = origins[lineIndex]
+            for case let run as CTRun in CTLineGetGlyphRuns(line) as NSArray {
+                let range = CTRunGetStringRange(run)
+                guard range.location <= characterIndex,
+                      characterIndex
+                        < range.location + max(1, range.length)
+                else { continue }
+                anchor = inlineAttachmentFrame(
+                    run: run,
+                    line: line,
+                    lineOrigin: lineOrigin,
+                    outerFrame: frame
+                )
+                break
+            }
+            if anchor != nil { break }
+        }
+        guard let anchor else { return nil }
+        let values = [
+            anchor.minX,
+            anchor.minY,
+            anchor.width,
+            anchor.height,
+        ]
+        return values.allSatisfy(\.isFinite) && !anchor.isEmpty
+            ? anchor
+            : nil
+    }
+
+    static func inlineAttachmentFrame(
+        run: CTRun,
+        line: CTLine,
+        lineOrigin: CGPoint,
+        outerFrame: CGRect
+    ) -> CGRect {
+        let range = CTRunGetStringRange(run)
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        var leading: CGFloat = 0
+        let width = CGFloat(CTRunGetTypographicBounds(
+            run,
+            CFRange(location: 0, length: 0),
+            &ascent,
+            &descent,
+            &leading
+        ))
+        let horizontalPosition = lineOrigin.x + CTLineGetOffsetForStringIndex(
+            line,
+            range.location,
+            nil
+        )
+        let height = max(1, ascent + descent)
+        let localBottom = lineOrigin.y - descent
+        return CGRect(
+            x: outerFrame.minX + horizontalPosition,
+            y: outerFrame.maxY - localBottom - height,
+            width: max(1, width),
+            height: height
+        )
+    }
+
+    static func hit(
+        box: NativeTimelineAttributedTextBox,
+        frame: CGRect,
+        point: CGPoint
+    ) -> NativeTimelineTextHit? {
+        var drawingFrame = frame
+        drawingFrame.size.height += box.layoutHeightAdjustment
+        return hit(
+            value: box.value,
+            framesetter: box.framesetter,
+            frame: drawingFrame,
+            point: point
+        )
+    }
+
+    private struct CoreTextFrameLayout {
+        let frame: CTFrame
+        let lines: NSArray
+        let origins: [CGPoint]
+    }
+
+    static func hit(
+        value: NSAttributedString,
+        framesetter: CTFramesetter,
+        frame: CGRect,
+        point: CGPoint,
+        targetsTextCharacters: Bool = false
+    ) -> NativeTimelineTextHit? {
+        guard value.length > 0,
+              frame.width > 0,
+              frame.height > 0,
+              frame.contains(point)
+        else { return nil }
+        let layout = coreTextFrameLayout(value: value, framesetter: framesetter, frame: frame)
+        guard !layout.origins.isEmpty else { return nil }
+        // Lookup needs the pointed character, rather than the start of a
+        // clickable link or spoiler region.
+        if targetsTextCharacters {
+            return textLineHit(
+                value: value, layout: layout, frame: frame, point: point,
+                targetsTextCharacters: true
+            )
+        }
+        let paintedSpoiler = spoilerRegions(
+            value: value,
+            textFrame: layout.frame,
+            frame: frame
+        ).first(where: { $0.frame.contains(point) })
+        if let paintedSpoiler {
+            let textHit = textLineHit(
+                value: value, layout: layout, frame: frame, point: point,
+                targetsTextCharacters: true
+            )
+            let index = min(NSMaxRange(paintedSpoiler.range) - 1,
+                            max(paintedSpoiler.range.location, textHit?.characterIndex ?? paintedSpoiler.range.location))
+            return NativeTimelineTextHit(
+                characterIndex: index,
+                url: linkURL(from: value.attribute(.link, at: index, effectiveRange: nil)),
+                mention: (value.attribute(.nativeTimelineMention, at: index, effectiveRange: nil)
+                    as? NativeTimelineMentionBox)?.presentation,
+                spoilerRange: paintedSpoiler.range
+            )
+        }
+        if let hit = inlineAttachmentHit(
+            value: value,
+            layout: layout,
+            outerFrame: frame,
+            point: point,
+            paintedSpoiler: paintedSpoiler
+        ) { return hit.spoilerRange == nil ? hit : nil }
+        if let link = linkRegions(
+            value: value,
+            textFrame: layout.frame,
+            outerFrame: frame
+        ).first(where: { $0.frame.contains(point) }) {
+            guard link.spoilerRange == nil else { return nil }
+            return NativeTimelineTextHit(
+                characterIndex: link.characterIndex,
+                url: link.url,
+                mention: nil,
+                spoilerRange: link.spoilerRange,
+                displayedText: MessageLinkActivator.safetyDisplayedText(in: value, at: link.characterIndex)
+            )
+        }
+        let hit = textLineHit(value: value, layout: layout, frame: frame, point: point)
+        return hit?.spoilerRange == nil ? hit : nil
+    }
+
+    private static func coreTextFrameLayout(
+        value: NSAttributedString,
+        framesetter: CTFramesetter,
+        frame: CGRect
+    ) -> CoreTextFrameLayout {
+        let path = CGPath(
+            rect: CGRect(origin: .zero, size: frame.size),
+            transform: nil
+        )
+        let textFrame = CTFramesetterCreateFrame(
+            framesetter,
+            CFRange(location: 0, length: value.length),
+            path,
+            nil
+        )
+        let lines = CTFrameGetLines(textFrame) as NSArray
+        var origins = Array(repeating: CGPoint.zero, count: lines.count)
+        CTFrameGetLineOrigins(
+            textFrame,
+            CFRange(location: 0, length: lines.count),
+            &origins
+        )
+        return CoreTextFrameLayout(frame: textFrame, lines: lines, origins: origins)
+    }
+
+    private static func inlineAttachmentHit(
+        value: NSAttributedString,
+        layout: CoreTextFrameLayout,
+        outerFrame: CGRect,
+        point: CGPoint,
+        paintedSpoiler: NativeTimelineTextSpoilerHitRegion?
+    ) -> NativeTimelineTextHit? {
+        // Inline mentions are taller than the surrounding text line. Check
+        // their exact painted run rectangles first so the whole visible pill,
+        // including its top and bottom padding, is clickable.
+        for index in 0 ..< layout.lines.count {
+            let line = coreTextLine(layout.lines[index])
+            let lineOrigin = layout.origins[index]
+            for case let run as CTRun in CTLineGetGlyphRuns(line) as NSArray {
+                let range = CTRunGetStringRange(run)
+                let attachmentFrame = inlineAttachmentFrame(
+                    run: run,
+                    line: line,
+                    lineOrigin: lineOrigin,
+                    outerFrame: outerFrame
+                )
+                guard range.location >= 0,
+                      range.location < value.length,
+                      attachmentFrame.contains(point)
+                else { continue }
+                let mention = (
+                    value.attribute(
+                        .nativeTimelineMention,
+                        at: range.location,
+                        effectiveRange: nil
+                    ) as? NativeTimelineMentionBox
+                )?.presentation
+                let effectiveSpoilerRange =
+                    paintedSpoiler?.range
+                    ?? NativeTimelineTextSpoilers.range(
+                        at: range.location,
+                        in: value
+                    )
+                if let effectiveSpoilerRange {
+                    // Keep the run's link so it opens once the spoiler is
+                    // revealed; activation reveals a hidden spoiler first.
+                    return NativeTimelineTextHit(
+                        characterIndex: range.location,
+                        url: linkURL(from: value.attribute(
+                            .link,
+                            at: range.location,
+                            effectiveRange: nil
+                        )),
+                        mention: mention,
+                        spoilerRange: effectiveSpoilerRange
+                    )
+                }
+                guard let mention else { continue }
+                return NativeTimelineTextHit(
+                    characterIndex: range.location,
+                    url: nil,
+                    mention: mention,
+                    spoilerRange: nil
+                )
+            }
+        }
+        return nil
+    }
+
+    private static func textLineHit(
+        value: NSAttributedString,
+        layout: CoreTextFrameLayout,
+        frame: CGRect,
+        point: CGPoint,
+        targetsTextCharacters: Bool = false
+    ) -> NativeTimelineTextHit? {
+        let local = CGPoint(
+            x: point.x - frame.minX,
+            y: frame.maxY - point.y
+        )
+        for index in 0 ..< layout.lines.count {
+            let line = coreTextLine(layout.lines[index])
+            let origin = layout.origins[index]
+            var ascent: CGFloat = 0
+            var descent: CGFloat = 0
+            var leading: CGFloat = 0
+            let width = CGFloat(CTLineGetTypographicBounds(
+                line,
+                &ascent,
+                &descent,
+                &leading
+            ))
+            guard local.y >= origin.y - descent,
+                  local.y <= origin.y + ascent + leading,
+                  local.x >= origin.x,
+                  local.x <= origin.x + max(1, width)
+            else { continue }
+
+            var stringIndex = CTLineGetStringIndexForPosition(
+                line,
+                CGPoint(x: local.x - origin.x, y: 0)
+            )
+            guard stringIndex != kCFNotFound else { return nil }
+            let lineRange = CTLineGetStringRange(line)
+            guard lineRange.length > 0 else { return nil }
+            if targetsTextCharacters {
+                // Core Text returns the nearest caret. On the trailing half
+                // of a glyph that can point at the next word or spoiler.
+                let string = value.string as NSString
+                for candidate in [
+                    min(stringIndex, value.length - 1),
+                    max(lineRange.location, stringIndex - 1),
+                ] {
+                    let range = string.rangeOfComposedCharacterSequence(at: candidate)
+                    let start = CTLineGetOffsetForStringIndex(line, range.location, nil)
+                    let end = CTLineGetOffsetForStringIndex(line, NSMaxRange(range), nil)
+                    let localX = local.x - origin.x
+                    if localX >= min(start, end), localX < max(start, end) {
+                        stringIndex = range.location
+                        break
+                    }
+                }
+            }
+            let characterIndex = min(
+                value.length - 1,
+                max(
+                    lineRange.location,
+                    min(
+                        stringIndex,
+                        lineRange.location + lineRange.length - 1
+                    )
+                )
+            )
+            let mention = (
+                value.attribute(
+                    .nativeTimelineMention,
+                    at: characterIndex,
+                    effectiveRange: nil
+                ) as? NativeTimelineMentionBox
+            )?.presentation
+            let rawLink = value.attribute(
+                .link,
+                at: characterIndex,
+                effectiveRange: nil
+            )
+            let url = linkURL(from: rawLink)
+            return NativeTimelineTextHit(
+                characterIndex: characterIndex,
+                url: url,
+                mention: mention,
+                spoilerRange: NativeTimelineTextSpoilers.range(
+                    at: characterIndex,
+                    in: value
+                ),
+                displayedText: MessageLinkActivator.safetyDisplayedText(in: value, at: characterIndex)
+            )
+        }
+        return nil
+    }
+
+    static func caretIndex(
+        box: NativeTimelineAttributedTextBox,
+        frame: CGRect,
+        point: CGPoint,
+        clampsToText: Bool
+    ) -> Int? {
+        var drawingFrame = frame
+        drawingFrame.size.height += box.layoutHeightAdjustment
+        return caretIndex(
+            value: box.value,
+            framesetter: box.framesetter,
+            frame: drawingFrame,
+            point: point,
+            clampsToText: clampsToText
+        )
+    }
+
+    static func caretIndex(
+        value: NSAttributedString,
+        framesetter: CTFramesetter,
+        frame: CGRect,
+        point: CGPoint,
+        clampsToText: Bool
+    ) -> Int? {
+        guard value.length > 0,
+              frame.width > 0,
+              frame.height > 0,
+              clampsToText || frame.contains(point)
+        else { return nil }
+        let layout = coreTextFrameLayout(value: value, framesetter: framesetter, frame: frame)
+        guard !layout.origins.isEmpty else { return nil }
+        let local = CGPoint(
+            x: point.x - frame.minX,
+            y: frame.maxY - point.y
+        )
+        if clampsToText {
+            if let boundary = boundaryCaretIndex(
+                valueLength: value.length,
+                layout: layout,
+                localPoint: local
+            ) { return boundary }
+        }
+        guard let selectedLineIndex = selectedCaretLineIndex(
+            layout: layout,
+            localY: local.y,
+            clampsToText: clampsToText
+        ) else { return nil }
+        return caretIndex(
+            valueLength: value.length,
+            line: coreTextLine(layout.lines[selectedLineIndex]),
+            origin: layout.origins[selectedLineIndex],
+            localX: local.x,
+            clampsToText: clampsToText
+        )
+    }
+
+    private static func selectedCaretLineIndex(
+        layout: CoreTextFrameLayout,
+        localY: CGFloat,
+        clampsToText: Bool
+    ) -> Int? {
+        var selectedLineIndex: Int?
+        var nearestDistance = CGFloat.greatestFiniteMagnitude
+        for index in 0 ..< layout.lines.count {
+            let line = coreTextLine(layout.lines[index])
+            let origin = layout.origins[index]
+            var ascent: CGFloat = 0
+            var descent: CGFloat = 0
+            var leading: CGFloat = 0
+            _ = CTLineGetTypographicBounds(
+                line,
+                &ascent,
+                &descent,
+                &leading
+            )
+            let lower = origin.y - descent
+            let upper = origin.y + ascent + leading
+            if localY >= lower, localY <= upper {
+                selectedLineIndex = index
+                break
+            }
+            guard clampsToText else { continue }
+            let distance = localY < lower ? lower - localY : localY - upper
+            if distance < nearestDistance {
+                nearestDistance = distance
+                selectedLineIndex = index
+            }
+        }
+        return selectedLineIndex
+    }
+
+    private static func boundaryCaretIndex(
+        valueLength: Int,
+        layout: CoreTextFrameLayout,
+        localPoint: CGPoint
+    ) -> Int? {
+        let firstLine = coreTextLine(layout.lines[0])
+        let lastLine = coreTextLine(layout.lines[layout.lines.count - 1])
+        var firstAscent: CGFloat = 0
+        var firstLeading: CGFloat = 0
+        _ = CTLineGetTypographicBounds(firstLine, &firstAscent, nil, &firstLeading)
+        var lastDescent: CGFloat = 0
+        _ = CTLineGetTypographicBounds(lastLine, nil, &lastDescent, nil)
+        if localPoint.y > layout.origins[0].y + firstAscent + firstLeading {
+            return max(0, CTLineGetStringRange(firstLine).location)
+        }
+        if localPoint.y < layout.origins.last!.y - lastDescent {
+            let range = CTLineGetStringRange(lastLine)
+            return min(valueLength, range.location + range.length)
+        }
+        return nil
+    }
+
+    private static func caretIndex(
+        valueLength: Int,
+        line: CTLine,
+        origin: CGPoint,
+        localX: CGFloat,
+        clampsToText: Bool
+    ) -> Int? {
+        let lineRange = CTLineGetStringRange(line)
+        guard lineRange.length > 0 else { return nil }
+        let width = CGFloat(CTLineGetTypographicBounds(
+            line,
+            nil,
+            nil,
+            nil
+        ))
+        if !clampsToText,
+           localX < origin.x || localX > origin.x + max(1, width)
+        {
+            return nil
+        }
+        if localX <= origin.x {
+            return lineRange.location
+        }
+        if localX >= origin.x + width {
+            return min(
+                valueLength,
+                lineRange.location + lineRange.length
+            )
+        }
+        let index = CTLineGetStringIndexForPosition(
+            line,
+            CGPoint(x: localX - origin.x, y: 0)
+        )
+        guard index != kCFNotFound else { return nil }
+        return min(valueLength, max(0, index))
+    }
+}

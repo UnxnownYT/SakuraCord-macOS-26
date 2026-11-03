@@ -1,0 +1,256 @@
+import Foundation
+@testable import MediaPipeline
+import Testing
+
+@Test
+func `media cache persists bytes without storing the source URL`() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let cache = try MediaCache(maximumBytes: 1_024, directory: root)
+    let url = try #require(URL(
+        string: "https://cdn.example/image.png?signature=private-shape"
+    ))
+    let expected = Data("cached-media".utf8)
+
+    try await cache.insert(expected, for: url)
+
+    #expect(try await cache.data(for: url) == expected)
+    let cacheDirectory = root.appending(
+        path: "SakuraCord/Media",
+        directoryHint: .isDirectory
+    )
+    let filenames = try FileManager.default.contentsOfDirectory(
+        atPath: cacheDirectory.path
+    )
+    // Lowercase SHA-256 hex of the URL; existing caches depend on this spelling.
+    #expect(filenames == ["b05bc1595a5c4661a3003e69a51ba9bd4b0836f0675e07c38be78c620123f32b"])
+}
+
+@Test
+func `media cache enforces its byte budget and can be cleared`() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let cache = try MediaCache(maximumBytes: 12, directory: root)
+    let firstURL = try #require(URL(string: "https://cdn.example/first"))
+    let secondURL = try #require(URL(string: "https://cdn.example/second"))
+
+    try await cache.insert(Data(repeating: 1, count: 8), for: firstURL)
+    try await cache.insert(Data(repeating: 2, count: 8), for: secondURL)
+
+    #expect(try await cache.currentByteCount() <= 12)
+    #expect(try await cache.data(for: secondURL) != nil)
+
+    try await cache.removeAll()
+    #expect(try await cache.currentByteCount() == 0)
+}
+
+@Test
+func `lowering the media cache limit evicts least recently used bytes`() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let cache = try MediaCache(maximumBytes: 24, directory: root)
+    let firstURL = try #require(URL(string: "https://cdn.example/first"))
+    let secondURL = try #require(URL(string: "https://cdn.example/second"))
+
+    try await cache.insert(Data(repeating: 1, count: 8), for: firstURL)
+    try await Task.sleep(for: .milliseconds(10))
+    try await cache.insert(Data(repeating: 2, count: 8), for: secondURL)
+    _ = try await cache.data(for: secondURL)
+
+    try await cache.setMaximumBytes(8)
+
+    let status = try await cache.status()
+    #expect(status.maximumBytes == 8)
+    #expect(status.currentBytes == 8)
+    #expect(status.evictionStatus == .withinLimit)
+    #expect(try await cache.data(for: firstURL) == nil)
+    #expect(try await cache.data(for: secondURL) != nil)
+}
+
+@Test
+func `media cache status enforces a smaller persisted launch limit`() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let firstURL = try #require(URL(string: "https://cdn.example/first"))
+    let secondURL = try #require(URL(string: "https://cdn.example/second"))
+    let seed = try MediaCache(maximumBytes: 24, directory: root)
+    try await seed.insert(Data(repeating: 1, count: 8), for: firstURL)
+    try await seed.insert(Data(repeating: 2, count: 8), for: secondURL)
+
+    let relaunched = try MediaCache(maximumBytes: 8, directory: root)
+    let status = try await relaunched.status()
+
+    #expect(status.maximumBytes == 8)
+    #expect(status.currentBytes == 8)
+    #expect(status.evictionStatus == .withinLimit)
+}
+
+@Test
+func `media cache reads do not wait for index maintenance`() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let cachedURL = try #require(URL(string: "https://cdn.example/cached"))
+    let insertedURL = try #require(URL(string: "https://cdn.example/inserted"))
+    let expected = Data("cached-media".utf8)
+    let seed = try MediaCache(maximumBytes: 1_024, directory: root)
+    try await seed.insert(expected, for: cachedURL)
+
+    let indexLoad = SuspendedMediaCacheIndexLoad()
+    let cache = try MediaCache(
+        maximumBytes: 1_024,
+        directory: root,
+        beforeIndexLoad: indexLoad.pause
+    )
+    let insert = Task {
+        try await cache.insert(Data("new-media".utf8), for: insertedURL)
+    }
+    await indexLoad.waitUntilPaused()
+
+    let read = Task {
+        try await cache.data(for: cachedURL)
+    }
+    let readFinishedFirst = await withTaskGroup(of: Bool.self) { group in
+        group.addTask {
+            (try? await read.value) == expected
+        }
+        group.addTask {
+            try? await Task.sleep(for: .milliseconds(250))
+            return false
+        }
+        let result = await group.next() ?? false
+        await indexLoad.resume()
+        group.cancelAll()
+        return result
+    }
+
+    #expect(readFinishedFirst)
+    try await insert.value
+}
+
+@Test
+func `media cache clear cannot be undone by an older suspended insert`() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let insertedURL = try #require(URL(string: "https://cdn.example/inserted"))
+    let indexLoad = SuspendedMediaCacheIndexLoad()
+    let cache = try MediaCache(
+        maximumBytes: 1_024,
+        directory: root,
+        beforeIndexLoad: indexLoad.pause
+    )
+    let insert = Task {
+        try await cache.insert(Data("old-media".utf8), for: insertedURL)
+    }
+    await indexLoad.waitUntilPaused()
+
+    let clear = Task { try await cache.removeAll() }
+    for _ in 0 ..< 20 { await Task.yield() }
+    await indexLoad.resume()
+    try await insert.value
+    try await clear.value
+
+    #expect(try await cache.currentByteCount() == 0)
+    #expect(try await cache.data(for: insertedURL) == nil)
+}
+
+@Test
+func `concurrent media cache clears coalesce`() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let cache = try MediaCache(maximumBytes: 1_024, directory: root)
+    let url = try #require(URL(string: "https://cdn.example/cached"))
+    try await cache.insert(Data("cached-media".utf8), for: url)
+
+    async let firstClear: Void = cache.removeAll()
+    async let secondClear: Void = cache.removeAll()
+    _ = try await (firstClear, secondClear)
+
+    #expect(try await cache.currentByteCount() == 0)
+    #expect(try await cache.data(for: url) == nil)
+}
+
+@Test
+func `media cache tracks failed evictions and retries them`() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let removal = FailFirstMediaCacheRemoval()
+    let cache = try MediaCache(
+        maximumBytes: 8,
+        directory: root,
+        beforeIndexLoad: {},
+        removeCachedFile: removal.remove
+    )
+    let firstURL = try #require(URL(string: "https://cdn.example/first"))
+    let secondURL = try #require(URL(string: "https://cdn.example/second"))
+    let thirdURL = try #require(URL(string: "https://cdn.example/third"))
+
+    try await cache.insert(Data(repeating: 1, count: 8), for: firstURL)
+    try await cache.insert(Data(repeating: 2, count: 8), for: secondURL)
+
+    #expect(try await cache.currentByteCount() == 16)
+    #expect(removal.attemptCount == 1)
+    #expect(
+        try await cache.status().evictionStatus
+            == .incomplete(failedFileCount: 1)
+    )
+
+    try await cache.insert(Data(repeating: 3, count: 8), for: thirdURL)
+
+    #expect(try await cache.currentByteCount() == 8)
+    #expect(removal.attemptCount == 3)
+    #expect(try await cache.status().evictionStatus == .withinLimit)
+}
+
+private actor SuspendedMediaCacheIndexLoad {
+    private var paused = false
+    private var resumed = false
+    private var pauseWaiter: CheckedContinuation<Void, Never>?
+    private var resumeWaiter: CheckedContinuation<Void, Never>?
+
+    func pause() async {
+        paused = true
+        pauseWaiter?.resume()
+        pauseWaiter = nil
+        guard !resumed else { return }
+        await withCheckedContinuation { resumeWaiter = $0 }
+    }
+
+    func waitUntilPaused() async {
+        guard !paused else { return }
+        await withCheckedContinuation { pauseWaiter = $0 }
+    }
+
+    func resume() {
+        resumed = true
+        resumeWaiter?.resume()
+        resumeWaiter = nil
+    }
+}
+
+private final class FailFirstMediaCacheRemoval: @unchecked Sendable {
+    private let lock = NSLock()
+    private var attempts = 0
+
+    var attemptCount: Int {
+        lock.withLock { attempts }
+    }
+
+    func remove(_ url: URL) throws {
+        let shouldFail = lock.withLock {
+            attempts += 1
+            return attempts == 1
+        }
+        if shouldFail {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        try FileManager.default.removeItem(at: url)
+    }
+}

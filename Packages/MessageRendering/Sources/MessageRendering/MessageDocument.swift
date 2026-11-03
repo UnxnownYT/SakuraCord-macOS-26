@@ -1,0 +1,319 @@
+import Foundation
+
+enum MessageRegularExpression {
+    static func make(_ pattern: String) -> NSRegularExpression {
+        do {
+            return try NSRegularExpression(pattern: pattern)
+        } catch {
+            preconditionFailure("Invalid checked-in regular expression: \(error)")
+        }
+    }
+}
+
+public struct RenderedEmoji: Codable, Hashable, Sendable {
+    private static let tokenExpression = MessageRegularExpression.make(
+        #"^<(a?):([A-Za-z0-9_]+):([0-9]+)>$"#
+    )
+
+    public var id: String
+    public var name: String
+    public var isAnimated: Bool
+    public var rawToken: String
+
+    public init?(rawToken: String) {
+        let range = NSRange(rawToken.startIndex ..< rawToken.endIndex, in: rawToken)
+        guard let match = Self.tokenExpression.firstMatch(in: rawToken, range: range),
+              let animationRange = Range(match.range(at: 1), in: rawToken),
+              let nameRange = Range(match.range(at: 2), in: rawToken),
+              let idRange = Range(match.range(at: 3), in: rawToken)
+        else { return nil }
+        id = String(rawToken[idRange])
+        name = String(rawToken[nameRange])
+        isAnimated = rawToken[animationRange] == "a"
+        self.rawToken = rawToken
+    }
+
+    public var imageURL: URL? {
+        URL(
+            string:
+            "https://cdn.discordapp.com/emojis/\(id).\(isAnimated ? "gif" : "png")?size=96&quality=lossless"
+        )
+    }
+}
+
+public enum GuildNavigationMention: String, Codable, Hashable, Sendable {
+    case guide, browse, customize
+
+    public var title: String {
+        switch self {
+        case .guide: "Server Guide"
+        case .browse: "Browse Channels"
+        case .customize: "Channels & Roles"
+        }
+    }
+}
+
+public struct RenderedMention: Codable, Hashable, Sendable {
+    private static let tokenExpression = MessageRegularExpression.make(
+        #"^<(@!?|@&|#)([0-9]+)>$"#
+    )
+
+    public enum Kind: String, Codable, Hashable, Sendable {
+        case user, role, game, broadcast, timestamp, command, channel, channelLink, message, guildNavigation
+    }
+
+    public static let tokenPattern = [
+        #"<id:(?:guide|browse|customize)>|"#,
+        #"<@!?[0-9]+>|<@&[0-9]+>|<@\$[0-9]+>|<#[0-9]+>|"#,
+        #"(?<![\w@\\])@(?:everyone|here)(?!\w)|"#,
+        #"<t:-?[0-9]+(?::[tTdDfFsSR])?>|"#,
+        // Discord's command mention: up to three name parts, as in `</role add:123>`.
+        #"</[-_\p{L}\p{N}\p{sc=Deva}\p{sc=Thai}]{1,32}(?: [-_\p{L}\p{N}\p{sc=Deva}\p{sc=Thai}]{1,32}){0,2}:[0-9]+>|"#,
+        #"https?://(?:(?:canary|ptb|www)\.)?discord(?:app)?\.com/channels/(?:@me|[0-9]+)/[0-9]+(?:/[0-9]+)?"#
+    ].joined()
+
+    public var id: String
+    public var kind: Kind
+    public var rawToken: String
+    public var messageGuildID: String?
+    public var messageChannelID: String?
+
+    /// The full name of a command mention, such as `role add`.
+    public var commandName: String? {
+        guard kind == .command, let separator = rawToken.lastIndex(of: ":") else { return nil }
+        return String(rawToken[rawToken.index(rawToken.startIndex, offsetBy: 2) ..< separator])
+    }
+
+    public init?(rawToken: String) {
+        if rawToken.hasPrefix("<id:"), rawToken.hasSuffix(">"),
+           let destination = GuildNavigationMention(rawValue: String(rawToken.dropFirst(4).dropLast())) {
+            id = destination.rawValue
+            kind = .guildNavigation
+            self.rawToken = rawToken
+            messageGuildID = nil
+            messageChannelID = nil
+            return
+        }
+        if let (id, kind) = Self.selfContainedMention(rawToken) {
+            self.id = id
+            self.kind = kind
+            self.rawToken = rawToken
+            messageGuildID = nil
+            messageChannelID = nil
+            return
+        }
+
+        let range = NSRange(rawToken.startIndex ..< rawToken.endIndex, in: rawToken)
+        if let match = Self.tokenExpression.firstMatch(in: rawToken, range: range),
+           let prefixRange = Range(match.range(at: 1), in: rawToken),
+           let idRange = Range(match.range(at: 2), in: rawToken)
+        {
+            id = String(rawToken[idRange])
+            kind = switch rawToken[prefixRange] {
+            case "@&": .role
+            case "#": .channel
+            default: .user
+            }
+            self.rawToken = rawToken
+            messageGuildID = nil
+            messageChannelID = nil
+            return
+        }
+
+        guard let url = URL(string: rawToken),
+              url.scheme == "https" || url.scheme == "http",
+              let host = url.host?.lowercased(),
+              Self.messageLinkHosts.contains(host)
+        else { return nil }
+        let components = url.pathComponents.filter { $0 != "/" }
+        guard (3 ... 4).contains(components.count),
+              components[0] == "channels",
+              components[1] == "@me" || UInt64(components[1]) != nil,
+              UInt64(components[2]) != nil,
+              components.count == 3 || UInt64(components[3]) != nil
+        else { return nil }
+        id = components.count == 4 ? components[3] : components[2]
+        kind = components.count == 4 ? .message : .channelLink
+        self.rawToken = rawToken
+        messageGuildID = components[1] == "@me" ? nil : components[1]
+        messageChannelID = components[2]
+    }
+
+    /// Game, timestamp, command and broadcast mentions: the token is all they hold.
+    private static func selfContainedMention(_ rawToken: String) -> (id: String, kind: Kind)? {
+        if rawToken.hasPrefix("<@$"), rawToken.hasSuffix(">"), let gameID = UInt64(rawToken.dropFirst(3).dropLast()) {
+            return (String(gameID), .game)
+        }
+        if let timestamp = DiscordTimestampToken(rawToken: rawToken) {
+            return (String(timestamp.seconds), .timestamp)
+        }
+        if rawToken.hasPrefix("</"), rawToken.hasSuffix(">"), let separator = rawToken.lastIndex(of: ":"),
+           let commandID = UInt64(rawToken[rawToken.index(after: separator)...].dropLast()) {
+            return (String(commandID), .command)
+        }
+        if rawToken == "@everyone" || rawToken == "@here" {
+            return (String(rawToken.dropFirst()), .broadcast)
+        }
+        return nil
+    }
+
+    private static let messageLinkHosts: Set<String> = [
+        "discord.com", "www.discord.com", "canary.discord.com", "ptb.discord.com",
+        "discordapp.com", "www.discordapp.com", "canary.discordapp.com", "ptb.discordapp.com"
+    ]
+}
+
+public struct MessageDocument: Hashable, Sendable {
+    private static let tokenExpression = MessageRegularExpression.make(
+        #"<a?:[A-Za-z0-9_]+:[0-9]+>|"# + RenderedMention.tokenPattern
+    )
+
+    public static let maximumJumboEmojiCount = 27
+
+    public enum Segment: Hashable, Sendable {
+        case markdown(String)
+        case customEmoji(RenderedEmoji)
+        case mention(RenderedMention)
+    }
+
+    public var source: String
+    public var segments: [Segment]
+    public var isEmojiOnly: Bool
+
+    public init(source: String) {
+        self.source = source
+        segments = Self.tokenize(source)
+        isEmojiOnly = Self.detectEmojiOnly(source: source, segments: segments)
+    }
+
+    private static func tokenize(_ source: String) -> [Segment] {
+        let matches = tokenExpression.matches(
+            in: source, range: NSRange(source.startIndex ..< source.endIndex, in: source)
+        )
+        guard !matches.isEmpty else { return source.isEmpty ? [] : [.markdown(source)] }
+        // Only the token-only mention kinds need these scans; most matches are not.
+        var literalRanges: [NSRange]?
+        var result: [Segment] = []
+        var cursor = source.startIndex
+        for match in matches {
+            guard let range = Range(match.range, in: source) else { continue }
+            if cursor < range.lowerBound {
+                result.append(.markdown(String(source[cursor ..< range.lowerBound])))
+            }
+            let token = String(source[range])
+            if let emoji = RenderedEmoji(rawToken: token) {
+                result.append(.customEmoji(emoji))
+            } else if !isMaskedLinkTarget(range, in: source), let mention = RenderedMention(rawToken: token),
+                      !isLiteralMention(mention, range: range, in: source, literalRanges: &literalRanges) {
+                result.append(.mention(mention))
+            } else {
+                result.append(.markdown(token))
+            }
+            cursor = range.upperBound
+        }
+        if cursor < source.endIndex {
+            result.append(.markdown(String(source[cursor...])))
+        }
+        // Markdown must see a masked link and its target as one run.
+        return result.reduce(into: []) { merged, segment in
+            if case let .markdown(next) = segment, case let .markdown(previous)? = merged.last {
+                merged[merged.count - 1] = .markdown(previous + next)
+            } else {
+                merged.append(segment)
+            }
+        }
+    }
+
+    /// A link's own text, such as `https://example.com/@here`, holds no
+    /// mentions. Links end where the Markdown renderer ends them.
+    private static func urlRanges(in source: String) -> [NSRange] {
+        guard source.contains("://") else { return [] }
+        var ranges: [NSRange] = []
+        var rest = source[...]
+        while let match = DiscordMarkdown.firstURL(in: rest) {
+            ranges.append(NSRange(match.range, in: source))
+            rest = source[match.range.upperBound...]
+        }
+        return ranges
+    }
+
+    private static func isLiteralMention(
+        _ mention: RenderedMention, range: Range<String.Index>, in source: String, literalRanges: inout [NSRange]?
+    ) -> Bool {
+        guard [.game, .broadcast, .timestamp, .command].contains(mention.kind) else { return false }
+        let tokenRange = NSRange(range, in: source)
+        let ranges = literalRanges ?? DiscordMarkdown.sourceCodeRanges(source) + urlRanges(in: source)
+        literalRanges = ranges
+        if ranges.contains(where: { NSIntersectionRange($0, tokenRange).length > 0 }) { return true }
+        var cursor = range.lowerBound
+        var escaped = false
+        while cursor > source.startIndex {
+            let previous = source.index(before: cursor)
+            guard source[previous] == "\\" else { break }
+            escaped.toggle()
+            cursor = previous
+        }
+        return escaped
+    }
+
+    /// `[label](https://discord.com/channels/…)` is a masked link, as in
+    /// Discord, not a message-link pill.
+    private static func isMaskedLinkTarget(_ range: Range<String.Index>, in source: String) -> Bool {
+        source[..<range.lowerBound].hasSuffix("](") && source[range.upperBound...].hasPrefix(")")
+    }
+
+    private static func detectEmojiOnly(source: String, segments: [Segment]) -> Bool {
+        var emojiCount = 0
+        for segment in segments {
+            switch segment {
+            case let .markdown(value):
+                for character in value where !character.isWhitespace {
+                    guard isDisplayedEmoji(character) else { return false }
+                    emojiCount += 1
+                    guard emojiCount <= maximumJumboEmojiCount else { return false }
+                }
+            case .mention:
+                return false
+            case .customEmoji:
+                emojiCount += 1
+                guard emojiCount <= maximumJumboEmojiCount else { return false }
+            }
+        }
+        return emojiCount > 0
+    }
+
+    private static func isDisplayedEmoji(_ character: Character) -> Bool {
+        let scalars = character.unicodeScalars
+        return scalars.contains { $0.properties.isEmojiPresentation }
+            || scalars.contains { $0.value == 0xFE0F || $0.value == 0x20E3 }
+            || (scalars.count > 1 && scalars.contains { $0.properties.isEmoji })
+    }
+}
+
+@MainActor
+public final class MessageDocumentCache {
+    public static let shared = MessageDocumentCache()
+    private let values = NSCache<NSString, MessageDocumentBox>()
+
+    private init() {
+        values.countLimit = 2000
+        values.totalCostLimit = 12 * 1024 * 1024
+    }
+
+    public func document(for source: String) -> MessageDocument {
+        let key = source as NSString
+        if let cached = values.object(forKey: key) {
+            return cached.value
+        }
+        let document = MessageDocument(source: source)
+        values.setObject(MessageDocumentBox(document), forKey: key, cost: source.utf8.count)
+        return document
+    }
+}
+
+private final class MessageDocumentBox: NSObject {
+    let value: MessageDocument
+    init(_ value: MessageDocument) {
+        self.value = value
+    }
+}

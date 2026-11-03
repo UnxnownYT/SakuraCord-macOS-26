@@ -1,0 +1,204 @@
+import CoreGraphics
+import Foundation
+import SakuraCordModels
+@testable import SakuraCord
+import Testing
+
+@MainActor @Test func `gifv embed media autoplays while ordinary video attachments remain click to play`() throws {
+    let videoURL = try #require(URL(string: "https://cdn.example/animation.mp4"))
+    let embed = RichMediaItem(
+        id: "gifv", media: MessageEmbedMedia(url: videoURL, contentType: "video/mp4"),
+        fallbackTitle: "GIF", autoplaysInline: true
+    )
+    let attachment = RichMediaItem(
+        Attachment(id: "video", filename: "clip.mp4", url: videoURL, mediaType: "video/mp4")
+    )
+    #expect(embed.autoplaysInline)
+    #expect(!attachment.autoplaysInline)
+    #expect(
+        !TimelineInlineVideoPolicy
+            .canvasOwnsLoadingSurface(
+                mediaIsVideo: true,
+                autoplaysInline: true
+            )
+    )
+    #expect(
+        TimelineInlineVideoPolicy
+            .canvasOwnsLoadingSurface(
+                mediaIsVideo: true,
+                autoplaysInline: false
+            )
+    )
+}
+
+@MainActor @Test func `linked Discord emoji and image markdown is extracted into inline media`() {
+    let content = "before [wave](https://cdn.discordapp.com/emojis/123.webp?size=48) after"
+    let presentation = LinkedImagePresentation(content: content)
+    #expect(presentation.visibleText == content)
+    #expect(presentation.images.count == 1)
+    #expect(presentation.images[0].isEmoji)
+    #expect(presentation.images[0].displaySize == CGSize(width: 48, height: 48))
+    #expect(presentation.images[0].displayURL.path == "/emojis/123.png")
+
+    let mediaOnly = LinkedImagePresentation(
+        content: "[wave](https://cdn.discordapp.com/emojis/123.webp?size=48)"
+    )
+    #expect(mediaOnly.visibleText == "<:wave:123>")
+    #expect(mediaOnly.images.isEmpty)
+}
+
+@MainActor @Test
+func `animated linked Discord emoji use the normal animated emoji presentation`() throws {
+    let sourceURL = try #require(URL(
+        string:
+            "https://cdn.discordapp.com/emojis/456.gif?size=48&animated=true&name=party&lossless=true"
+    ))
+    let presentation = LinkedImagePresentation(
+        content: "[party](\(sourceURL.absoluteString))"
+    )
+
+    #expect(presentation.visibleText == "<a:party:456>")
+    #expect(presentation.images.isEmpty)
+    #expect(presentation.matchedEmojiURLs == Set([sourceURL]))
+}
+
+@MainActor @Test
+func `linked emoji and images inside spoilers stay spoilered links`() throws {
+    let party = "https://cdn.discordapp.com/emojis/456.png"
+    let wave = "https://cdn.discordapp.com/emojis/789.png"
+    #expect(LinkedImagePresentation(content: "[party](\(party))").visibleText == "<:party:456>")
+
+    let image = "https://cdn.discordapp.com/attachments/1/2/secret.gif"
+    #expect(LinkedImagePresentation(content: "[secret](\(image))").images.count == 1)
+    let hiddenImage = "||[secret](\(image))||"
+    let spoileredImage = LinkedImagePresentation(content: hiddenImage)
+    #expect(spoileredImage.visibleText == hiddenImage)
+    #expect(spoileredImage.images.isEmpty)
+
+    let hidden = "||[party](\(party))||"
+    let spoilered = LinkedImagePresentation(content: hidden)
+    #expect(spoilered.visibleText == hidden)
+    #expect(spoilered.images.isEmpty)
+    #expect(spoilered.matchedEmojiURLs.isEmpty)
+
+    // Only the unspoilered link, including one to the same emoji, converts.
+    let mixed = LinkedImagePresentation(
+        content: "[wave](\(wave)) [party](\(party)) ||[party](\(party))||"
+    )
+    #expect(mixed.images.map(\.id) == ["0:\(wave)", "50:\(party)"])
+    #expect(mixed.matchedEmojiURLs == Set([wave, party].compactMap(URL.init(string:))))
+    #expect(mixed.visibleText.hasSuffix("||[party](\(party))||"))
+
+    // A different syntax occurrence of the same URL must not borrow or
+    // consume the masked link's spoiler state, including adjacent links.
+    for content in [
+        "||<\(party)>|| [party](\(party))",
+        "<\(party)> ||[party](\(party))|| [party](\(party))",
+        "||[party](\(party))||[party](\(party))",
+        "`[party](\(party))` ||[party](\(party))|| [party](\(party))",
+    ] {
+        let result = LinkedImagePresentation(content: content)
+        let visibleLocation = (content as NSString).range(of: "[party]", options: .backwards).location
+        #expect(result.images.contains { $0.id == "\(visibleLocation):\(party)" })
+        #expect(!result.images.contains { reference in
+            let hidden = (content as NSString).range(of: "||[party]")
+            return hidden.location != NSNotFound && reference.id == "\(hidden.location + 2):\(party)"
+        })
+    }
+}
+
+@MainActor @Test
+func `linked emoji previews replace duplicate Discord bare media embeds`() throws {
+    let sourceURL = try #require(URL(
+        string:
+            "https://cdn.discordapp.com/emojis/456.gif?size=48&animated=true&name=party&lossless=true"
+    ))
+    let message = Message(
+        id: MessageID(rawValue: 1),
+        channelID: ChannelID(rawValue: 2),
+        author: User(
+            id: UserID(rawValue: 3),
+            username: "fixture",
+            displayName: "Fixture"
+        ),
+        content: "hello [party](\(sourceURL.absoluteString))",
+        embeds: [
+            MessageEmbed(
+                type: "image",
+                url: sourceURL,
+                image: MessageEmbedMedia(url: sourceURL)
+            )
+        ]
+    )
+
+    #expect(MessageEmbedPresentation.visibleEmbeds(for: message).isEmpty)
+    let presentation = LinkedImagePresentation(content: message.content)
+    #expect(presentation.visibleText == message.content)
+    #expect(presentation.images.count == 1)
+    #expect(presentation.images[0].displayURL.path == "/emojis/456.gif")
+}
+
+@MainActor @Test func `media only embeds are bare and replace solitary source links`() throws {
+    let sourceURL = try #require(URL(string: "https://example.com/cat"))
+    let videoURL = try #require(URL(string: "https://cdn.example/cat.mp4"))
+    let gifv = MessageEmbed(
+        title: "Cat", type: "gifv", url: sourceURL,
+        video: MessageEmbedMedia(url: videoURL, width: 320, height: 480),
+        provider: MessageEmbedProvider(name: "Example")
+    )
+    #expect(MessageEmbedPresentation.kind(for: gifv) == .bareMedia)
+    #expect(MessageEmbedPresentation.visibleMessageContent(sourceURL.absoluteString, embeds: [gifv]).isEmpty)
+    #expect(
+        MessageEmbedPresentation.visibleMessageContent("Look: \(sourceURL.absoluteString)", embeds: [gifv])
+            == "Look: \(sourceURL.absoluteString)"
+    )
+
+    #expect(MessageEmbedPresentation.kind(for: MessageEmbed(type: "rich")) == .hidden)
+    #expect(MessageEmbedPresentation.kind(for: MessageEmbed(title: "Preview", type: "rich")) == .card)
+
+    let gifURL = try #require(URL(string: "https://cdn.discordapp.com/attachments/1/2/cat.gif"))
+    let signedGIFURL = try #require(URL(string: "\(gifURL.absoluteString)?ex=1&is=2&hm=3&"))
+    let gif = MessageEmbed(
+        type: "image", url: gifURL,
+        image: MessageEmbedMedia(url: signedGIFURL, contentType: "image/gif", flags: 32)
+    )
+    #expect(MessageEmbedPresentation.kind(for: gif) == .bareMedia)
+    #expect(MessageEmbedPresentation.visibleMessageContent(gifURL.absoluteString, embeds: [gif]).isEmpty)
+    let gifItem = try #require(RichMediaItem(embed: gif, attachments: []))
+    #expect(gifItem.url == signedGIFURL)
+    #expect(gifItem.kind == .image(animated: true))
+}
+
+@MainActor @Test
+func `suppressed embeds retain their source link and expose no preview`() throws {
+    let sourceURL = try #require(URL(string: "https://example.com/cat"))
+    let videoURL = try #require(URL(string: "https://cdn.example/cat.mp4"))
+    let embed = MessageEmbed(
+        id: "suppressed-gifv",
+        type: "gifv",
+        url: sourceURL,
+        video: MessageEmbedMedia(
+            url: videoURL,
+            width: 320,
+            height: 480
+        )
+    )
+    let message = Message(
+        id: MessageID(rawValue: 90),
+        channelID: ChannelID(rawValue: 91),
+        author: User(
+            id: UserID(rawValue: 92),
+            username: "fixture",
+            displayName: "Fixture"
+        ),
+        content: sourceURL.absoluteString,
+        flags: [.suppressEmbeds],
+        embeds: [embed]
+    )
+
+    #expect(MessageEmbedPresentation.visibleEmbeds(for: message).isEmpty)
+    #expect(
+        MessageEmbedPresentation.visibleMessageContent(for: message)
+            == sourceURL.absoluteString
+    )
+}

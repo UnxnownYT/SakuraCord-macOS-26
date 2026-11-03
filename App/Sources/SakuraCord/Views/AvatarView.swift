@@ -1,0 +1,91 @@
+import SwiftUI
+
+struct AvatarView: View {
+    let name: String
+    let url: URL?
+    let size: CGFloat
+    let maximumPixelDimension: Int?
+    let animates: Bool
+    // Rows with their own pointer tracking supply the hover state; standalone
+    // avatars track the pointer over the image itself.
+    let isHovered: Bool?
+    @State private var isPointerInside = false
+
+    init(
+        name: String,
+        url: URL?,
+        size: CGFloat,
+        maximumPixelDimension: Int? = nil,
+        animates: Bool = true,
+        isHovered: Bool? = nil
+    ) {
+        self.name = name
+        self.url = url
+        self.size = size
+        self.maximumPixelDimension = maximumPixelDimension
+        self.animates = animates
+        self.isHovered = isHovered
+    }
+
+    var body: some View {
+        ZStack {
+            if let cachedFrame {
+                Image(decorative: cachedFrame, scale: 1)
+                    .resizable()
+                    .scaledToFill()
+            } else if showsFallback {
+                Circle().fill(SakuraCordAccentColor.color.gradient)
+                fallback
+            }
+            if let url {
+                if animates,
+                   NativeTimelineAvatarPresentation
+                    .shouldDecodeAnimation(for: url)
+                {
+                    AnimatedRemoteImage(
+                        url: url,
+                        animates: isHovered ?? isPointerInside,
+                        maximumPixelDimension: requestedPixelDimension,
+                        contentMode: .fill,
+                        resetsWhenStopped: true
+                    )
+                } else {
+                    StaticRemoteImage(
+                        url: url,
+                        maximumPixelDimension:
+                            max(96, requestedPixelDimension),
+                        contentMode: .fill
+                    )
+                }
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(Circle())
+        .onModalHover { isPointerInside = $0 }
+        .accessibilityLabel("\(name) avatar")
+    }
+
+    private var fallback: some View {
+        Text(name.prefix(1).uppercased()).font(.system(size: size * 0.42, weight: .semibold))
+    }
+
+    var requestedPixelDimension: Int {
+        maximumPixelDimension ?? max(1, Int((size * 2).rounded(.up)))
+    }
+
+    var showsFallback: Bool {
+        url == nil
+    }
+
+    var cachedFrame: CGImage? {
+        guard let url,
+              animates,
+              NativeTimelineAvatarPresentation
+                .shouldDecodeAnimation(for: url)
+        else { return nil }
+        return AnimatedRemoteImageDisplayCache.shared.image(
+            for: url,
+            maximumPixelDimension: requestedPixelDimension
+        )?.frames.first
+    }
+}

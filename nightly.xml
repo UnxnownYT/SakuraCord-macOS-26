@@ -1,0 +1,71 @@
+<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
+--><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>SakuraCord Nightly</title>
+        <item>
+            <title>0.1.7 Beta 6</title>
+            <pubDate>Tue, 03 Nov 2026 17:40:37 +0800</pubDate>
+            <link>https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/tag/v0.1.7-Beta-6</link>
+            <sparkle:fullReleaseNotesLink>https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/tag/v0.1.7-Beta-6</sparkle:fullReleaseNotesLink>
+            <sparkle:version>202611030929</sparkle:version>
+            <sparkle:shortVersionString>0.1.7 Beta 6</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.4</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description sparkle:format="markdown"><![CDATA[# SakuraCord v0.1.7-Beta-6
+
+An unofficial build of SakuraCord's Nightly channel that runs on **macOS 26 Tahoe**. The official app requires macOS 27.
+
+⚠️ This is a nightly build. Expect bugs. It replaces a stable SakuraCord install, because both use the same app ID.
+
+### New in this macOS 26 build
+- **In-app updates.** SakuraCord can now update itself. Nightly installs follow this nightly feed, and stable installs follow a separate stable feed. Check under Settings → Software Updates.
+- **Discord Rich Presence.** Games and apps that support Rich Presence can show what you're doing on your profile, including your own profile card in SakuraCord. Turn it on in Settings → Features. Images uploaded to a game's Discord app work, but images given as web links don't show yet. If the official Discord app is open, games connect to it instead.
+
+### New from upstream (v0.1.7 Beta 6)
+**Files, media and uploads**
+- File cards with macOS file icons. Downloads save straight to Downloads, with progress and Show in Finder
+- Quick Look previews for text, code, PDFs and more
+- Audio cards with a compact player, plus a bigger player in the viewer with 10-second skips
+- Inline video playback in the timeline, with scrubbing, volume and full screen
+- Uploads start as soon as you attach files, run in parallel, and can be cancelled or retried
+- Discord's warning before downloading potentially dangerous files
+
+**Messages and composer**
+- Discord-style spoilers for text, images, videos, files, embeds and components
+- More mention types: timestamps with live relative times, @everyone/@here pills, slash-command mentions and game mentions
+- Reaction animations, and message layouts, Markdown and code blocks that match Discord
+- Pointing-hand cursor on everything clickable in the timeline
+
+**Channels, friends and calls**
+- Message Requests under Friends, with Requests and Spam tabs
+- AutoMod alert messages
+- Custom message sound and call ringtone pickers
+- Deafen now also mutes your mic, matching Discord
+- Fixed text keeping the old theme's colours after switching between Light and Dark
+
+### Also included from Beta 5
+- Create Thread from the message menu, a Threads browser, and Join/Leave/Follow/Rename for threads and posts
+- Rebuilt forum browser, with per-forum memory of sort and view
+- Unread tracking for forums and threads that follows Discord's rules, plus a clickable new-messages banner
+- Discord's security check (CAPTCHA) wherever Discord asks for one
+- Close DM, Add Friend that sends the request directly, and blocked/ignored account management
+- Nitro upload limit raised to 1 GB
+
+### macOS 26 differences
+- Drag-to-reorder for input bar icons and profile widgets is unavailable
+- Some Liquid Glass effects and toolbar spacing are simplified
+- Inbox tabs use a standard segmented control
+
+### Install
+1. Open the DMG and drag SakuraCord into Applications.
+2. The app isn't notarized, so the first time, right-click SakuraCord → **Open** → **Open**. If macOS still blocks it, go to System Settings → Privacy & Security → **Open Anyway**.
+
+Requires macOS 26.4 or later. Full upstream changelog: https://github.com/SakuraCordApp/SakuraCord/releases]]></description>
+            <enclosure url="https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/download/v0.1.7-Beta-6/SakuraCord-v0.1.7-Beta-6.dmg" length="43269691" type="application/octet-stream" sparkle:edSignature="SXGb6HyiTHe4SKHx1juTcvRaeEJhB/2yDYQOrJPXsKkcp11k6MV69PVhCiWrMbo1WkCZz/TeVQYrVW7ekmXrCA=="></enclosure>
+        </item>
+    </channel>
+</rss><!-- sparkle-signatures:
+edSignature: Xq0m+rQdfd3rpmaZ6b0butRq1LMk3lim6/19RwsVARbe0rM/hMn2o2hwpvCjJ1LkC6icZVUIwG42bMniRfV/Bw==
+length: 4694
+-->

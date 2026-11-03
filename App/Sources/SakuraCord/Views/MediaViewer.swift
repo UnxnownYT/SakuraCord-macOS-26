@@ -1,0 +1,389 @@
+import AppKit
+import SwiftUI
+
+struct MediaViewer: View {
+    @Environment(\.profileCosmeticPolicy) private var cosmeticPolicy
+    /// The window's scheme; the viewer itself always renders dark.
+    @Environment(\.colorScheme) private var windowColorScheme
+    let presentation: NativeTimelineMediaViewerPresentation
+    let isVisible: Bool
+    let transitionSources: [String: MediaViewerTransitionSource]
+    let close: () -> Void
+    let closeInteractively: () -> Void
+    let selectionChanged: (String) -> Void
+    @State private var interaction: MediaViewerInteractionModel
+    @State private var feedbackTask: Task<Void, Never>?
+    @FocusState private var keyboardNavigationIsFocused: Bool
+
+    init(
+        presentation: NativeTimelineMediaViewerPresentation,
+        isVisible: Bool = true,
+        transitionSources: [String: MediaViewerTransitionSource] = [:],
+        close: @escaping () -> Void,
+        closeInteractively: @escaping () -> Void,
+        selectionChanged: @escaping (String) -> Void = { _ in }
+    ) {
+        self.presentation = presentation
+        self.isVisible = isVisible
+        self.transitionSources = transitionSources
+        self.close = close
+        self.closeInteractively = closeInteractively
+        self.selectionChanged = selectionChanged
+        _interaction = State(
+            initialValue: MediaViewerInteractionModel(
+                itemCount: presentation.items.count,
+                selection: presentation.selection
+            )
+        )
+    }
+
+    var body: some View {
+        let item = presentation.items[interaction.selection]
+        let transitionSource = transitionSources[item.id]
+        let usesSourceTransition = transitionSource != nil
+
+        GlassEffectContainer(spacing: InterfaceScale.metric(12)) {
+            GeometryReader { proxy in
+                ZStack {
+                    MediaViewerBackdrop(
+                        isVisible: isVisible,
+                        interaction: interaction,
+                        close: close
+                    )
+
+                    MediaViewerStage(
+                        item: item,
+                        messageID: presentation.messageID,
+                        previewImage:
+                            presentation.timelinePreviewImages[item.id],
+                        isVisible: isVisible,
+                        transitionSource: transitionSource,
+                        horizontalInset: 66,
+                        topInset: MediaViewerTopChromeMetrics.mediaTopInset,
+                        bottomInset: presentation.items.count > 1 ? 82 : 14,
+                        interaction: interaction,
+                        finishPinchDismissal: finishPinchDismissal,
+                        download: { save(item, to: .defaultFolder) },
+                        imageContextMenuActions: MediaImageContextMenuActions(
+                            copyImage: { copyImage(item) },
+                            save: saveActions(for: item),
+                            copyLink: { copyLink(item) },
+                            openLink: {
+                                MediaViewerActionService.openInBrowser(item.url)
+                            }
+                        )
+                    )
+                    .modifier(
+                        MediaViewerStagePresentationEffect(
+                            isVisible: isVisible,
+                            usesSourceTransition: usesSourceTransition,
+                            interaction: interaction
+                        )
+                    )
+
+                    MediaViewerHeader(
+                        authorFontID: presentation.authorID.map { cosmeticPolicy.disables(.nameStyle, for: $0) } == true ? nil : presentation.authorFontID,
+                        authorName: presentation.authorName,
+                        authorAvatarURL: presentation.authorAvatarURL,
+                        timestamp: presentation.timestamp,
+                        selection: interaction.selection,
+                        itemCount: presentation.items.count
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .padding(.leading, InterfaceScale.metric(72))
+                    .padding(
+                        .top,
+                        MediaViewerTopChromeMetrics.outerPadding
+                    )
+                    .modifier(
+                        MediaViewerChromePresentationEffect(
+                            isVisible: isVisible,
+                            hiddenOffsetY: -10,
+                            interaction: interaction
+                        )
+                    )
+
+                    MediaViewerTopControls(
+                        item: item,
+                        isSaving: interaction.isSaving,
+                        copyImage: { copyImage(item) },
+                        copyLink: { copyLink(item) },
+                        copyAttachmentID: { copyAttachmentID(item) },
+                        saveActions: saveActions(for: item),
+                        open: {
+                            MediaViewerActionService.openInBrowser(item.url)
+                        },
+                        close: close
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    .padding(.trailing, InterfaceScale.metric(16))
+                    .padding(
+                        .top,
+                        MediaViewerTopChromeMetrics.outerPadding
+                    )
+                    .modifier(
+                        MediaViewerChromePresentationEffect(
+                            isVisible: isVisible,
+                            hiddenOffsetY: -10,
+                            interaction: interaction
+                        )
+                    )
+
+                    if presentation.items.count > 1 {
+                        MediaViewerNavigationButtons(
+                            canMoveBackward: interaction.canMoveBackward,
+                            canMoveForward: interaction.canMoveForward,
+                            moveBackward: { move(-1) },
+                            moveForward: { move(1) }
+                        )
+                        .padding(.horizontal, InterfaceScale.metric(18))
+                        .modifier(
+                            MediaViewerChromePresentationEffect(
+                                isVisible: isVisible,
+                                hiddenOffsetY: 0,
+                                interaction: interaction
+                            )
+                        )
+
+                        MediaViewerThumbnailStrip(
+                            items: presentation.items,
+                            selection: interaction.selection,
+                            maximumWidth: max(
+                                120,
+                                min(760, proxy.size.width - 180)
+                            ),
+                            select: select
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                        .padding(.bottom, InterfaceScale.metric(14))
+                        .modifier(
+                            MediaViewerChromePresentationEffect(
+                                isVisible: isVisible,
+                                hiddenOffsetY: 14,
+                                interaction: interaction
+                            )
+                        )
+                    }
+
+                    if let feedback = interaction.feedback {
+                        MediaViewerFeedbackPill(message: feedback.message)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                            .padding(.bottom, presentation.items.count > 1 ? 86 : 22)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                }
+            }
+        }
+        .ignoresSafeArea()
+        .focusable()
+        .focused($keyboardNavigationIsFocused)
+        .focusEffectDisabled()
+        .allowsHitTesting(isVisible)
+        .onExitCommand(perform: close)
+        .onKeyPress(phases: .down) { press in
+            handleKeyPress(press)
+        }
+        .task {
+            await Task.yield()
+            keyboardNavigationIsFocused = true
+        }
+        .onDisappear {
+            feedbackTask?.cancel()
+            feedbackTask = nil
+        }
+        .alert(
+            "Media action failed",
+            isPresented: Binding(
+                get: { interaction.errorMessage != nil },
+                set: { if !$0 { interaction.errorMessage = nil } }
+            )
+        ) {
+            Button("OK") { interaction.errorMessage = nil }
+        } message: {
+            Text(interaction.errorMessage ?? "Unknown error")
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(
+            "Media viewer, item \(interaction.selection + 1) of \(presentation.items.count)"
+        )
+        .environment(\.mediaViewerWindowColorScheme, windowColorScheme)
+        // The viewer always sits on a near-black backdrop.
+        .environment(\.colorScheme, .dark)
+    }
+
+    private func handleKeyPress(_ press: KeyPress) -> KeyPress.Result {
+        switch press.key {
+        case .leftArrow:
+            move(-1)
+            return .handled
+        case .rightArrow:
+            move(1)
+            return .handled
+        default:
+            return .ignored
+        }
+    }
+
+    private func move(_ delta: Int) {
+        guard interaction.move(delta) else { return }
+        announceSelection()
+    }
+
+    private func select(_ index: Int) {
+        guard interaction.select(index) else { return }
+        announceSelection()
+    }
+
+    private func announceSelection() {
+        selectionChanged(presentation.items[interaction.selection].id)
+        NSAccessibility.post(
+            element: NSApplication.shared,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement:
+                    "Item \(interaction.selection + 1) of \(presentation.items.count)"
+            ]
+        )
+    }
+
+    private func finishPinchDismissal(magnification: CGFloat) -> Bool {
+        let committed = interaction.shouldCommitPinchDismissal(
+            magnification: magnification
+        )
+        if committed {
+            closeInteractively()
+        } else {
+            withAnimation(
+                .snappy(
+                    duration:
+                        MediaViewerTransitionTiming
+                            .interactiveCancellationDuration,
+                    extraBounce: 0.04
+                )
+            ) {
+                interaction.cancelPinchDismissal()
+            }
+        }
+        return committed
+    }
+
+    private func copyImage(_ item: RichMediaItem) {
+        Task {
+            do {
+                try await MediaViewerActionService.copyImage(from: item.url)
+                showFeedback("Image copied")
+            } catch {
+                interaction.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func copyLink(_ item: RichMediaItem) {
+        MediaViewerActionService.copyText(item.url.absoluteString)
+        showFeedback("Media link copied")
+    }
+
+    private func copyAttachmentID(_ item: RichMediaItem) {
+        MediaViewerActionService.copyText(item.id)
+        showFeedback("Attachment ID copied")
+    }
+
+    private func saveActions(for item: RichMediaItem) -> MediaSaveMenuActions {
+        MediaSaveMenuActions(
+            saveAs: { save(item, to: .saveAs) },
+            saveToDefaultFolder: { save(item, to: .defaultFolder) }
+        )
+    }
+
+    private func save(
+        _ item: RichMediaItem,
+        to destination: MediaSaveDestination
+    ) {
+        guard item.canSave, !interaction.isSaving else { return }
+        interaction.isSaving = true
+        Task {
+            defer { interaction.isSaving = false }
+            if DangerousDownloadPolicy.isPotentiallyDangerous(item.url) {
+                guard await DangerousDownloadPolicy.confirm(in: nil) else { return }
+            }
+            do {
+                if let savedURL = try await MediaViewerActionService.save(
+                    item,
+                    to: destination
+                ) {
+                    showFeedback("Saved \(savedURL.lastPathComponent)")
+                }
+            } catch {
+                interaction.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func showFeedback(_ message: String) {
+        feedbackTask?.cancel()
+        withAnimation(.snappy(duration: 0.22)) {
+            interaction.feedback = MediaViewerFeedback(message: message)
+        }
+        feedbackTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.18)) {
+                interaction.feedback = nil
+            }
+        }
+    }
+}
+
+private struct MediaViewerBackdrop: View {
+    let isVisible: Bool
+    let interaction: MediaViewerInteractionModel
+    let close: () -> Void
+
+    var body: some View {
+        let presentationProgress = isVisible
+            ? 1 - interaction.pinchDismissalProgress
+            : 0
+
+        Color.black.opacity(
+            WindowModalVisualStyle.mediaViewerBackgroundDimmingOpacity
+                * presentationProgress
+        )
+        .contentShape(Rectangle())
+        .onTapGesture(perform: close)
+    }
+}
+
+private struct MediaViewerStagePresentationEffect: ViewModifier {
+    let isVisible: Bool
+    let usesSourceTransition: Bool
+    let interaction: MediaViewerInteractionModel
+
+    func body(content: Content) -> some View {
+        let presentationProgress = isVisible
+            ? 1 - interaction.pinchDismissalProgress
+            : 0
+        content
+            .scaleEffect(
+                usesSourceTransition
+                    ? 1
+                    : 0.965 + presentationProgress * 0.035
+            )
+            .opacity(usesSourceTransition ? 1 : presentationProgress)
+    }
+}
+
+private struct MediaViewerChromePresentationEffect: ViewModifier {
+    let isVisible: Bool
+    let hiddenOffsetY: CGFloat
+    let interaction: MediaViewerInteractionModel
+
+    func body(content: Content) -> some View {
+        let presentationProgress = isVisible
+            ? 1 - interaction.pinchDismissalProgress
+            : 0
+        content
+            .offset(y: hiddenOffsetY * (1 - presentationProgress))
+            .opacity(presentationProgress)
+            .scaleEffect(0.975 + presentationProgress * 0.025)
+    }
+}

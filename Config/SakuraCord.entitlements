@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <key>com.apple.security.device.camera</key>
+    <true/>
+    <key>com.apple.security.files.downloads.read-write</key>
+    <true/>
+    <key>com.apple.security.files.bookmarks.app-scope</key>
+    <true/>
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <key>com.apple.security.files.user-selected.executable</key>
+    <true/>
+    <key>com.apple.security.temporary-exception.files.home-relative-path.read-only</key>
+    <array>
+        <string>/Library/Application Support/discord/Local Storage/leveldb/</string>
+        <string>/Library/Application Support/Discord/Local Storage/leveldb/</string>
+    </array>
+    <key>com.apple.security.temporary-exception.files.home-relative-path.read-write</key>
+    <array>
+        <string>/Library/Sounds/</string>
+    </array>
+    <key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
+    <array>
+        <string>__SAKURACORD_BUNDLE_IDENTIFIER__-spks</string>
+        <string>__SAKURACORD_BUNDLE_IDENTIFIER__-spki</string>
+    </array>
+    <key>com.apple.security.temporary-exception.files.absolute-path.read-write</key>
+    <array>
+        <string>/private/var/folders</string>
+        <string>/private/var/folders/</string>
+    </array>
+    <key>com.apple.security.temporary-exception.sbpl</key>
+    <array>
+        <string>(allow network-bind (local unix-socket (path-regex #"^/private/var/folders/[^/]+/[^/]+/T/discord-ipc-[0-9]$")))</string>
+        <string>(allow network-inbound (local unix-socket (path-regex #"^/private/var/folders/[^/]+/[^/]+/T/discord-ipc-[0-9]$")))</string>
+        <string>(allow network-outbound (remote unix-socket (path-regex #"^/private/var/folders/[^/]+/[^/]+/T/discord-ipc-[0-9]$")))</string>
+    </array>
+</dict>
+</plist>

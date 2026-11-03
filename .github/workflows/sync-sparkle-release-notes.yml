@@ -1,0 +1,142 @@
+name: Sync Sparkle Release Notes
+
+on:
+  release:
+    types: [edited]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published stable or vMAJOR.MINOR.PATCH-Beta-NUMBER release to resync
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.event_name == 'workflow_dispatch' || github.event.release.draft == false
+    runs-on: xcode-27
+    concurrency:
+      group: sparkle-release
+      cancel-in-progress: false
+    env:
+      SAKURACORD_RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve release tag
+        run: |
+          if [[ ! "$SAKURACORD_RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-Beta-[0-9]+)?$ ]]; then
+            echo "Release tags must use vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-Beta-NUMBER." >&2
+            exit 1
+          fi
+          asset_version="${SAKURACORD_RELEASE_TAG#v}"
+          version="${asset_version%%-Beta-*}"
+          release_track=regular
+          expected_prerelease=false
+          if [[ "$SAKURACORD_RELEASE_TAG" == *-Beta-* ]]; then
+            release_track=nightly
+            expected_prerelease=true
+            beta_number="${SAKURACORD_RELEASE_TAG##*-}"
+            asset_version="$version-Beta-$beta_number"
+          fi
+          is_prerelease="$(gh release view "$SAKURACORD_RELEASE_TAG" --json isPrerelease --jq .isPrerelease)"
+          if [[ "$is_prerelease" != "$expected_prerelease" ]]; then
+            echo "The GitHub Release prerelease state does not match its tag." >&2
+            exit 1
+          fi
+          echo "SAKURACORD_VERSION=$version" >> "$GITHUB_ENV"
+          echo "SAKURACORD_RELEASE_TRACK=$release_track" >> "$GITHUB_ENV"
+          if [[ "$release_track" == "nightly" ]]; then
+            dmg_name="SakuraCord-v$asset_version.dmg"
+          else
+            dmg_name="SakuraCord.v$asset_version.dmg"
+          fi
+          echo "SAKURACORD_DMG_NAME=$dmg_name" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SAKURACORD_RELEASE_TAG }}
+      - name: Check out current release-control files
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v7
+        with:
+          path: release-control
+          ref: ${{ github.sha }}
+      - name: Select release-control files
+        run: |
+          release_control_root="$GITHUB_WORKSPACE"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            release_control_root="$GITHUB_WORKSPACE/release-control"
+          fi
+          echo "SAKURACORD_RELEASE_CONTROL_ROOT=$release_control_root" >> "$GITHUB_ENV"
+      - name: Validate Sparkle release secrets
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          SPARKLE_ED_PUBLIC_KEY: ${{ secrets.SPARKLE_ED_PUBLIC_KEY }}
+        run: |
+          if [[ -z "$SPARKLE_ED_PRIVATE_KEY" || -z "$SPARKLE_ED_PUBLIC_KEY" ]]; then
+            echo "SPARKLE_ED_PRIVATE_KEY and SPARKLE_ED_PUBLIC_KEY must be configured." >&2
+            exit 1
+          fi
+          private_key_bytes="$(printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | base64 -D | wc -c | tr -d '[:space:]')"
+          public_key_bytes="$(printf '%s' "$SPARKLE_ED_PUBLIC_KEY" | base64 -D | wc -c | tr -d '[:space:]')"
+          if [[ "$private_key_bytes" != "32" || "$public_key_bytes" != "32" ]]; then
+            echo "Sparkle secrets must contain base64-encoded 32-byte Ed25519 keys." >&2
+            exit 1
+          fi
+      - name: Resolve Sparkle release tools
+        run: |
+          for attempt in 1 2 3; do
+            if swift package --package-path "$SAKURACORD_RELEASE_CONTROL_ROOT/App" resolve; then
+              break
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "Dependency resolution failed after $attempt attempts." >&2
+              exit 1
+            fi
+            echo "Dependency resolution failed; retrying ($attempt/3)..." >&2
+            sleep $((attempt * 5))
+          done
+      - name: Download published release inputs
+        run: |
+          asset_dir="$RUNNER_TEMP/release-assets"
+          mkdir -p "$asset_dir" dist
+          gh release download "$SAKURACORD_RELEASE_TAG" \
+            --pattern "$SAKURACORD_DMG_NAME" \
+            --pattern appcast.xml \
+            --dir "$asset_dir"
+          gh release view "$SAKURACORD_RELEASE_TAG" \
+            --json body --jq .body > dist/release-notes.md
+          if ! grep -q '[^[:space:]]' dist/release-notes.md; then
+            echo "The current GitHub Release body is empty." >&2
+            exit 1
+          fi
+          build_number="$(
+            xmllint --xpath \
+              'string((//*[local-name()="item"])[1]/*[local-name()="version"])' \
+              "$asset_dir/appcast.xml"
+          )"
+          if [[ ! "$build_number" =~ ^[0-9]+$ ]]; then
+            echo "The published appcast has an invalid build number." >&2
+            exit 1
+          fi
+          echo "SAKURACORD_BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
+          echo "SAKURACORD_DMG_PATH=$asset_dir/$SAKURACORD_DMG_NAME" >> "$GITHUB_ENV"
+      - name: Regenerate and validate signed Sparkle appcast
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          SPARKLE_ED_PUBLIC_KEY: ${{ secrets.SPARKLE_ED_PUBLIC_KEY }}
+        run: |
+          "$SAKURACORD_RELEASE_CONTROL_ROOT/script/generate_appcast.sh" \
+            "$SAKURACORD_DMG_PATH" "$GITHUB_WORKSPACE/dist/appcast.xml" \
+            "$GITHUB_WORKSPACE/dist/release-notes.md"
+      - name: Replace appcast asset
+        run: gh release upload "$SAKURACORD_RELEASE_TAG" dist/appcast.xml --clobber
+      - name: Verify published appcast
+        run: |
+          published_appcast="$RUNNER_TEMP/published-appcast.xml"
+          release_prefix="https://github.com/$GITHUB_REPOSITORY/releases/download/$SAKURACORD_RELEASE_TAG"
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
+            --output "$published_appcast" \
+            "$release_prefix/appcast.xml?run=$GITHUB_RUN_ID"
+          cmp dist/appcast.xml "$published_appcast"

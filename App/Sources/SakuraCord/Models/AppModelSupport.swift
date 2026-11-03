@@ -1,0 +1,1126 @@
+import DiscordProtocol
+import Foundation
+import ImageIO
+import MediaPipeline
+import MessageRendering
+import SakuraCordModels
+import SakuraCordPersistence
+import UniformTypeIdentifiers
+
+struct AppModelAccountSession {
+    let generation: UInt64
+    let installedRevision: UInt64
+    let allowsTransition: Bool
+    let provider: any ChatProvider
+    let database: SakuraCordDatabase?
+}
+
+struct BootstrapHistoryPrefetch {
+    let accountGeneration: UInt64
+    let accountRevision: UInt64
+    let channelID: ChannelID
+    let task: Task<MessagePage, any Error>
+}
+
+struct AppModelVoiceOperationIdentity {
+    let generation: Int
+    let channelID: ChannelID?
+    let session: DiscordVoiceSession?
+}
+
+actor AccountTransitionCoordinator {
+    private var isAcquired = false
+
+    func acquireIfAvailable() -> Bool {
+        guard !isAcquired else { return false }
+        isAcquired = true
+        return true
+    }
+
+    func release() {
+        isAcquired = false
+    }
+}
+
+extension AppModel {
+    func voiceGatewayDiagnostics(transport: String) -> VoiceGatewayDiagnostics {
+        VoiceGatewayDiagnostics(
+            recorder: { direction, data in
+                DiscordAPIDiagnosticStore.shared.recordWebSocketData(
+                    transport: transport,
+                    direction: direction.rawValue,
+                    data: data
+                )
+            },
+            eventRecorder: { event in
+                DiscordAPIDiagnosticStore.shared.recordWebSocketLifecycle(
+                    transport: transport,
+                    operation: event.operation,
+                    integers: event.integers,
+                    flags: event.flags,
+                    error: event.error,
+                    incident: event.incident
+                )
+            }
+        )
+    }
+
+    func accountSession(allowsTransition: Bool = false) -> AppModelAccountSession {
+        let isBlockedTransition = accountTransitionIsActive && !allowsTransition
+        return AppModelAccountSession(
+            generation: accountSessionGeneration,
+            installedRevision: installedAccountSessionRevision,
+            allowsTransition: allowsTransition,
+            provider: isBlockedTransition ? SignedOutChatProvider() : provider,
+            database: isBlockedTransition ? nil : database
+        )
+    }
+
+    func isCurrentAccountSession(_ session: AppModelAccountSession) -> Bool {
+        accountSessionGeneration == session.generation
+            && installedAccountSessionRevision == session.installedRevision
+            && (!accountTransitionIsActive || session.allowsTransition)
+    }
+
+    /// No challenge is presented for a session being replaced or signed out.
+    func solveCaptcha(_ challenge: DiscordCaptchaChallenge) async -> String? {
+        guard !accountTransitionIsActive else { return nil }
+        return await captcha.solution(for: challenge)
+    }
+
+    func invalidateAccountSession() {
+        accountSessionGeneration &+= 1
+        resetMessageSearches()
+        captcha.cancel()
+        serverInvites.reset()
+        friends.reset()
+        lastDirectMessageSelection = nil
+        ignoredUsers.reset()
+        serverTagCards.reset()
+        messageInteractionData.reset()
+        issueReports.reset()
+        nicknameEditor.reset()
+        groupDirectMessageEditor.reset()
+        groupDirectMessageLeave.reset()
+        threadActions.reset()
+        onboarding.reset()
+    }
+
+    func installAccountSession(
+        provider: any ChatProvider,
+        database: SakuraCordDatabase?
+    ) {
+        self.provider = provider
+        self.database = database
+        installedAccountSessionRevision &+= 1
+    }
+
+    @discardableResult
+    func startAccountChildTask(
+        account: AppModelAccountSession,
+        operation: @escaping @MainActor (
+            _ model: AppModel,
+            _ account: AppModelAccountSession
+        ) async -> Void
+    ) -> Task<Void, Never> {
+        let id = UUID()
+        let task = Task { @MainActor [weak self] in
+            defer { self?.accountChildTasks[id] = nil }
+            guard let self,
+                  !Task.isCancelled,
+                  isCurrentAccountSession(account)
+            else { return }
+            await operation(self, account)
+        }
+        accountChildTasks[id] = task
+        return task
+    }
+
+    func cancelAccountChildTasks() {
+        for task in accountChildTasks.values {
+            task.cancel()
+        }
+    }
+
+    func drainAccountChildTasks() async {
+        let tasks = Array(accountChildTasks.values)
+        for task in tasks {
+            task.cancel()
+        }
+        for task in tasks {
+            await task.value
+        }
+        accountChildTasks.removeAll(keepingCapacity: false)
+    }
+
+    func currentVoiceOperationIdentity() -> AppModelVoiceOperationIdentity {
+        AppModelVoiceOperationIdentity(
+            generation: voiceMigrationGeneration,
+            channelID: activeVoiceChannel?.id,
+            session: voiceSession
+        )
+    }
+
+    func isCurrentVoiceOperation(
+        _ account: AppModelAccountSession,
+        identity: AppModelVoiceOperationIdentity
+    ) -> Bool {
+        guard isCurrentAccountSession(account),
+              voiceMigrationGeneration == identity.generation,
+              activeVoiceChannel?.id == identity.channelID
+        else { return false }
+        if let expectedSession = identity.session {
+            return voiceSession === expectedSession
+        }
+        return voiceSession == nil
+    }
+
+    func observePrivateCall(
+        in channel: Channel,
+        account: AppModelAccountSession
+    ) async {
+        guard channel.kind == .directMessage || channel.kind == .groupDirectMessage else {
+            return
+        }
+        guard !Task.isCancelled, isCurrentAccountSession(account) else { return }
+        do {
+            try await account.provider.subscribeToPrivateCall(channelID: channel.id)
+            guard !Task.isCancelled, isCurrentAccountSession(account) else { return }
+        } catch {
+            // Observation is opportunistic while the Gateway is reconnecting.
+            // Connection-ready reconciliation will subscribe again.
+        }
+    }
+
+    func resetAppSounds() {
+        resetPrivateCallActions()
+        for task in outgoingPrivateCallRingTimeoutTasks.values {
+            task.cancel()
+        }
+        outgoingPrivateCallRingTimeoutTasks = [:]
+        locallyStartedOutgoingPrivateCallRings = []
+        soundPlayer.stopAll()
+    }
+}
+
+struct PreparedCreatedMessage: Sendable {
+    let message: Message
+    let textPlan: NativeTimelineTextPlan?
+}
+
+nonisolated enum OptimisticAttachmentPresentation {
+    static func attachment(
+        for url: URL,
+        index: Int,
+        id: String? = nil
+    ) -> Attachment {
+        let source = CGImageSourceCreateWithURL(url as CFURL, nil)
+        let properties = source.flatMap {
+            CGImageSourceCopyPropertiesAtIndex($0, 0, nil) as? [CFString: Any]
+        }
+        let width = (properties?[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue
+        let height = (properties?[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue
+        let orientation = (properties?[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+        let swapsDimensions = (5 ... 8).contains(orientation)
+        // ImageIO can't read a video; its size was read as it was staged.
+        let videoSize = LocalVideo.isVideo(url) ? LocalVideo.preparedSize(of: url) : nil
+        let resourceValues = try? url.resourceValues(forKeys: [.fileSizeKey])
+        var attachment = Attachment(
+            id: id ?? "pending-\(index)",
+            filename: url.lastPathComponent,
+            url: url,
+            mediaType: UTType(filenameExtension: url.pathExtension)?.preferredMIMEType,
+            width: (swapsDimensions ? height : width) ?? videoSize.map { Int($0.width) },
+            height: (swapsDimensions ? width : height) ?? videoSize.map { Int($0.height) },
+            size: resourceValues?.fileSize ?? 0
+        )
+        if LocalVideo.isVideo(url) { attachment.localPreviewURL = url }
+        return attachment
+    }
+}
+
+nonisolated enum ComposerSubmissionResult: Sendable {
+    case rejected
+    /// The message is in the outbox; `delivery` settles with server confirmation.
+    case enqueued(delivery: Task<Bool, Never>)
+
+    func serverConfirmation() async -> Bool {
+        guard case let .enqueued(delivery) = self else { return false }
+        return await delivery.value
+    }
+
+    var consumedComposer: Bool {
+        if case .enqueued = self { return true }
+        return false
+    }
+}
+
+nonisolated enum MessageComposerDestination: Hashable, Sendable {
+    case channel
+    case thread
+}
+
+/// A reference type so editing the name does not invalidate every view that
+/// only observes whether a thread is being created.
+@Observable
+final class ThreadCreationDraft {
+    static let maximumNameLength = ThreadNamePolicy.maximumLength
+
+    let identity = UUID()
+    let parentID: ChannelID
+    /// Resolved when the pane opens; submission rechecks the live permissions.
+    let permissions: ThreadCreationPermissions
+    /// Discord's name field replaces newlines with spaces while typing.
+    var name = "" {
+        didSet {
+            let normalized = String(name.replacing(/\R/, with: " ").prefix(Self.maximumNameLength))
+            // The observable setter re-enters didSet, so only reassign a changed value.
+            if normalized != name { name = normalized }
+        }
+    }
+    /// Without public-thread permission, every created thread is private.
+    var isPrivate: Bool
+    /// Required-field errors appear after an invalid submission, never while a valid draft is consumed.
+    var showsValidationErrors = false
+    var isSubmitting = false
+    /// Discord's reason when creating the thread failed; the draft stays.
+    var submissionError: String?
+    /// The parent-channel message a thread started from it takes its ID from.
+    /// Such a thread is public and its name is optional.
+    let starterMessage: Message?
+    /// Created from the Threads browser rather than the composer.
+    let isFromThreadBrowser: Bool
+    /// The first-party default name used when the optional name is blank.
+    let defaultName: String
+
+    var trimmedName: String { name.trimmingCharacters(in: .whitespaces) }
+
+    /// The name to create the thread with, or nil when one is required.
+    var nameToCreate: String? {
+        if !trimmedName.isEmpty { return trimmedName }
+        return starterMessage == nil ? nil : defaultName
+    }
+
+    init(parentID: ChannelID, permissions: ThreadCreationPermissions, isFromThreadBrowser: Bool = false) {
+        self.parentID = parentID
+        self.permissions = permissions
+        self.isFromThreadBrowser = isFromThreadBrowser
+        isPrivate = !permissions.canCreatePublic
+        starterMessage = nil
+        defaultName = ""
+    }
+
+    init(startingFrom message: Message, defaultName: String) {
+        parentID = message.channelID
+        permissions = ThreadCreationPermissions(canCreatePublic: true, canCreatePrivate: false)
+        isPrivate = false
+        starterMessage = message
+        isFromThreadBrowser = false
+        self.defaultName = defaultName
+    }
+}
+
+nonisolated enum MessageReplyNavigationDirection: Equatable, Sendable {
+    case older
+    case newer
+}
+
+nonisolated struct ComponentControlKey: Hashable, Sendable {
+    let messageID: MessageID
+    let customID: String
+}
+
+/// Asks the timeline to scroll to the keyboard-selected reply.
+nonisolated struct ReplyRevealRequest: Equatable, Sendable {
+    let requestID: UInt64
+    let destination: MessageComposerDestination
+}
+
+nonisolated struct MessageNavigationRequest: Equatable, Sendable {
+    let requestID: UInt64
+    let channelID: ChannelID
+    let messageID: MessageID
+    /// The message was already on hand in the open conversation, so the
+    /// timeline can glide to it rather than cut.
+    var glides = false
+    var isUnreadBoundary = false
+}
+
+nonisolated struct ConversationNewestRequest: Equatable, Sendable {
+    let requestID: UInt64
+    let channelID: ChannelID
+}
+
+struct ProfilePresentationState: Identifiable {
+    var id: UUID { requestID }
+    let requestID: UUID
+    let guildID: GuildID?
+    var member: Member
+    let isCurrentUser: Bool
+    var profile: UserProfile?
+    var isLoading: Bool
+    var errorMessage: String?
+    var isWebhook = false
+    var isClyde = false
+    var isLocalIdentity: Bool { isWebhook || isClyde }
+    var sourceMessageID: MessageID?
+}
+
+struct ProfileCacheKey: Hashable {
+    let userID: UserID
+    let guildID: GuildID?
+}
+
+struct CurrentUserProfilePrefetch {
+    let key: ProfileCacheKey
+    let task: Task<Void, Never>
+}
+
+enum ProfilePresentationDestination {
+    case inspector
+    case contextual
+    case expanded
+}
+
+nonisolated enum UnreadPresentationPublicationPolicy {
+    static func shouldPublish(
+        snapshot: BootstrapSnapshot,
+        channels: [Channel],
+        guilds: [Guild]
+    ) -> Bool {
+        snapshot.channels != channels || snapshot.guilds != guilds
+    }
+}
+
+nonisolated struct ForumPostPresentation: Sendable {
+    var posts: [ForumPost]
+    var recentCount: Int
+
+    static func make(
+        catalogue: [ForumPost],
+        searchText: String,
+        selectedTagIDs: Set<ForumTagID>,
+        tagMatch: ForumTagMatch,
+        sortOrder: ForumSortOrder
+    ) -> Self {
+        let search = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var recent: [ForumPost] = []
+        var older: [ForumPost] = []
+        recent.reserveCapacity(catalogue.count)
+        older.reserveCapacity(min(catalogue.count, 64))
+
+        for post in catalogue {
+            guard matches(
+                post,
+                search: search,
+                selectedTagIDs: selectedTagIDs,
+                tagMatch: tagMatch
+            ) else { continue }
+            if post.thread.isArchived {
+                older.append(post)
+            } else {
+                recent.append(post)
+            }
+        }
+
+        recent.sort { areInDisplayOrder($0, $1, sortOrder: sortOrder) }
+        older.sort { areInDisplayOrder($0, $1, sortOrder: sortOrder) }
+        let recentCount = recent.count
+        recent.append(contentsOf: older)
+        return Self(posts: recent, recentCount: recentCount)
+    }
+
+    func updating(
+        _ post: ForumPost,
+        searchText: String,
+        selectedTagIDs: Set<ForumTagID>,
+        tagMatch: ForumTagMatch,
+        sortOrder: ForumSortOrder
+    ) -> Self {
+        var result = self
+        if let oldIndex = result.posts.firstIndex(where: { $0.id == post.id }) {
+            result.posts.remove(at: oldIndex)
+            if oldIndex < result.recentCount { result.recentCount -= 1 }
+        }
+
+        let search = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.matches(
+            post,
+            search: search,
+            selectedTagIDs: selectedTagIDs,
+            tagMatch: tagMatch
+        ) else { return result }
+
+        let range = post.thread.isArchived
+            ? result.recentCount ..< result.posts.endIndex
+            : result.posts.startIndex ..< result.recentCount
+        let insertionIndex = Self.insertionIndex(
+            of: post,
+            in: result.posts,
+            range: range,
+            sortOrder: sortOrder
+        )
+        result.posts.insert(post, at: insertionIndex)
+        if !post.thread.isArchived { result.recentCount += 1 }
+        return result
+    }
+
+    func filtering(
+        searchText: String,
+        selectedTagIDs: Set<ForumTagID>,
+        tagMatch: ForumTagMatch
+    ) -> Self {
+        let search = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var filtered: [ForumPost] = []
+        filtered.reserveCapacity(posts.count)
+        var filteredRecentCount = 0
+        for (index, post) in posts.enumerated() where Self.matches(
+            post,
+            search: search,
+            selectedTagIDs: selectedTagIDs,
+            tagMatch: tagMatch
+        ) {
+            filtered.append(post)
+            if index < recentCount { filteredRecentCount += 1 }
+        }
+        return Self(posts: filtered, recentCount: filteredRecentCount)
+    }
+
+    private static func matches(
+        _ post: ForumPost,
+        search: String,
+        selectedTagIDs: Set<ForumTagID>,
+        tagMatch: ForumTagMatch
+    ) -> Bool {
+        if !selectedTagIDs.isEmpty {
+            guard ForumPostQueryPolicy.matchesTags(
+                post,
+                selectedTagIDs: selectedTagIDs,
+                tagMatch: tagMatch
+            ) else { return false }
+        }
+        return search.isEmpty || post.thread.name.localizedCaseInsensitiveContains(search)
+    }
+
+    private static func areInDisplayOrder(
+        _ lhs: ForumPost,
+        _ rhs: ForumPost,
+        sortOrder: ForumSortOrder
+    ) -> Bool {
+        ForumPostQueryPolicy.areInDisplayOrder(lhs, rhs, sortOrder: sortOrder)
+    }
+
+    private static func insertionIndex(
+        of post: ForumPost,
+        in posts: [ForumPost],
+        range: Range<Int>,
+        sortOrder: ForumSortOrder
+    ) -> Int {
+        var lower = range.lowerBound
+        var upper = range.upperBound
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if areInDisplayOrder(post, posts[middle], sortOrder: sortOrder) {
+                upper = middle
+            } else {
+                lower = middle + 1
+            }
+        }
+        return lower
+    }
+}
+
+actor ReactionReactorLoadLimiter {
+    private struct Waiter {
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    let maximumConcurrentLoads: Int
+    private var activeLoadCount = 0
+    private var waiters: [Waiter] = []
+
+    init(maximumConcurrentLoads: Int) {
+        self.maximumConcurrentLoads = max(1, maximumConcurrentLoads)
+    }
+
+    func withPermit<Value: Sendable>(
+        _ operation: @Sendable () async throws -> Value
+    ) async throws -> Value {
+        try await acquire()
+        defer { release() }
+        try Task.checkCancellation()
+        return try await operation()
+    }
+
+    private func acquire() async throws {
+        try Task.checkCancellation()
+        if activeLoadCount < maximumConcurrentLoads {
+            activeLoadCount += 1
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            waiters.append(Waiter(continuation: continuation))
+        }
+    }
+
+    private func release() {
+        if !waiters.isEmpty {
+            let waiter = waiters.removeFirst()
+            waiter.continuation.resume()
+        } else {
+            activeLoadCount = max(0, activeLoadCount - 1)
+        }
+    }
+}
+
+nonisolated struct PreparedDiscordCustomEmojiCatalog: Sendable {
+    var orderedEmojis: [DiscordEmoji]?
+    var imageURLsByID: CustomEmojiImageURLs?
+}
+
+nonisolated enum DiscordCustomEmojiCatalog {
+    static func ordered(
+        emojisByGuild: [GuildID: [DiscordEmoji]],
+        guildOrder: [GuildID]
+    ) -> [DiscordEmoji] {
+        var seenGuilds = Set<GuildID>()
+        let orderedGuilds = guildOrder.filter { seenGuilds.insert($0).inserted }
+        let remainingGuilds = emojisByGuild.keys
+            .filter { seenGuilds.insert($0).inserted }
+            .sorted { $0.rawValue > $1.rawValue }
+        return (orderedGuilds + remainingGuilds).flatMap { emojisByGuild[$0] ?? [] }
+    }
+
+    static func imageURLsByID(from emojis: [DiscordEmoji]) -> CustomEmojiImageURLs {
+        var result = CustomEmojiImageURLs(minimumCapacity: emojis.count)
+        for emoji in emojis { result.insert(emoji) }
+        return result
+    }
+
+    static func prepare(
+        emojisByGuild: [GuildID: [DiscordEmoji]],
+        guildOrder: [GuildID],
+        previousOrderedEmojis: [DiscordEmoji],
+        previousImageURLsByID: CustomEmojiImageURLs,
+        cancellationCheck: @Sendable () -> Bool = { Task.isCancelled }
+    ) -> PreparedDiscordCustomEmojiCatalog? {
+        guard !cancellationCheck() else { return nil }
+        guard let orderedEmojis = orderedCooperatively(
+            emojisByGuild: emojisByGuild,
+            guildOrder: guildOrder,
+            cancellationCheck: cancellationCheck
+        ) else { return nil }
+        guard let imageURLs = imageURLsByIDCooperatively(
+            from: orderedEmojis,
+            cancellationCheck: cancellationCheck
+        ) else { return nil }
+        guard let orderedChanged = differsCooperatively(
+            previousOrderedEmojis,
+            orderedEmojis,
+            cancellationCheck: cancellationCheck
+        ) else { return nil }
+        guard let imageURLsChanged = differsCooperatively(
+            previousImageURLsByID,
+            imageURLs,
+            cancellationCheck: cancellationCheck
+        ) else { return nil }
+        return PreparedDiscordCustomEmojiCatalog(
+            orderedEmojis: orderedChanged ? orderedEmojis : nil,
+            imageURLsByID: imageURLsChanged ? imageURLs : nil
+        )
+    }
+
+    private static func orderedCooperatively(
+        emojisByGuild: [GuildID: [DiscordEmoji]],
+        guildOrder: [GuildID],
+        cancellationCheck: @Sendable () -> Bool
+    ) -> [DiscordEmoji]? {
+        var seenGuilds = Set<GuildID>()
+        var orderedGuilds: [GuildID] = []
+        orderedGuilds.reserveCapacity(emojisByGuild.count)
+        for (index, guildID) in guildOrder.enumerated() {
+            if index.isMultiple(of: 64), cancellationCheck() { return nil }
+            if seenGuilds.insert(guildID).inserted {
+                orderedGuilds.append(guildID)
+            }
+        }
+        let remainingGuilds = emojisByGuild.keys
+            .filter { seenGuilds.insert($0).inserted }
+            .sorted { $0.rawValue > $1.rawValue }
+        orderedGuilds.append(contentsOf: remainingGuilds)
+        var result: [DiscordEmoji] = []
+        for (index, guildID) in orderedGuilds.enumerated() {
+            if index.isMultiple(of: 16), cancellationCheck() { return nil }
+            result.append(contentsOf: emojisByGuild[guildID] ?? [])
+        }
+        return cancellationCheck() ? nil : result
+    }
+
+    private static func imageURLsByIDCooperatively(
+        from emojis: [DiscordEmoji],
+        cancellationCheck: @Sendable () -> Bool
+    ) -> CustomEmojiImageURLs? {
+        var result = CustomEmojiImageURLs(minimumCapacity: emojis.count)
+        for (index, emoji) in emojis.enumerated() {
+            if index.isMultiple(of: 128), cancellationCheck() { return nil }
+            result.insert(emoji)
+        }
+        return cancellationCheck() ? nil : result
+    }
+
+    private static func differsCooperatively(
+        _ lhs: [DiscordEmoji],
+        _ rhs: [DiscordEmoji],
+        cancellationCheck: @Sendable () -> Bool
+    ) -> Bool? {
+        guard lhs.count == rhs.count else { return true }
+        for index in lhs.indices {
+            if index.isMultiple(of: 128), cancellationCheck() { return nil }
+            if lhs[index] != rhs[index] { return true }
+        }
+        return cancellationCheck() ? nil : false
+    }
+
+    private static func differsCooperatively(
+        _ lhs: CustomEmojiImageURLs,
+        _ rhs: CustomEmojiImageURLs,
+        cancellationCheck: @Sendable () -> Bool
+    ) -> Bool? {
+        rhs.differs(from: lhs, cancellationCheck: cancellationCheck)
+    }
+}
+
+nonisolated enum DiscordEmojiUseCase: Equatable, Sendable {
+    case message
+    case reaction(guildID: GuildID?)
+    case profile
+    case customStatus
+}
+
+nonisolated enum DiscordEmojiPermissionPolicy {
+    static func hasNitro(premiumType: Int) -> Bool {
+        premiumType > 0
+    }
+
+    static func composerText(
+        for emoji: DiscordEmoji,
+        currentGuildID: GuildID?,
+        premiumType: Int,
+        fakeNitroEnabled: Bool = true
+    ) -> String {
+        let requiresNitro = emoji.isAnimated || emoji.guildID != currentGuildID
+        return !hasNitro(premiumType: premiumType) && requiresNitro
+            ? (fakeNitroEnabled ? emoji.linkedImageMarkdown : ":\(emoji.name):")
+            : emoji.messageToken
+    }
+
+    static func canShow(_ emoji: DiscordEmoji, for useCase: DiscordEmojiUseCase, premiumType: Int)
+        -> Bool
+    {
+        switch useCase {
+        case .message, .profile, .customStatus:
+            true
+        case .reaction(let guildID):
+            hasNitro(premiumType: premiumType)
+                || (!emoji.isAnimated && emoji.guildID == guildID)
+        }
+    }
+
+    static func canShowGuild(
+        _ guildID: GuildID,
+        for useCase: DiscordEmojiUseCase,
+        premiumType: Int
+    ) -> Bool {
+        switch useCase {
+        case .message, .profile, .customStatus:
+            true
+        case .reaction(let currentGuildID):
+            hasNitro(premiumType: premiumType) || guildID == currentGuildID
+        }
+    }
+
+    static func isPremiumLocked(_ emoji: DiscordEmoji, for useCase: DiscordEmojiUseCase, premiumType: Int) -> Bool {
+        guard !hasNitro(premiumType: premiumType) else { return false }
+        switch useCase {
+        case .customStatus: return true
+        case .profile: return !emoji.isManaged || emoji.isAnimated
+        case .message, .reaction: return false
+        }
+    }
+
+    static func canToggleReaction(
+        _ rawEmoji: String,
+        existingReactions: [Reaction],
+        currentGuildEmojis: [DiscordEmoji],
+        premiumType: Int
+    ) -> Bool {
+        let reference = EmojiReference(rawToken: rawEmoji)
+        guard let emojiID = reference.id else { return true }
+
+        if existingReactions.contains(where: { $0.emojiReference.id == emojiID }) {
+            // Discord permits joining an existing reaction even when its
+            // custom emoji would not be available in the add-reaction picker.
+            return true
+        }
+        if hasNitro(premiumType: premiumType) {
+            return true
+        }
+        guard !reference.isAnimated else { return false }
+        return currentGuildEmojis.contains {
+            $0.id == emojiID && !$0.isAnimated && $0.isAvailable
+        }
+    }
+}
+
+@MainActor
+struct MessageRowsUpdateHint: Equatable {
+    enum Change: Equatable {
+        case insert(IndexSet)
+        case replace(IndexSet)
+        case remove(removedIndexes: IndexSet, changedIndexes: IndexSet)
+    }
+
+    let revision: UInt64
+    let change: Change
+}
+
+struct MessageRowsUpdateRecord: Equatable {
+    let revision: UInt64
+    let change: MessageRowsUpdateHint.Change?
+    let insertedMessageIDs: [MessageID]
+    let changedMessageIDs: Set<MessageID>
+    let removedMessageIDs: Set<MessageID>
+    let invalidatesAllRows: Bool
+}
+
+@MainActor
+final class MessageRowsUpdateJournal {
+    private var storage: [MessageRowsUpdateRecord] = []
+
+    var latestRevision: UInt64? {
+        storage.last?.revision
+    }
+
+    func append(_ record: MessageRowsUpdateRecord) {
+        storage.append(record)
+        if storage.count > 4_608 {
+            storage.removeFirst(512)
+        }
+    }
+
+    func records(
+        after oldRevision: UInt64,
+        through newRevision: UInt64
+    ) -> ArraySlice<MessageRowsUpdateRecord>? {
+        guard newRevision > oldRevision,
+              let firstRevision = storage.first?.revision,
+              let lastRevision = storage.last?.revision,
+              oldRevision &+ 1 >= firstRevision,
+              newRevision <= lastRevision
+        else {
+            return nil
+        }
+
+        let lowerBound = Int(oldRevision &+ 1 - firstRevision)
+        let upperBound = Int(newRevision - firstRevision) + 1
+        guard storage.indices.contains(lowerBound),
+              upperBound <= storage.endIndex
+        else {
+            return nil
+        }
+        return storage[lowerBound ..< upperBound]
+    }
+}
+
+enum MessageRowsUpdateRecordBuilder {
+    static func make(
+        oldRows: [MessageRowPresentation],
+        newRows: [MessageRowPresentation],
+        revision: UInt64
+    ) -> MessageRowsUpdateRecord {
+        let oldIdentities = oldRows.map(\.identity)
+        let newIdentities = newRows.map(\.identity)
+        let oldRowsByIdentity = Dictionary(
+            uniqueKeysWithValues: oldRows.map { ($0.identity, $0) }
+        )
+        let changedMessageIDs = Set<MessageID>(
+            newRows.lazy.compactMap { row in
+                guard let oldRow = oldRowsByIdentity[row.identity],
+                      oldRow != row
+                else { return nil }
+                return row.id
+            }
+        )
+
+        if oldIdentities == newIdentities {
+            return MessageRowsUpdateRecord(
+                revision: revision,
+                change: .replace(
+                    IndexSet(
+                        newRows.indices.filter {
+                            oldRows[$0] != newRows[$0]
+                        }
+                    )
+                ),
+                insertedMessageIDs: [],
+                changedMessageIDs: changedMessageIDs,
+                removedMessageIDs: [],
+                invalidatesAllRows: false
+            )
+        }
+
+        if let insertedIndexes = insertedIndexes(
+            preserving: oldIdentities,
+            in: newIdentities
+        ) {
+            return MessageRowsUpdateRecord(
+                revision: revision,
+                change: .insert(insertedIndexes),
+                insertedMessageIDs: insertedIndexes.map { newRows[$0].id },
+                changedMessageIDs: changedMessageIDs,
+                removedMessageIDs: [],
+                invalidatesAllRows: false
+            )
+        }
+
+        if let removedIndexes = removedIndexes(
+            preserving: newIdentities,
+            in: oldIdentities
+        ) {
+            let changedIndexes = IndexSet(
+                newRows.indices.filter {
+                    changedMessageIDs.contains(newRows[$0].id)
+                }
+            )
+            return MessageRowsUpdateRecord(
+                revision: revision,
+                change: .remove(
+                    removedIndexes: removedIndexes,
+                    changedIndexes: changedIndexes
+                ),
+                insertedMessageIDs: [],
+                changedMessageIDs: changedMessageIDs,
+                removedMessageIDs: Set(
+                    removedIndexes.map { oldRows[$0].id }
+                ),
+                invalidatesAllRows: false
+            )
+        }
+
+        return MessageRowsUpdateRecord(
+            revision: revision,
+            change: nil,
+            insertedMessageIDs: [],
+            changedMessageIDs: changedMessageIDs,
+            removedMessageIDs: [],
+            invalidatesAllRows: true
+        )
+    }
+
+    private static func insertedIndexes<Element: Equatable>(
+        preserving oldIDs: [Element],
+        in newIDs: [Element]
+    ) -> IndexSet? {
+        guard newIDs.count >= oldIDs.count else { return nil }
+        var oldIndex = oldIDs.startIndex
+        var inserted = IndexSet()
+        for newIndex in newIDs.indices {
+            if oldIndex < oldIDs.endIndex,
+               newIDs[newIndex] == oldIDs[oldIndex]
+            {
+                oldIndex += 1
+            } else {
+                inserted.insert(newIndex)
+            }
+        }
+        return oldIndex == oldIDs.endIndex ? inserted : nil
+    }
+
+    private static func removedIndexes<Element: Equatable>(
+        preserving newIDs: [Element],
+        in oldIDs: [Element]
+    ) -> IndexSet? {
+        guard oldIDs.count >= newIDs.count else { return nil }
+        var newIndex = newIDs.startIndex
+        var removed = IndexSet()
+        for oldIndex in oldIDs.indices {
+            if newIndex < newIDs.endIndex,
+               oldIDs[oldIndex] == newIDs[newIndex]
+            {
+                newIndex += 1
+            } else {
+                removed.insert(oldIndex)
+            }
+        }
+        return newIndex == newIDs.endIndex ? removed : nil
+    }
+}
+
+nonisolated enum LocalHistoryMemberResolution {
+    static let maximumUserCount = 100
+
+    static func userIDs(in messages: [Message], known: Set<UserID>) -> [UserID] {
+        var seen = known
+        var result: [UserID] = []
+
+        func append(_ userID: UserID) {
+            guard result.count < maximumUserCount, seen.insert(userID).inserted else { return }
+            result.append(userID)
+        }
+
+        // Prefer the newest visible authors when a long local cache contains
+        // more unique people than one bounded Gateway member request permits.
+        for message in messages.reversed() {
+            append(message.author.id)
+            if let replyAuthorID = message.replyPreview?.author.id {
+                append(replyAuthorID)
+            }
+        }
+        for message in messages.reversed() {
+            for user in message.mentionedUsers {
+                append(user.id)
+            }
+        }
+        return result
+    }
+
+    static func hydrating(
+        _ messages: [Message],
+        with membersByID: [UserID: Member]
+    ) -> [Message] {
+        messages.map { original in
+            var message = original
+            if let member = membersByID[message.author.id] {
+                message.guildMember = MessageGuildMember.merging(
+                    incoming: MessageGuildMember(member: member),
+                    existing: message.guildMember
+                )
+            }
+            if var preview = message.replyPreview,
+               let member = membersByID[preview.author.id]
+            {
+                preview.guildMember = MessageGuildMember.merging(
+                    incoming: MessageGuildMember(member: member),
+                    existing: preview.guildMember
+                )
+                message.replyPreview = preview
+            }
+            return message
+        }
+    }
+
+}
+
+nonisolated enum ChannelMessageCachePolicy {
+    static let maximumChannelCount = 8
+    static let maximumPreparedChannelCount = 3
+    static let maximumMessageCountPerChannel = 250
+
+    static func retainedMessages(from messages: [Message]) -> [Message] {
+        guard messages.count > maximumMessageCountPerChannel else {
+            return messages
+        }
+        return Array(messages.suffix(maximumMessageCountPerChannel))
+    }
+}
+
+/// Reduces a live guild-member update to the fields that can actually change
+/// pixels or geometry in a message row. Presence, activity, list grouping,
+/// and other inspector-only churn must not invalidate the timeline.
+nonisolated enum TimelineMemberPresentationImpact {
+    struct Signature: Equatable {
+        let user: User
+        let guildAvatarURL: URL?
+        let roleColorHex: UInt32?
+    }
+
+    static func changedUserIDs(
+        from oldMembers: [UserID: Member],
+        to newMembers: [UserID: Member],
+        guildRoles: [GuildRole],
+        candidates: Set<UserID>? = nil
+    ) -> Set<UserID> {
+        let comparedUserIDs = candidates
+            ?? Set(oldMembers.keys).union(newMembers.keys)
+        return Set(comparedUserIDs.filter { userID in
+            signature(for: oldMembers[userID], guildRoles: guildRoles)
+                != signature(for: newMembers[userID], guildRoles: guildRoles)
+        })
+    }
+
+    static func referencedUserIDs(in messages: [Message]) -> Set<UserID> {
+        var userIDs: Set<UserID> = []
+        userIDs.reserveCapacity(messages.count)
+        for message in messages {
+            userIDs.insert(message.author.id)
+            if let replyAuthorID = message.replyPreview?.author.id {
+                userIDs.insert(replyAuthorID)
+            }
+            userIDs.formUnion(message.mentionedUsers.lazy.map(\.id))
+        }
+        return userIDs
+    }
+
+    static func affectedMessageIDs(
+        in messages: [Message],
+        changedUserIDs: Set<UserID>
+    ) -> Set<MessageID> {
+        guard !changedUserIDs.isEmpty else { return [] }
+        return Set(messages.lazy.compactMap { message in
+            guard changedUserIDs.contains(message.author.id)
+                    || message.replyPreview.map({
+                        changedUserIDs.contains($0.author.id)
+                    }) == true
+                    || message.mentionedUsers.contains(where: {
+                        changedUserIDs.contains($0.id)
+                    })
+            else { return nil }
+            return message.id
+        })
+    }
+
+    private static func signature(
+        for member: Member?,
+        guildRoles: [GuildRole]
+    ) -> Signature? {
+        guard let member else { return nil }
+        let roleIDs = Set(member.roleIDs)
+        return Signature(
+            user: member.user,
+            guildAvatarURL: member.guildAvatarURL,
+            roleColorHex:
+                MessageAuthorPresentation.topRoleColor(in: member.roles)
+                    ?? MessageAuthorPresentation.topRoleColor(
+                        in: guildRoles.filter { roleIDs.contains($0.id) }
+                    )
+        )
+    }
+}
+
+nonisolated struct PreparedMemberListPresentation: Sendable {
+    let guildID: GuildID
+    let roles: [GuildRole]
+    let sections: [MemberSection]
+
+    static func make(
+        guildID: GuildID,
+        members: [Member],
+        groups: [GuildMemberListGroup],
+        roles: [GuildRole]
+    ) -> Self {
+        Self(
+            guildID: guildID,
+            roles: roles,
+            sections: AppPerformanceSignposts.measureSync(
+                "MemberSectionBuild"
+            ) {
+                MemberSection.make(
+                    from: members,
+                    groups: groups,
+                    roles: roles
+                )
+            }
+        )
+    }
+}

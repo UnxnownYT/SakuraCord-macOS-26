@@ -1,0 +1,216 @@
+import Foundation
+import GRDB
+import SakuraCordModels
+@testable import SakuraCordPersistence
+import Testing
+
+@Test func `drafts round trip and clear with scoped draft action`() async throws {
+    let database = try SakuraCordDatabase(inMemory: true)
+    let channelID = ChannelID(rawValue: 12)
+
+    try await database.saveDraft("hello", channelID: channelID)
+    #expect(try await database.draft(channelID: channelID) == "hello")
+
+    try await database.clearDrafts()
+    #expect(try await database.draft(channelID: channelID).isEmpty)
+}
+
+@Test func `draft storage summary counts local drafts and UTF-8 content bytes`() async throws {
+    let database = try SakuraCordDatabase(inMemory: true)
+    try await database.saveDraft("hello", channelID: ChannelID(rawValue: 21))
+    try await database.saveDraft("🌸", channelID: ChannelID(rawValue: 22))
+
+    #expect(
+        try await database.draftStorageSummary()
+            == DraftStorageSummary(draftCount: 2, approximateByteCount: 9)
+    )
+
+    try await database.clearDrafts()
+    #expect(
+        try await database.draftStorageSummary()
+            == DraftStorageSummary(draftCount: 0, approximateByteCount: 0)
+    )
+}
+
+@Test func `created invites stay scoped, newest first, and drop once expired`() async throws {
+    let database = try SakuraCordDatabase(inMemory: true)
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    func invite(_ code: String, guild: UInt64, age: TimeInterval, expiresIn: TimeInterval?) throws -> CreatedServerInvite {
+        CreatedServerInvite(reference: try #require(ServerInviteReference(code)), guildID: .init(rawValue: guild),
+                            channelID: .init(rawValue: guild + 1), createdAt: now.addingTimeInterval(-age),
+                            expiresAt: expiresIn.map { now.addingTimeInterval($0) }, maxAge: 0, maxUses: 0)
+    }
+    try await database.saveCreatedInvite(invite("older", guild: 10, age: 60, expiresIn: nil))
+    try await database.saveCreatedInvite(invite("newer", guild: 10, age: 1, expiresIn: 3600))
+    try await database.saveCreatedInvite(invite("expired", guild: 10, age: 7200, expiresIn: -1))
+    try await database.saveCreatedInvite(invite("elsewhere", guild: 20, age: 1, expiresIn: nil))
+    // Discord can hand back an existing link; saving it again must not duplicate the row.
+    try await database.saveCreatedInvite(invite("older", guild: 10, age: 60, expiresIn: nil))
+
+    #expect(try await database.createdInvites(guildID: .init(rawValue: 10), now: now).map(\.reference.code) == ["newer", "older"])
+    try await database.deleteCreatedInvite(code: "newer")
+    #expect(try await database.createdInvites(guildID: .init(rawValue: 10), now: now).map(\.reference.code) == ["older"])
+    try await database.clearAccountData()
+    #expect(try await database.createdInvites(guildID: .init(rawValue: 20), now: now).isEmpty)
+}
+
+@Test func `legacy Discord caches are dropped while drafts survive migration`() async throws {
+    let directory = FileManager.default.temporaryDirectory.appending(
+        path: "sakuracord-session-cache-migration-\(UUID().uuidString)",
+        directoryHint: .isDirectory
+    )
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let accountID = AccountID(rawValue: 86)
+    let channelID = ChannelID(rawValue: 87)
+    let path = directory.appending(path: "account-\(accountID).sqlite").path
+    try createVersionFiveDatabase(
+        at: path,
+        channelID: channelID,
+        draft: "keep this draft"
+    )
+
+    let upgraded = try SakuraCordDatabase(
+        accountID: accountID,
+        directory: directory
+    )
+    #expect(try await upgraded.draft(channelID: channelID) == "keep this draft")
+
+    let inspectionQueue = try DatabaseQueue(path: path)
+    let tableNames = try await inspectionQueue.read { db in
+        try String.fetchAll(
+            db,
+            sql: """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+            ORDER BY name
+            """
+        )
+    }
+    #expect(tableNames == ["createdInvites", "drafts", "grdb_migrations"])
+}
+
+private func createVersionFiveDatabase(
+    at path: String,
+    channelID: ChannelID,
+    draft: String
+) throws {
+    let queue = try DatabaseQueue(path: path)
+    var migrator = DatabaseMigrator()
+    migrator.registerMigration("v1-core") { db in
+        try db.create(table: "messages") { table in
+            table.primaryKey("id", .text)
+            table.column("channelID", .text).notNull().indexed()
+            table.column("timestamp", .datetime).notNull().indexed()
+            table.column("payload", .blob).notNull()
+        }
+        try db.create(table: "drafts") { table in
+            table.primaryKey("channelID", .text)
+            table.column("content", .text).notNull()
+            table.column("updatedAt", .datetime).notNull()
+        }
+        try db.create(table: "gatewaySession") { table in
+            table.primaryKey("accountID", .text)
+            table.column("sessionID", .text)
+            table.column("resumeURL", .text)
+            table.column("sequence", .integer)
+        }
+    }
+    migrator.registerMigration("v2-message-timeline-index") { db in
+        try db.create(
+            index: "messages_channel_timestamp",
+            on: "messages",
+            columns: ["channelID", "timestamp"]
+        )
+    }
+    migrator.registerMigration("v3-conversation-page-boundary") { db in
+        try db.create(table: "conversationPages") { table in
+            table.primaryKey("channelID", .text)
+            table.column("hasMoreBefore", .boolean).notNull()
+        }
+    }
+    migrator.registerMigration("v4-bootstrap-snapshot") { db in
+        try db.create(table: "bootstrapSnapshots") { table in
+            table.primaryKey("id", .integer)
+            table.column("payload", .blob).notNull()
+            table.column("updatedAt", .datetime).notNull()
+        }
+    }
+    migrator.registerMigration("v5-account-presentation") { db in
+        try db.create(table: "accountPresentation") { table in
+            table.primaryKey("id", .integer)
+            table.column("selectedChannelID", .text).notNull()
+        }
+    }
+    try migrator.migrate(queue)
+    try queue.write { db in
+        try db.execute(
+            sql: """
+            INSERT INTO drafts (channelID, content, updatedAt)
+            VALUES (?, ?, ?)
+            """,
+            arguments: [channelID.description, draft, Date.now]
+        )
+        try db.execute(
+            sql: """
+            INSERT INTO messages (id, channelID, timestamp, payload)
+            VALUES ('1', ?, ?, X'00')
+            """,
+            arguments: [channelID.description, Date.now]
+        )
+        try db.execute(
+            sql: """
+            INSERT INTO conversationPages (channelID, hasMoreBefore)
+            VALUES (?, 0)
+            """,
+            arguments: [channelID.description]
+        )
+        try db.execute(
+            sql: """
+            INSERT INTO bootstrapSnapshots (id, payload, updatedAt)
+            VALUES (1, X'00', ?)
+            """,
+            arguments: [Date.now]
+        )
+        try db.execute(
+            sql: """
+            INSERT INTO accountPresentation (id, selectedChannelID)
+            VALUES (1, ?)
+            """,
+            arguments: [channelID.description]
+        )
+        try db.execute(
+            sql: """
+            INSERT INTO gatewaySession (accountID, sessionID, resumeURL, sequence)
+            VALUES ('legacy', 'session', 'wss://gateway.example', 1)
+            """
+        )
+    }
+}
+
+@Test func `legacy onboarding choices are dropped without removing message drafts`() async throws {
+    let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let accountID = AccountID(rawValue: 1)
+    let channelID = ChannelID(rawValue: 12)
+    let database = try SakuraCordDatabase(accountID: accountID, directory: directory)
+    try await database.saveDraft("keep this message", channelID: channelID)
+
+    // Recreate the previous schema with an unfinished onboarding draft.
+    let queue = try DatabaseQueue(path: directory.appending(path: "account-\(accountID).sqlite").path)
+    try await queue.write { db in
+        try db.execute(sql: "DELETE FROM grdb_migrations WHERE identifier = 'v11-session-only-onboarding'")
+        try db.execute(sql: "CREATE TABLE onboardingDrafts (guildID TEXT PRIMARY KEY NOT NULL, payload BLOB NOT NULL)")
+        try db.execute(sql: "INSERT INTO onboardingDrafts VALUES ('100', X'00')")
+    }
+
+    let upgraded = try SakuraCordDatabase(accountID: accountID, directory: directory)
+    #expect(try await upgraded.draft(channelID: channelID) == "keep this message")
+    #expect(try await upgraded.draftStorageSummary().draftCount == 1)
+    #expect(try await queue.read { db in try !db.tableExists("onboardingDrafts") })
+}

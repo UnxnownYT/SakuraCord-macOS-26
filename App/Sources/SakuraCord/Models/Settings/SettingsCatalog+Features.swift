@@ -1,0 +1,94 @@
+import Foundation
+
+nonisolated extension SettingsCatalog {
+    static let featuresPage = page(
+        .features, group: .preferences, title: "Features", image: "square.stack.3d.up.fill",
+        help: "Manage hidden channels, FakeNitro, voice messages, attachments, and on-device translation.",
+        keywords: [
+            "channels", "hidden", "FakeNitro", "emoji", "stickers", "soundboard", "stream", "voice messages", "uploads", "translation",
+            "language",
+        ]
+    )
+
+    static let featuresControls: [SettingsControlMetadata] = [
+        control(
+            .readAllButton, page: .features, section: .featuresNotifications,
+            label: "Read All button", help: "Show a button above the server list to mark all server channels as read after confirmation.",
+            keywords: ["unread", "notifications", "mark read", "servers"], scope: .appWideLocal
+        ),
+        control(
+            .translationEnabled, page: .features, section: .featuresTranslation,
+            label: "Enable on-device translation", help: "Translate messages and drafts with Apple Translation after an explicit action.",
+            keywords: ["translation", "language", "Apple", "offline"], scope: .appWideLocal
+        ),
+        control(
+            .translationMessageLanguage, page: .features, section: .featuresTranslation,
+            label: "Translate messages into", help: "Choose a supported target language for messages.",
+            keywords: ["translation", "language"], scope: .appWideLocal
+        ),
+        control(
+            .translationDraftLanguage, page: .features, section: .featuresTranslation,
+            label: "Translate drafts into", help: "Choose a supported target language for editable drafts.",
+            keywords: ["translation", "language", "composer"], scope: .appWideLocal
+        ),
+        control(
+            .channelManagement, page: .features, section: .featuresChannels,
+            label: "Channel customization", help: "Use each server’s channel selections. Turn off to show all channels and hide channel customization controls without changing server selections.",
+            keywords: ["onboarding", "channels", "roles", "default channels"], scope: .appWideLocal
+        ),
+        control(
+            .showHiddenChannels, page: .features, section: .featuresChannels,
+            label: "Show hidden channels", help: "Show channels you cannot access, including their available metadata.",
+            keywords: ["features", "hidden channels"], scope: .appWideLocal
+        ),
+        control(
+            .fakeNitroEmojis, page: .features, section: .featuresFakeNitro,
+            label: "FakeNitro emojis", help: "Send unavailable custom emojis as image links.",
+            keywords: ["features", "FakeNitro"], scope: .appWideLocal
+        ),
+        control(
+            .fakeNitroStickers, page: .features, section: .featuresFakeNitro,
+            label: "FakeNitro stickers", help: "Send stickers from other servers as image uploads.",
+            keywords: ["features", "FakeNitro"], scope: .appWideLocal
+        ),
+        control(
+            .fakeNitroSoundboard, page: .features, section: .featuresFakeNitro,
+            label: "FakeNitro soundboard", help: "Play sounds from other servers through your outgoing audio.",
+            keywords: ["features", "FakeNitro"], scope: .appWideLocal
+        ),
+        control(
+            .fakeNitroStreamQuality, page: .features, section: .featuresFakeNitro,
+            label: "FakeNitro stream quality", help: "Use higher stream resolutions and frame rates without Nitro.",
+            keywords: ["features", "FakeNitro"], scope: .appWideLocal
+        ),
+        control(
+            .voiceMessageRecording, page: .features, section: .featuresVoiceMessages,
+            label: "Record voice messages",
+            help: "Show the composer’s record button. Voice messages in conversations play either way.",
+            keywords: ["voice message", "record", "microphone", "audio"], scope: .appWideLocal
+        ),
+        control(
+            .attachmentCompactionPrompt, page: .features, section: .featuresAttachments,
+            label: "Compress oversized images and videos",
+            help: "Choose whether to compress oversized images and videos automatically, ask first, or never compress.",
+            keywords: ["attachment", "compression", "compaction", "upload", "file size"], scope: .appWideLocal
+        ),
+        control(
+            .attachmentExternalUploadPrompt, page: .features, section: .featuresAttachments,
+            label: "Upload files that still exceed Discord’s limit",
+            help: "Uploads to a third-party host and adds a link to your draft.",
+            keywords: ["attachment", "compression", "compaction", "upload", "file size"], scope: .appWideLocal
+        ),
+        control(
+            .attachmentExternalProvider, page: .features, section: .featuresAttachments,
+            label: "File host", help: "Choose the third-party host for automatic oversized uploads.",
+            keywords: ["catbox", "litterbox", "upload"], scope: .appWideLocal
+        ),
+        control(
+            .attachmentCompactionQuality, page: .features, section: .featuresAttachments,
+            label: "Compression quality",
+            help: "Choose between higher quality, balanced compression, and smaller files.",
+            keywords: ["attachment", "compression", "compaction", "upload", "file size"], scope: .appWideLocal
+        ),
+    ]
+}

@@ -1,0 +1,1046 @@
+import AppKit
+import AVFoundation
+import Combine
+import CoreText
+import ImageIO
+import Lottie
+import QuartzCore
+import SakuraCordModels
+import SwiftUI
+
+extension NativeTimelineRowPainter {
+    private struct SingleLineTextInput {
+        let sourceLine: CTLine
+        let sourceWidth: CGFloat
+        let frame: CGRect
+        let font: NSFont
+        let color: NSColor
+        let alignment: NSTextAlignment
+        let lineBreakMode: NSLineBreakMode
+        let concealedSpoilerRanges: [NSRange]
+        let context: CGContext
+    }
+
+    static func mediaPlayGlyph(in frame: CGRect) {
+        guard let image = NativeTimelineSystemSymbolCache.configuredImage(
+            named: "play.circle.fill",
+            pointSize: 36,
+            weight: .regular,
+            color: .white
+        ) else { return }
+        let imageSize = image.size
+        let imageFrame = CGRect(
+            x: frame.midX - imageSize.width / 2,
+            y: frame.midY - imageSize.height / 2,
+            width: imageSize.width,
+            height: imageSize.height
+        )
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.55)
+        shadow.shadowBlurRadius = 3
+        shadow.shadowOffset = .zero
+        shadow.set()
+        image.draw(in: imageFrame)
+        NSGraphicsContext.restoreGraphicsState()
+        // A single tint fills the symbol's knocked-out triangle, so it is
+        // drawn again in a contrasting color.
+        guard let triangle = NativeTimelineSystemSymbolCache.configuredImage(
+            named: "play.fill",
+            pointSize: 15,
+            weight: .regular,
+            color: NSColor.black.withAlphaComponent(0.75)
+        ) else { return }
+        triangle.draw(in: CGRect(
+            // The triangle's visual centre sits left of its bounding box.
+            x: frame.midX - triangle.size.width / 2 + InterfaceScale.metric(1.5),
+            y: frame.midY - triangle.size.height / 2,
+            width: triangle.size.width,
+            height: triangle.size.height
+        ))
+    }
+
+    static func text(
+        _ value: String,
+        in frame: CGRect,
+        font: NSFont,
+        color: NSColor,
+        alignment: NSTextAlignment = .left,
+        lineBreakMode: NSLineBreakMode = .byTruncatingTail,
+        isInteractiveHovered: Bool = false,
+        concealedSpoilerRanges: [NSRange] = []
+    ) {
+        guard frame.width > 0, frame.height > 0 else { return }
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        var attributed = coreTextValue(
+            value,
+            font: font,
+            color: color,
+            alignment: alignment,
+            lineBreakMode: lineBreakMode,
+            isInteractiveHovered: isInteractiveHovered
+        )
+        if !concealedSpoilerRanges.isEmpty {
+            let concealed = NSMutableAttributedString(attributedString: attributed as NSAttributedString)
+            for range in concealedSpoilerRanges {
+                NativeTimelineSpoilerAppearance.concealText(in: concealed, range: range)
+            }
+            attributed = concealed as CFAttributedString
+        }
+        let sourceLine = CTLineCreateWithAttributedString(attributed)
+        let sourceWidth = CGFloat(CTLineGetTypographicBounds(sourceLine, nil, nil, nil))
+        let usesSingleLine = !value.contains("\n")
+            && (lineBreakMode != .byWordWrapping || sourceWidth <= frame.width)
+        if usesSingleLine {
+            drawSingleLineText(SingleLineTextInput(
+                sourceLine: sourceLine,
+                sourceWidth: sourceWidth,
+                frame: frame,
+                font: font,
+                color: color,
+                alignment: alignment,
+                lineBreakMode: lineBreakMode,
+                concealedSpoilerRanges: concealedSpoilerRanges,
+                context: context
+            ))
+        } else {
+            drawMultilineText(attributed, in: frame, context: context)
+        }
+    }
+
+    private static func coreTextValue(
+        _ value: String,
+        font: NSFont,
+        color: NSColor,
+        alignment: NSTextAlignment,
+        lineBreakMode: NSLineBreakMode,
+        isInteractiveHovered: Bool
+    ) -> CFAttributedString {
+        var textAlignment: CTTextAlignment = switch alignment {
+        case .center: .center
+        case .right: .right
+        case .justified: .justified
+        case .natural: .natural
+        default: .left
+        }
+        var breakMode: CTLineBreakMode = switch lineBreakMode {
+        case .byCharWrapping: .byCharWrapping
+        case .byClipping: .byClipping
+        case .byTruncatingHead: .byTruncatingHead
+        case .byTruncatingMiddle: .byTruncatingMiddle
+        case .byWordWrapping: .byWordWrapping
+        default: .byTruncatingTail
+        }
+        let paragraph = withUnsafePointer(to: &textAlignment) { alignmentPointer in
+            withUnsafePointer(to: &breakMode) { breakPointer in
+                let settings = [
+                    CTParagraphStyleSetting(
+                        spec: .alignment,
+                        valueSize: MemoryLayout<CTTextAlignment>.size,
+                        value: alignmentPointer
+                    ),
+                    CTParagraphStyleSetting(
+                        spec: .lineBreakMode,
+                        valueSize: MemoryLayout<CTLineBreakMode>.size,
+                        value: breakPointer
+                    ),
+                ]
+                return CTParagraphStyleCreate(settings, settings.count)
+            }
+        }
+        // NSFont and CTFont are toll-free bridged. Recreating the font from
+        // `fontName` turns system fonts into `.SFNS-*` names, which
+        // CoreText explicitly rejects and may substitute with Times New Roman.
+        let coreFont = font as CTFont
+        var attributes: [CFString: Any] = [
+            kCTFontAttributeName: coreFont,
+            kCTForegroundColorAttributeName: color.cgColor,
+            kCTParagraphStyleAttributeName: paragraph,
+        ]
+        if isInteractiveHovered {
+            attributes[kCTUnderlineStyleAttributeName] =
+                NativeTimelineLinkAppearance.hoverUnderlineStyle
+        }
+        return CFAttributedStringCreate(
+            nil,
+            value as CFString,
+            attributes as CFDictionary
+        )!
+    }
+
+    private static func drawSingleLineText(_ input: SingleLineTextInput) {
+        let sourceLine = input.sourceLine
+        let sourceWidth = input.sourceWidth
+        let frame = input.frame
+        let font = input.font
+        let color = input.color
+        let alignment = input.alignment
+        let lineBreakMode = input.lineBreakMode
+        let context = input.context
+        let line = truncatedLine(
+            sourceLine,
+            sourceWidth: sourceWidth,
+            maximumWidth: frame.width,
+            font: font,
+            color: color,
+            lineBreakMode: lineBreakMode
+        )
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        var leading: CGFloat = 0
+        let lineWidth = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
+        let horizontalPosition: CGFloat = switch alignment {
+        case .center: max(0, (frame.width - lineWidth) / 2)
+        case .right: max(0, frame.width - lineWidth)
+        default: 0
+        }
+        let baseline = max(descent, (frame.height - ascent - descent - leading) / 2 + descent)
+        for range in input.concealedSpoilerRanges {
+            let startX = CTLineGetOffsetForStringIndex(sourceLine, range.location, nil)
+            let endX = min(
+                CTLineGetOffsetForStringIndex(sourceLine, NSMaxRange(range), nil),
+                lineWidth
+            )
+            guard endX > startX else { continue }
+            let fragment = CGRect(
+                x: frame.minX + horizontalPosition + startX,
+                y: frame.maxY - baseline - ascent,
+                width: endX - startX,
+                height: ascent + descent
+            )
+            let box = NativeTimelineTextSpoilerGeometry.coverFrame(fragment, clippedTo: frame)
+            guard !box.isNull else { continue }
+            NativeTimelineSpoilerAppearance.hiddenColor.setFill()
+            NSBezierPath(
+                roundedRect: box,
+                xRadius: NativeTimelineSpoilerAppearance.textCornerRadius,
+                yRadius: NativeTimelineSpoilerAppearance.textCornerRadius
+            ).fill()
+        }
+        context.saveGState()
+        context.translateBy(x: frame.minX, y: frame.maxY)
+        context.scaleBy(x: 1, y: -1)
+        context.textMatrix = .identity
+        context.textPosition = CGPoint(x: horizontalPosition, y: baseline)
+        CTLineDraw(line, context)
+        context.restoreGState()
+    }
+
+    private static func truncatedLine(
+        _ sourceLine: CTLine,
+        sourceWidth: CGFloat,
+        maximumWidth: CGFloat,
+        font: NSFont,
+        color: NSColor,
+        lineBreakMode: NSLineBreakMode
+    ) -> CTLine {
+        guard sourceWidth > maximumWidth,
+              lineBreakMode == .byTruncatingHead
+                || lineBreakMode == .byTruncatingMiddle
+                || lineBreakMode == .byTruncatingTail
+        else { return sourceLine }
+        let token = CTLineCreateWithAttributedString(CFAttributedStringCreate(
+            nil,
+            "…" as CFString,
+            [
+                kCTFontAttributeName: font as CTFont,
+                kCTForegroundColorAttributeName: color.cgColor,
+            ] as CFDictionary
+        )!)
+        let truncation: CTLineTruncationType = switch lineBreakMode {
+        case .byTruncatingHead: .start
+        case .byTruncatingMiddle: .middle
+        default: .end
+        }
+        return CTLineCreateTruncatedLine(sourceLine, Double(maximumWidth), truncation, token)
+            ?? sourceLine
+    }
+
+    private static func drawMultilineText(
+        _ attributed: CFAttributedString,
+        in frame: CGRect,
+        context: CGContext
+    ) {
+        let framesetter = CTFramesetterCreateWithAttributedString(attributed)
+        let path = CGPath(
+            rect: CGRect(origin: .zero, size: frame.size),
+            transform: nil
+        )
+        let textFrame = CTFramesetterCreateFrame(
+            framesetter,
+            CFRange(location: 0, length: 0),
+            path,
+            nil
+        )
+        context.saveGState()
+        context.translateBy(x: frame.minX, y: frame.maxY)
+        context.scaleBy(x: 1, y: -1)
+        context.textMatrix = .identity
+        CTFrameDraw(textFrame, context)
+        context.restoreGState()
+    }
+
+    static func attributedText(
+        _ box: NativeTimelineAttributedTextBox,
+        in frame: CGRect,
+        model: AppModel?,
+        selectionRange: NSRange? = nil,
+        hoveredMentionCharacterIndex: Int? = nil,
+        hoveredLinkCharacterIndex: Int? = nil,
+        spoilerHoverProgress: [Int: CGFloat] = [:],
+        revealedSpoilerLocations: Set<Int> = []
+    ) {
+        var drawingFrame = frame
+        drawingFrame.size.height += box.layoutHeightAdjustment
+        attributedText(
+            box.value,
+            framesetter: box.framesetter,
+            in: drawingFrame,
+            model: model,
+            selectionRange: selectionRange,
+            hoveredMentionCharacterIndex:
+                hoveredMentionCharacterIndex,
+            hoveredLinkCharacterIndex:
+                hoveredLinkCharacterIndex,
+            spoilerHoverProgress:
+                spoilerHoverProgress,
+            revealedSpoilerLocations: revealedSpoilerLocations
+        )
+    }
+
+    static func attributedText(
+        _ value: NSAttributedString,
+        in frame: CGRect,
+        model: AppModel?
+    ) {
+        attributedText(
+            value,
+            framesetter: CTFramesetterCreateWithAttributedString(value),
+            in: frame,
+            model: model
+        )
+    }
+
+    static func attributedText(
+        _ value: NSAttributedString,
+        framesetter: CTFramesetter,
+        in frame: CGRect,
+        model: AppModel?,
+        isOutgoingBubble: Bool = false,
+        selectionRange: NSRange? = nil,
+        hoveredMentionCharacterIndex: Int? = nil,
+        hoveredLinkCharacterIndex: Int? = nil,
+        spoilerHoverProgress: [Int: CGFloat] = [:],
+        revealedSpoilerLocations: Set<Int> = []
+    ) {
+        guard frame.width > 0, frame.height > 0,
+              let context = NSGraphicsContext.current?.cgContext
+        else { return }
+        let (drawingValue, drawingFramesetter) = preparedDrawingText(
+            value,
+            framesetter: framesetter,
+            hoveredLinkCharacterIndex: hoveredLinkCharacterIndex,
+            underlinesLinks: model?.accessibilitySettings.underlinesLinks == true,
+            revealedSpoilerLocations: revealedSpoilerLocations
+        )
+        let path = CGPath(rect: CGRect(origin: .zero, size: frame.size), transform: nil)
+        let textFrame = CTFramesetterCreateFrame(
+            drawingFramesetter,
+            CFRange(location: 0, length: drawingValue.length),
+            path,
+            nil
+        )
+        drawMarkdownBlocks(
+            in: textFrame,
+            outerFrame: frame,
+            attributedText: drawingValue,
+            spoilerHoverProgress: spoilerHoverProgress
+        )
+        NativeTimelineSpoilerAppearance.revealedTextColor.setFill()
+        for range in NativeTimelineTextSpoilers.ranges(in: value) where revealedSpoilerLocations.contains(range.location) {
+            for rect in NativeTimelineTextSpoilerGeometry.rects(in: textFrame, outerFrame: frame, range: range) {
+                NSBezierPath(concentricRoundedRect: rect, cornerRadius: NativeTimelineSpoilerAppearance.textCornerRadius).fill()
+            }
+        }
+        drawTextSelection(
+            selectionRange,
+            in: textFrame,
+            outerFrame: frame,
+            attributedText: drawingValue
+        )
+        context.saveGState()
+        context.translateBy(x: frame.minX, y: frame.maxY)
+        context.scaleBy(x: 1, y: -1)
+        context.textMatrix = .identity
+        CTFrameDraw(textFrame, context)
+        context.restoreGState()
+        drawInlineAttachments(
+            in: textFrame,
+            outerFrame: frame,
+            attributedText: drawingValue,
+            model: model,
+            isOutgoingBubble: isOutgoingBubble,
+            selectionRange: selectionRange,
+            hoveredMentionCharacterIndex: hoveredMentionCharacterIndex
+        )
+    }
+
+    private static func preparedDrawingText(
+        _ value: NSAttributedString,
+        framesetter: CTFramesetter,
+        hoveredLinkCharacterIndex: Int?,
+        underlinesLinks: Bool,
+        revealedSpoilerLocations: Set<Int>
+    ) -> (NSAttributedString, CTFramesetter) {
+        let fullRange = NSRange(location: 0, length: value.length)
+        let spoilerRanges = NativeTimelineTextSpoilers.ranges(in: value)
+        var hasUnderlinedLinks = false
+        if underlinesLinks {
+            value.enumerateAttribute(.link, in: fullRange) { link, _, stop in
+                guard link != nil else { return }
+                hasUnderlinedLinks = true
+                stop.pointee = true
+            }
+        }
+        if spoilerRanges.isEmpty, hoveredLinkCharacterIndex == nil, !hasUnderlinedLinks {
+            return (value, framesetter)
+        }
+        let drawing = NSMutableAttributedString(attributedString: value)
+        NativeTimelineLinkAppearance.applyHover(
+            to: drawing,
+            characterIndex: hoveredLinkCharacterIndex,
+            underlinesAllLinks: underlinesLinks
+        )
+        // Conceal last so no earlier color adjustment can repaint hidden text.
+        for range in spoilerRanges {
+            if revealedSpoilerLocations.contains(range.location) {
+                drawing.removeAttribute(.discordMarkdownSpoiler, range: range)
+            } else {
+                NativeTimelineSpoilerAppearance.concealText(in: drawing, range: range)
+            }
+        }
+        return (drawing, CTFramesetterCreateWithAttributedString(drawing))
+    }
+
+    private static func drawTextSelection(
+        _ selectionRange: NSRange?,
+        in textFrame: CTFrame,
+        outerFrame: CGRect,
+        attributedText: NSAttributedString
+    ) {
+        if let selectionRange, selectionRange.length > 0 {
+            textSelectionHighlightColor.setFill()
+            for backgroundRange
+                in NativeTimelineTextSelectionGeometry.backgroundRanges(
+                    in: attributedText,
+                    selectionRange: selectionRange
+                )
+            {
+                for selectionRect in NativeTimelineTextSelectionGeometry.rects(
+                    in: textFrame,
+                    outerFrame: outerFrame,
+                    range: backgroundRange
+                ) {
+                    selectionRect.fill()
+                }
+            }
+        }
+    }
+
+    private struct MarkdownDecorationRects {
+        var autoModerationMatches: [CGRect] = []
+        var quotes: [CGRect] = []
+        var inlineCode: [CGRect] = []
+        var spoilers: [(CGRect, CGFloat)] = []
+        var listMarkers: [ListMarker] = []
+    }
+
+    private struct ListMarker {
+        let frame: CGRect
+        let isNested: Bool
+        let isQuoted: Bool
+        /// One of Discord's CSS pixels at the item's size.
+        let em: CGFloat
+    }
+
+    static func drawMarkdownBlocks(
+        in textFrame: CTFrame,
+        outerFrame: CGRect,
+        attributedText: NSAttributedString,
+        spoilerHoverProgress: [Int: CGFloat] = [:]
+    ) {
+        guard attributedText.length > 0 else { return }
+        let decorations = markdownDecorationRects(
+            in: textFrame,
+            outerFrame: outerFrame,
+            attributedText: attributedText,
+            spoilerHoverProgress: spoilerHoverProgress
+        )
+        let codeBlocks = NativeTimelineCodeBlockGeometry.regions(
+            in: textFrame,
+            outerFrame: outerFrame,
+            value: attributedText
+        )
+        drawInlineCodeDecorations(decorations.inlineCode)
+        drawSpoilerDecorations(decorations.spoilers)
+        drawCodeBlockDecorations(codeBlocks)
+        for rect in decorations.autoModerationMatches {
+            autoModerationMatchColor.setFill()
+            NSBezierPath(concentricRoundedRect: rect, cornerRadius: InterfaceScale.metric(3)).fill()
+        }
+        drawListMarkerDecorations(decorations.listMarkers)
+        drawQuoteDecorations(decorations.quotes)
+    }
+
+    private static func markdownDecorationRects(
+        in textFrame: CTFrame,
+        outerFrame: CGRect,
+        attributedText: NSAttributedString,
+        spoilerHoverProgress: [Int: CGFloat]
+    ) -> MarkdownDecorationRects {
+        let fullRange = NSRange(location: 0, length: attributedText.length)
+        var result = MarkdownDecorationRects()
+        attributedText.enumerateAttribute(
+            .discordMarkdownInlineCode,
+            in: fullRange
+        ) { rawValue, range, _ in
+            guard (rawValue as? NSNumber)?.boolValue == true else {
+                return
+            }
+            var rects = NativeTimelineTextSelectionGeometry.rects(
+                in: textFrame,
+                outerFrame: outerFrame,
+                range: range,
+                fitsGlyphs: true
+            )
+            // Markdown reserves the padding as kerning after the code and
+            // before it. The code's last glyph carries its trailing side; the
+            // leading side sits before the first glyph.
+            let padding = attributedText.attribute(.kern, at: NSMaxRange(range) - 1, effectiveRange: nil) as? CGFloat ?? 0
+            if !rects.isEmpty {
+                rects[0].origin.x -= padding
+                rects[0].size.width += padding
+            }
+            result.inlineCode.append(contentsOf: rects)
+        }
+        attributedText.enumerateAttribute(.autoModerationMatch, in: fullRange) { value, range, _ in
+            guard value != nil else { return }
+            result.autoModerationMatches += NativeTimelineTextSelectionGeometry.rects(
+                in: textFrame, outerFrame: outerFrame, range: range
+            )
+        }
+        for range in NativeTimelineTextSpoilers.ranges(in: attributedText) {
+            result.spoilers.append(
+                contentsOf:
+                    NativeTimelineTextSpoilerGeometry.rects(
+                        in: textFrame,
+                        outerFrame: outerFrame,
+                        range: range
+                    ).map {
+                        (
+                            $0,
+                            spoilerHoverProgress[range.location] ?? 0
+                        )
+                    }
+            )
+        }
+        attributedText.enumerateAttribute(
+            .discordMarkdownListMarker,
+            in: fullRange
+        ) { rawValue, range, _ in
+            guard let level = rawValue as? NSNumber else { return }
+            let isQuoted = attributedText.attribute(.discordMarkdownBlock, at: range.location, effectiveRange: nil)
+                as? String == "quote"
+            let em = NativeTimelineMarkdownChromeMetrics.em(in: attributedText, at: range.location)
+            result.listMarkers.append(
+                contentsOf:
+                    NativeTimelineTextSelectionGeometry.rects(
+                        in: textFrame,
+                        outerFrame: outerFrame,
+                        range: range
+                    ).map { ListMarker(frame: $0, isNested: level.intValue > 0, isQuoted: isQuoted, em: em) }
+            )
+        }
+        // Quoted lines are separated by an unmarked newline, so one quote is
+        // every marked range up to the next unquoted text.
+        var quoteRanges: [NSRange] = []
+        attributedText.enumerateAttribute(
+            .discordMarkdownBlock,
+            in: fullRange
+        ) { rawValue, range, _ in
+            guard rawValue as? String == "quote" else { return }
+            if let last = quoteRanges.last, range.location - NSMaxRange(last) <= 1 {
+                quoteRanges[quoteRanges.count - 1] = NSUnionRange(last, range)
+            } else {
+                quoteRanges.append(range)
+            }
+        }
+        result.quotes = quoteRanges.compactMap { range in
+            // Discord's bar is 4 px wide.
+            let width = 4 * NativeTimelineMarkdownChromeMetrics.em(in: attributedText, at: range.location)
+            return NativeTimelineTextSelectionGeometry.rects(
+                in: textFrame,
+                outerFrame: outerFrame,
+                range: range
+            ).reduce(nil) { ($0 as CGRect?)?.union($1) ?? $1 }
+                .map { CGRect(x: outerFrame.minX, y: $0.minY, width: width, height: $0.height) }
+        }
+        return result
+    }
+
+    private static func drawInlineCodeDecorations(_ rects: [CGRect]) {
+        for inlineRect in rects {
+            let backgroundFrame = inlineRect.insetBy(dx: 0, dy: InterfaceScale.metric(1))
+            discordCodeBackgroundColor.setFill()
+            NSBezierPath(
+                concentricRoundedRect: backgroundFrame,
+                cornerRadius: NativeTimelineMarkdownChromeMetrics.codeBlockCornerRadius
+            ).fill()
+            discordCodeBorderColor.setStroke()
+            let border = NSBezierPath(
+                concentricRoundedRect: backgroundFrame.insetBy(dx: 0.5, dy: 0.5),
+                cornerRadius: NativeTimelineMarkdownChromeMetrics.codeBlockCornerRadius
+            )
+            border.lineWidth = 1
+            border.stroke()
+        }
+    }
+
+    private static func drawSpoilerDecorations(_ rects: [(CGRect, CGFloat)]) {
+        for (spoilerRect, hover) in rects {
+            let backgroundFrame = spoilerRect
+            NativeTimelineSpoilerAppearance.textBackgroundColor(hover: hover).setFill()
+            NSBezierPath(
+                concentricRoundedRect: backgroundFrame,
+                cornerRadius:
+                    NativeTimelineSpoilerAppearance.textCornerRadius
+            ).fill()
+        }
+    }
+
+    private static func drawCodeBlockDecorations(
+        _ codeBlocks: [NativeTimelineCodeBlockRegion]
+    ) {
+        for codeBlock in codeBlocks {
+            let backgroundFrame = codeBlock.backgroundFrame
+            discordCodeBackgroundColor.setFill()
+            NSBezierPath(
+                concentricRoundedRect: backgroundFrame,
+                cornerRadius: InterfaceScale.metric(4)
+            ).fill()
+            discordCodeBorderColor.setStroke()
+            let border = NSBezierPath(
+                concentricRoundedRect: backgroundFrame.insetBy(dx: 0.5, dy: 0.5),
+                cornerRadius: InterfaceScale.metric(4)
+            )
+            border.lineWidth = 1
+            border.stroke()
+        }
+    }
+
+    /// Discord centers its 5.5 px disc 12 px before the item text, which
+    /// starts one 16 px gutter after the marker, and hollows nested ones.
+    private static func drawListMarkerDecorations(_ markers: [ListMarker]) {
+        for marker in markers {
+            (marker.isQuoted ? NSColor.secondaryLabelColor : NSColor.labelColor).set()
+            let diameter = 5.5 * marker.em
+            let disc = CGRect(
+                x: marker.frame.minX + 4 * marker.em - diameter / 2,
+                y: marker.frame.midY - diameter / 2,
+                width: diameter,
+                height: diameter
+            )
+            if marker.isNested {
+                let ring = NSBezierPath(ovalIn: disc.insetBy(dx: 0.5, dy: 0.5))
+                ring.lineWidth = 1
+                ring.stroke()
+            } else {
+                NSBezierPath(ovalIn: disc).fill()
+            }
+        }
+    }
+
+    private static func drawQuoteDecorations(_ bars: [CGRect]) {
+        NSColor.tertiaryLabelColor.setFill()
+        for bar in bars {
+            NSBezierPath(
+                roundedRect: bar,
+                xRadius: bar.width / 2,
+                yRadius: bar.width / 2
+            ).fill()
+        }
+    }
+
+    /// Discord tints code with its blurple and outlines it in a translucent
+    /// gray, so both read on any background and in either appearance.
+    static let discordCodeBackgroundColor = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 89 / 255, green: 102 / 255, blue: 242 / 255, alpha: 0.08)
+            : NSColor(srgbRed: 77 / 255, green: 102 / 255, blue: 230 / 255, alpha: 0.04)
+    }
+
+    static let discordCodeBorderColor = NSColor(name: nil) { appearance in
+        NSColor(
+            srgbRed: 150 / 255,
+            green: 150 / 255,
+            blue: 160 / 255,
+            alpha: appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? 0.2 : 0.4
+        )
+    }
+
+    enum InlineAttachmentDraw {
+        case image(NSImage, CGRect, selectionFrame: CGRect?)
+        case mention(
+            NativeTimelineMentionBox,
+            CGRect,
+            characterIndex: Int,
+            selectionFrame: CGRect?
+        )
+        case emojiFallback(CGRect, selectionFrame: CGRect?)
+
+        var selectionFrame: CGRect? {
+            switch self {
+            case let .image(_, _, selectionFrame),
+                 let .mention(_, _, _, selectionFrame),
+                 let .emojiFallback(_, selectionFrame):
+                selectionFrame
+            }
+        }
+    }
+
+    private struct InlineAttachmentContext {
+        let textFrame: CTFrame
+        let outerFrame: CGRect
+        let attributedText: NSAttributedString
+        let model: AppModel?
+        let selectionRange: NSRange?
+    }
+
+    static func drawInlineAttachments(
+        in textFrame: CTFrame,
+        outerFrame: CGRect,
+        attributedText: NSAttributedString,
+        model: AppModel?,
+        isOutgoingBubble: Bool = false,
+        selectionRange: NSRange?,
+        hoveredMentionCharacterIndex: Int?
+    ) {
+        let draws = inlineAttachmentDraws(
+            in: textFrame,
+            outerFrame: outerFrame,
+            attributedText: attributedText,
+            model: model,
+            selectionRange: selectionRange
+        )
+        for draw in draws {
+            renderInlineAttachment(
+                draw,
+                isOutgoingBubble: isOutgoingBubble,
+                hoveredMentionCharacterIndex: hoveredMentionCharacterIndex
+            )
+        }
+    }
+
+    private static func inlineAttachmentDraws(
+        in textFrame: CTFrame,
+        outerFrame: CGRect,
+        attributedText: NSAttributedString,
+        model: AppModel?,
+        selectionRange: NSRange?
+    ) -> [InlineAttachmentDraw] {
+        let lines = CTFrameGetLines(textFrame) as NSArray
+        guard lines.count > 0 else { return [] }
+        var origins = Array(repeating: CGPoint.zero, count: lines.count)
+        CTFrameGetLineOrigins(
+            textFrame,
+            CFRange(location: 0, length: lines.count),
+            &origins
+        )
+        var draws: [InlineAttachmentDraw] = []
+        draws.reserveCapacity(4)
+        let context = InlineAttachmentContext(
+            textFrame: textFrame,
+            outerFrame: outerFrame,
+            attributedText: attributedText,
+            model: model,
+            selectionRange: selectionRange
+        )
+
+        for index in 0 ..< lines.count {
+            let line = coreTextLine(lines[index])
+            let lineOrigin = origins[index]
+            let runs = CTLineGetGlyphRuns(line) as NSArray
+            for case let run as CTRun in runs {
+                if let draw = inlineAttachmentDraw(
+                    for: run,
+                    line: line,
+                    lineOrigin: lineOrigin,
+                    context: context
+                ) {
+                    draws.append(draw)
+                }
+            }
+        }
+        return draws
+    }
+
+    private static func inlineAttachmentDraw(
+        for run: CTRun,
+        line: CTLine,
+        lineOrigin: CGPoint,
+        context: InlineAttachmentContext
+    ) -> InlineAttachmentDraw? {
+        let textFrame = context.textFrame
+        let outerFrame = context.outerFrame
+        let attributedText = context.attributedText
+        let model = context.model
+        let selectionRange = context.selectionRange
+        let range = CTRunGetStringRange(run)
+        guard range.location >= 0, range.location < attributedText.length else { return nil }
+        let mention = attributedText.attribute(
+            .nativeTimelineMention,
+            at: range.location,
+            effectiveRange: nil
+        ) as? NativeTimelineMentionBox
+        let emojiToken = attributedText.attribute(
+            .discordEmojiToken,
+            at: range.location,
+            effectiveRange: nil
+        ) as? String
+        guard mention != nil || emojiToken != nil else { return nil }
+        let isHiddenSpoiler = attributedText.attribute(
+            .discordMarkdownSpoiler,
+            at: range.location,
+            effectiveRange: nil
+        ) != nil
+        guard !isHiddenSpoiler else { return nil }
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        let width = CGFloat(CTRunGetTypographicBounds(
+            run, CFRange(location: 0, length: 0), &ascent, &descent, nil
+        ))
+        let horizontalOffset = lineOrigin.x
+            + CTLineGetOffsetForStringIndex(line, range.location, nil)
+        let size = CGSize(width: max(1, width), height: max(1, ascent + descent))
+        let frame = CGRect(
+            x: outerFrame.minX + horizontalOffset,
+            y: outerFrame.maxY - (lineOrigin.y - descent) - size.height,
+            width: size.width,
+            height: size.height
+        )
+        let selectionFrame = inlineAttachmentSelectionFrame(
+            range: range,
+            selectionRange: selectionRange,
+            textFrame: textFrame,
+            outerFrame: outerFrame
+        )
+        if let mention {
+            return .mention(
+                mention, frame, characterIndex: range.location, selectionFrame: selectionFrame
+            )
+        }
+        guard let emojiToken,
+              let image = inlineEmojiImage(token: emojiToken, model: model)
+        else { return .emojiFallback(frame, selectionFrame: selectionFrame) }
+        return .image(image, frame, selectionFrame: selectionFrame)
+    }
+
+    private static func inlineAttachmentSelectionFrame(
+        range: CFRange,
+        selectionRange: NSRange?,
+        textFrame: CTFrame,
+        outerFrame: CGRect
+    ) -> CGRect? {
+        guard NativeTimelineTextSelectionGeometry.intersects(
+            characterRange: range,
+            selectionRange: selectionRange
+        ) else { return nil }
+        return NativeTimelineTextSelectionGeometry.rects(
+            in: textFrame,
+            outerFrame: outerFrame,
+            range: NSRange(location: range.location, length: max(1, range.length))
+        ).first
+    }
+
+    private static func renderInlineAttachment(
+        _ draw: InlineAttachmentDraw,
+        isOutgoingBubble: Bool,
+        hoveredMentionCharacterIndex: Int?
+    ) {
+        switch draw {
+        case let .image(image, frame, _):
+            drawImage(image, in: frame, cornerRadius: 0, fillsFrame: false)
+        case let .mention(mention, frame, characterIndex, _):
+            drawMention(
+                mention.presentation,
+                fontSize: mention.fontSize,
+                in: frame,
+                isHovered: hoveredMentionCharacterIndex == characterIndex,
+                isOutgoingBubble: isOutgoingBubble
+            )
+        case let .emojiFallback(frame, _):
+            text(
+                "🙂",
+                in: frame,
+                font: .systemFont(ofSize: max(11, frame.height * 0.8)),
+                color: .labelColor,
+                alignment: .center
+            )
+        }
+        if let selectionFrame = draw.selectionFrame {
+            attachmentSelectionHighlightColor.setFill()
+            selectionFrame.fill()
+        }
+    }
+
+    static var textSelectionHighlightColor: NSColor {
+        NSColor.sakuraCordTextSelectionBackgroundColor
+    }
+
+    static var attachmentSelectionHighlightColor: NSColor {
+        NSColor.sakuraCordTextSelectionBackgroundColor.withAlphaComponent(0.5)
+    }
+
+    static func drawMention(
+        _ presentation: MentionPresentation,
+        fontSize: CGFloat,
+        in frame: CGRect,
+        isHovered: Bool,
+        isOutgoingBubble: Bool = false
+    ) {
+        let color: NSColor = isOutgoingBubble
+            ? .white : presentation.isTimestamp ? .labelColor : roleColor(presentation.colorHex) ?? .sakuraCordAccentColor
+        let shape = NSBezierPath(
+            concentricRoundedRect: frame,
+            cornerRadius: InterfaceScale.metric(5.5)
+        )
+        if isOutgoingBubble {
+            // Outgoing message text is white. A black backing at this opacity
+            // keeps its matching mention text readable even on a white accent.
+            NSColor.black.withAlphaComponent(isHovered ? 0.65 : 0.55).setFill()
+        } else {
+            color.withAlphaComponent(
+                NativeTimelineMentionAppearance.backgroundAlpha(isHovered: isHovered, isTimestamp: presentation.isTimestamp)
+            ).setFill()
+        }
+        shape.fill()
+        if isOutgoingBubble {
+            // Keep the pill distinct even when the bubble itself is black.
+            color.withAlphaComponent(isHovered ? 0.4 : 0.25).setStroke()
+            shape.lineWidth = 1
+            shape.stroke()
+        } else if case .role = presentation.target,
+                  SakuraCordAccentColor.usesAccentFallback(forRoleColorHex: presentation.colorHex) {
+            color.withAlphaComponent(isHovered ? 0.9 : 0.7).setStroke()
+            shape.lineWidth = 1
+            shape.stroke()
+        }
+
+        let metrics = NativeTimelineMentionMetrics.self
+        var labelX = frame.minX + metrics.horizontalPadding
+        if let systemImage = presentation.systemImage {
+            let iconSize = max(InterfaceScale.metric(10), frame.height - metrics.iconInset)
+            let iconFrame = CGRect(
+                x: labelX,
+                y: frame.midY - iconSize / 2,
+                width: iconSize,
+                height: iconSize
+            )
+            if let image = NativeTimelineSystemSymbolCache.configuredImage(
+                named: systemImage,
+                pointSize: iconSize,
+                weight: .semibold,
+                color: color
+            ) {
+                drawImage(
+                    image,
+                    in: iconFrame,
+                    cornerRadius: 0,
+                    fillsFrame: false
+                )
+            }
+            labelX = iconFrame.maxX + metrics.leadingGap
+        } else if presentation.showsAvatar {
+            let avatarSize = max(InterfaceScale.metric(10), frame.height - metrics.avatarInset)
+            let avatarFrame = CGRect(
+                x: labelX,
+                y: frame.midY - avatarSize / 2,
+                width: avatarSize,
+                height: avatarSize
+            )
+            if let url = presentation.avatarURL,
+               let image = mediaImage(for: .avatar(url))
+            {
+                drawImage(
+                    image,
+                    in: avatarFrame,
+                    cornerRadius: presentation.avatarCornerRadius(size: avatarSize),
+                    fillsFrame: true
+                )
+            } else {
+                color.withAlphaComponent(0.38).setFill()
+                let radius = presentation.avatarCornerRadius(size: avatarSize)
+                NSBezierPath(roundedRect: avatarFrame, xRadius: radius, yRadius: radius).fill()
+            }
+            labelX = avatarFrame.maxX + metrics.leadingGap
+        }
+        mentionLabel(
+            presentation,
+            in: CGRect(
+                x: labelX,
+                y: frame.minY,
+                width: max(1, frame.maxX - labelX - metrics.horizontalPadding),
+                height: frame.height
+            ),
+            font: .systemFont(ofSize: fontSize, weight: .semibold),
+            color: color
+        )
+    }
+
+    /// A mention's label at `font`'s size and the mention's own weight:
+    /// Discord sets timestamps in regular text.
+    private static func mentionLabel(_ presentation: MentionPresentation, in frame: CGRect, font: NSFont, color: NSColor) {
+        text(presentation.label, in: frame, font: .systemFont(ofSize: font.pointSize, weight: presentation.labelWeight),
+             color: color)
+    }
+
+    static func inlineEmojiImage(
+        token: String,
+        model: AppModel?
+    ) -> NSImage? {
+        let reference = EmojiReference(rawToken: token)
+        if let url =
+            reference.id.flatMap({ model?.customEmojiURLsByID[$0] })
+                ?? reference.imageURL(size: 64),
+           let image = mediaImage(
+               for: .media(url, maximumPixelDimension: 64)
+           )
+        {
+            return image
+        }
+        return nil
+    }
+
+    static func roleColor(_ value: UInt32?) -> NSColor? {
+        guard let value, value != 0 else { return nil }
+        return NSColor(
+            red: CGFloat((value >> 16) & 0xFF) / 255,
+            green: CGFloat((value >> 8) & 0xFF) / 255,
+            blue: CGFloat(value & 0xFF) / 255,
+            alpha: 1
+        )
+    }
+
+    static func measuredTextWidth(
+        _ value: String,
+        font: NSFont
+    ) -> CGFloat {
+        let attributed = NSAttributedString(
+            string: value,
+            attributes: [.font: font]
+        )
+        let line = CTLineCreateWithAttributedString(attributed)
+        return ceil(CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil)))
+    }
+
+}

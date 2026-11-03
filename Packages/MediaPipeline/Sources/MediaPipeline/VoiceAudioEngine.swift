@@ -1,0 +1,1018 @@
+import AVFAudio
+@preconcurrency import AVFoundation
+import CoreAudio
+import Foundation
+import OSLog
+
+private let voiceAudioLogger = Logger(subsystem: "dev.sakuracord.SakuraCord", category: "VoiceAudio")
+
+public struct CapturedOpusFrame: Sendable {
+    public var data: Data
+    public var containsVoice: Bool
+    public var containsMicrophoneVoice: Bool
+    public var containsInjectedAudio: Bool
+    public var sampleOffset: UInt64
+
+    public init(
+        data: Data,
+        containsVoice: Bool,
+        sampleOffset: UInt64 = 0,
+        containsMicrophoneVoice: Bool? = nil,
+        containsInjectedAudio: Bool = false
+    ) {
+        self.data = data
+        self.containsVoice = containsVoice
+        self.containsMicrophoneVoice = containsMicrophoneVoice ?? containsVoice
+        self.containsInjectedAudio = containsInjectedAudio
+        self.sampleOffset = sampleOffset
+    }
+}
+
+@MainActor
+public final class VoiceAudioEngine {
+    private struct LocalSoundboardPlayback {
+        let soundID: String
+        let player: AVAudioPlayerNode
+        let completion: (@MainActor @Sendable () -> Void)?
+    }
+
+    public private(set) var isRunning = false
+    private var isShutDown = false
+    /// The input device in use, which may be the system default after a fallback.
+    public private(set) var inputDeviceID: AudioDeviceID?
+    public private(set) var outputDeviceID: AudioDeviceID?
+    public var inputLevelHandler: (@Sendable (Float) -> Void)? {
+        didSet { captureEncoder.levelHandler = inputLevelHandler }
+    }
+    public var inputVolume: Float = 1 {
+        didSet { captureEncoder.inputVolume = min(max(inputVolume, 0), 2) }
+    }
+
+    public var outputVolume: Float = 1 {
+        didSet { applyOutputVolume() }
+    }
+
+    public var isMuted = false {
+        didSet { captureEncoder.isMuted = isMuted }
+    }
+
+    public var isDeafened = false {
+        didSet { applyOutputVolume() }
+    }
+
+    // Capture uses AVCaptureSession rather than AVAudioEngine's full-duplex
+    // HAL node. Merely opening the default Bluetooth input through an
+    // AVAudioEngine can switch the headset transport for the entire Mac, even
+    // when the node is immediately redirected to the built-in microphone.
+    private let captureSession = AVCaptureSession()
+    private let captureQueue = DispatchQueue(label: "app.sakuracord.audio.capture", qos: .userInteractive)
+    private var captureOutput: AVCaptureAudioDataOutput?
+    private final class CaptureInputs: @unchecked Sendable {
+        // Written on captureQueue, read only after the awaited hop returns.
+        var inputs: [AVCaptureInput] = []
+    }
+    private let playbackEngine = AVAudioEngine()
+    private let codec: OpusCodec
+    private let captureEncoder: OpusSampleBufferEncoder
+    private var players: [String: AVAudioPlayerNode] = [:]
+    private var localSoundboardPlayers: [UUID: LocalSoundboardPlayback] = [:]
+    private var participantVolumes: [String: Float] = [:]
+    private var captureSessionObservers: [NSObjectProtocol] = []
+    private var captureRecoveryTask: Task<Void, Never>?
+    private var playbackConfigurationObserver: NSObjectProtocol?
+    private var playbackRecoveryTask: Task<Void, Never>?
+    private var inputRouteGeneration: UInt64 = 0
+    private var outputRouteGeneration: UInt64 = 0
+    private var isChangingCaptureRoute = false
+    private var isChangingPlaybackRoute = false
+
+    public init(bitRate: Int = 64000) throws {
+        let codec = try OpusCodec(bitRate: bitRate)
+        self.codec = codec
+        captureEncoder = OpusSampleBufferEncoder(codec: codec)
+        playbackConfigurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: playbackEngine,
+            queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.playbackConfigurationChanged()
+            }
+        }
+        captureSessionObservers = [
+            AVCaptureSession.runtimeErrorNotification,
+            AVCaptureSession.didStopRunningNotification,
+            AVCaptureSession.interruptionEndedNotification
+        ].map { name in
+            NotificationCenter.default.addObserver(
+                forName: name,
+                object: captureSession,
+                queue: nil
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.captureSessionChanged()
+                }
+            }
+        }
+    }
+
+    isolated deinit {
+        captureRecoveryTask?.cancel()
+        playbackRecoveryTask?.cancel()
+        for observer in captureSessionObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let playbackConfigurationObserver {
+            NotificationCenter.default.removeObserver(playbackConfigurationObserver)
+        }
+    }
+
+    public static func requestMicrophonePermission() async -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: true
+        case .notDetermined: await AVCaptureDevice.requestAccess(for: .audio)
+        default: false
+        }
+    }
+
+    public func start(
+        inputDeviceID: AudioDeviceID? = nil,
+        outputDeviceID: AudioDeviceID? = nil,
+        onCapturedFrame: @escaping @Sendable (CapturedOpusFrame) -> Void
+    ) throws {
+        try start(
+            inputDeviceID: inputDeviceID,
+            outputDeviceID: outputDeviceID,
+            captureBeforePlayback: false,
+            onCapturedFrame: onCapturedFrame
+        )
+    }
+
+    public func startMicrophoneTest(
+        inputDeviceID: AudioDeviceID?,
+        outputDeviceID: AudioDeviceID?,
+        onCapturedFrame: @escaping @Sendable (CapturedOpusFrame) -> Void
+    ) throws {
+        try start(
+            inputDeviceID: inputDeviceID,
+            outputDeviceID: outputDeviceID,
+            captureBeforePlayback: true,
+            onCapturedFrame: onCapturedFrame
+        )
+    }
+
+    private func start(
+        inputDeviceID: AudioDeviceID?,
+        outputDeviceID: AudioDeviceID?,
+        captureBeforePlayback: Bool,
+        onCapturedFrame: @escaping @Sendable (CapturedOpusFrame) -> Void
+    ) throws {
+        // A start that reaches the main actor after shutDown() must not reopen
+        // the microphone the departing session already released.
+        guard !isShutDown else { throw CancellationError() }
+        if isRunning || captureOutput != nil {
+            stop()
+        }
+        self.inputDeviceID = inputDeviceID
+        self.outputDeviceID = outputDeviceID
+        // Installed behind any queued teardown, so sample callbacks still queued
+        // from a previous run cannot reach the new handler.
+        captureQueue.async { [captureEncoder] in
+            captureEncoder.handler = onCapturedFrame
+        }
+        do {
+            // Local tests can warm up capture while Core Audio starts the output route.
+            if captureBeforePlayback {
+                try startCaptureGraph(deviceID: inputDeviceID)
+            }
+            try startPlaybackGraph()
+            if !captureBeforePlayback {
+                try startCaptureGraph(deviceID: inputDeviceID)
+            }
+            isRunning = true
+        } catch {
+            tearDownAudioGraph()
+            throw error
+        }
+    }
+
+    public func stop() {
+        tearDownAudioGraph()
+    }
+
+    /// Stops the engine for good, then waits until the capture queue has stopped
+    /// the session, without blocking the main actor, so a following voice
+    /// session cannot open the microphone while this one still holds it.
+    public func shutDown() async {
+        isShutDown = true
+        tearDownAudioGraph()
+        await withCheckedContinuation { continuation in
+            captureQueue.async { continuation.resume() }
+        }
+    }
+
+    private func tearDownAudioGraph() {
+        isRunning = false
+        inputRouteGeneration &+= 1
+        outputRouteGeneration &+= 1
+        captureRecoveryTask?.cancel()
+        captureRecoveryTask = nil
+        playbackRecoveryTask?.cancel()
+        playbackRecoveryTask = nil
+        tearDownCaptureGraph()
+        tearDownPlaybackGraph()
+        captureEncoder.removeAllInjectedAudio()
+        captureEncoder.handler = nil
+    }
+
+    // Configuration and startRunning run asynchronously on the serial capture
+    // queue so the main actor never blocks on Core Audio; queue order keeps them
+    // behind any earlier teardown. A rejected input surfaces through recovery.
+    private func startCaptureGraph(deviceID: AudioDeviceID?) throws {
+        let (input, resolvedDeviceID) = try makeCaptureInput(
+            deviceID: deviceID,
+            allowsDefaultFallback: true
+        )
+        let output = AVCaptureAudioDataOutput()
+        output.setSampleBufferDelegate(captureEncoder, queue: captureQueue)
+        captureOutput = output
+        let generation = inputRouteGeneration
+        captureQueue.async { [weak self, captureSession] in
+            captureSession.beginConfiguration()
+            for existing in captureSession.inputs {
+                captureSession.removeInput(existing)
+            }
+            for existing in captureSession.outputs {
+                captureSession.removeOutput(existing)
+            }
+            guard captureSession.canAddInput(input),
+                  captureSession.canAddOutput(output)
+            else {
+                captureSession.commitConfiguration()
+                voiceAudioLogger.error("Voice capture session rejected the microphone input")
+                Task { @MainActor [weak self] in
+                    self?.scheduleCaptureRecovery()
+                }
+                return
+            }
+            captureSession.addInput(input)
+            captureSession.addOutput(output)
+            captureSession.commitConfiguration()
+            Task { @MainActor [weak self] in
+                guard let self, generation == self.inputRouteGeneration else { return }
+                self.inputDeviceID = resolvedDeviceID
+            }
+            if !captureSession.isRunning {
+                captureSession.startRunning()
+            }
+        }
+        voiceAudioLogger.info("Voice capture configured without opening a shared output route")
+    }
+
+    private func onCaptureQueue(_ work: @escaping @Sendable () throws -> Void) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            captureQueue.async {
+                do {
+                    try work()
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func makeCaptureInput(
+        deviceID: AudioDeviceID?,
+        allowsDefaultFallback: Bool
+    ) throws -> (AVCaptureDeviceInput, AudioDeviceID?) {
+        var resolvedDeviceID = deviceID
+        var device = MediaDeviceCatalog.audioCaptureDevice(deviceID: deviceID)
+        if device == nil, deviceID != nil, allowsDefaultFallback {
+            voiceAudioLogger.warning(
+                "Selected input device failed; falling back to the system default"
+            )
+            resolvedDeviceID = nil
+            device = MediaDeviceCatalog.audioCaptureDevice(deviceID: nil)
+        }
+        guard let device else { throw VoiceAudioEngineError.inputUnavailable }
+        do {
+            return (try AVCaptureDeviceInput(device: device), resolvedDeviceID)
+        } catch {
+            throw VoiceAudioEngineError.inputUnavailable
+        }
+    }
+
+    private func captureSessionChanged() {
+        guard isRunning, !isChangingCaptureRoute, !captureSession.isRunning else { return }
+        voiceAudioLogger.warning("The microphone capture session stopped unexpectedly")
+        scheduleCaptureRecovery()
+    }
+
+    private func scheduleCaptureRecovery() {
+        guard captureRecoveryTask == nil else { return }
+        let generation = inputRouteGeneration
+        captureRecoveryTask = Task { @MainActor [weak self] in
+            defer {
+                if self?.inputRouteGeneration == generation {
+                    self?.captureRecoveryTask = nil
+                }
+            }
+            do {
+                try await Task.sleep(for: .milliseconds(150))
+                guard let self,
+                      self.isRunning,
+                      generation == self.inputRouteGeneration
+                else { return }
+                try await self.recoverCaptureRoute(generation: generation)
+            } catch is CancellationError {
+                return
+            } catch {
+                voiceAudioLogger.error(
+                    "Microphone recovery failed: \(String(reflecting: error), privacy: .public)"
+                )
+            }
+        }
+    }
+
+    private func recoverCaptureRoute(generation: UInt64) async throws {
+        guard generation == inputRouteGeneration else {
+            throw CancellationError()
+        }
+        isChangingCaptureRoute = true
+        defer { isChangingCaptureRoute = false }
+        do {
+            try await stabilizeCaptureSession(generation: generation)
+        } catch {
+            guard generation == inputRouteGeneration else {
+                throw CancellationError()
+            }
+            voiceAudioLogger.warning(
+                "Selected microphone could not recover; trying the system default"
+            )
+            tearDownCaptureGraph()
+            try startCaptureGraph(deviceID: nil)
+            try await stabilizeCaptureSession(generation: generation)
+        }
+        voiceAudioLogger.info("Voice capture recovered after a hardware configuration change")
+    }
+
+    private func stabilizeCaptureSession(
+        generation: UInt64,
+        maximumAttempts: Int = 5
+    ) async throws {
+        for attempt in 0 ..< maximumAttempts {
+            guard generation == inputRouteGeneration else {
+                throw CancellationError()
+            }
+            try await onCaptureQueue { [captureSession] in
+                if !captureSession.isRunning, !captureSession.inputs.isEmpty {
+                    captureSession.startRunning()
+                }
+            }
+            try await Task.sleep(for: .milliseconds(200 + attempt * 100))
+            if captureSession.isRunning {
+                return
+            }
+        }
+        throw VoiceAudioEngineError.inputUnavailable
+    }
+
+    private func startPlaybackGraph(
+        allowsDefaultFallback: Bool = true,
+        reselectCurrentDevice: Bool = true
+    ) throws {
+        do {
+            try startPlaybackGraph(on: outputDeviceID, reselectCurrentDevice: reselectCurrentDevice)
+        } catch {
+            guard outputDeviceID != nil, allowsDefaultFallback else { throw error }
+            voiceAudioLogger.warning(
+                "Selected output device failed; falling back to the system default"
+            )
+            outputDeviceID = nil
+            try startPlaybackGraph(on: nil, reselectCurrentDevice: reselectCurrentDevice)
+        }
+    }
+
+    private func startPlaybackGraph(on deviceID: AudioDeviceID?, reselectCurrentDevice: Bool) throws {
+        guard let resolvedDeviceID = deviceID ?? MediaDeviceCatalog.defaultOutputDeviceID() else {
+            throw VoiceAudioEngineError.outputUnavailable
+        }
+        try MediaDeviceCatalog.selectOutput(
+            resolvedDeviceID,
+            on: playbackEngine,
+            reselectCurrentDevice: reselectCurrentDevice
+        )
+        playbackEngine.mainMixerNode.outputVolume = isDeafened ? 0 : min(max(outputVolume, 0), 2)
+        playbackEngine.prepare()
+        try playbackEngine.start()
+        let format = playbackEngine.mainMixerNode.outputFormat(forBus: 0)
+        voiceAudioLogger.info(
+            "Voice playback graph started; selectedDevice=\(resolvedDeviceID), sampleRate=\(format.sampleRate), channels=\(format.channelCount)"
+        )
+    }
+
+    private func playbackConfigurationChanged() {
+        guard isRunning, !isChangingPlaybackRoute, !playbackEngine.isRunning else { return }
+        voiceAudioLogger.warning(
+            "Core Audio stopped the playback engine after a hardware configuration change"
+        )
+        schedulePlaybackRecovery()
+    }
+
+    private func schedulePlaybackRecovery() {
+        guard playbackRecoveryTask == nil else { return }
+        let generation = outputRouteGeneration
+        playbackRecoveryTask = Task { @MainActor [weak self] in
+            defer {
+                if self?.outputRouteGeneration == generation {
+                    self?.playbackRecoveryTask = nil
+                }
+            }
+            do {
+                try Task.checkCancellation()
+                guard let self,
+                      self.isRunning,
+                      generation == self.outputRouteGeneration
+                else { return }
+                try await self.recoverPlaybackRoute(generation: generation)
+            } catch is CancellationError {
+                return
+            } catch {
+                voiceAudioLogger.error(
+                    "Playback recovery failed: \(String(reflecting: error), privacy: .public)"
+                )
+            }
+        }
+    }
+
+    private func recoverPlaybackRoute(generation: UInt64) async throws {
+        let startedAt = ContinuousClock.now
+        guard generation == outputRouteGeneration else {
+            throw CancellationError()
+        }
+        isChangingPlaybackRoute = true
+        defer {
+            if generation == outputRouteGeneration {
+                isChangingPlaybackRoute = false
+            }
+        }
+        do {
+            // Hardware changes leave connected nodes using their previous formats.
+            // Rebuild on the selected output, including delayed Bluetooth profile changes.
+            tearDownPlaybackGraph()
+            try startPlaybackGraph(allowsDefaultFallback: false, reselectCurrentDevice: false)
+            try await stabilizePlaybackEngine(generation: generation)
+        } catch {
+            guard generation == outputRouteGeneration else {
+                throw CancellationError()
+            }
+            voiceAudioLogger.warning(
+                "Selected output route could not recover; trying the system default"
+            )
+            tearDownPlaybackGraph()
+            outputDeviceID = nil
+            try startPlaybackGraph(allowsDefaultFallback: false)
+            try await stabilizePlaybackEngine(generation: generation)
+        }
+        voiceAudioLogger.info(
+            "Voice playback recovered after a hardware configuration change in \(String(describing: startedAt.duration(to: .now)), privacy: .public)"
+        )
+    }
+
+    private func stabilizePlaybackEngine(
+        generation: UInt64,
+        maximumAttempts: Int = 5
+    ) async throws {
+        var lastError: Error = VoiceAudioEngineError.outputUnavailable
+        for attempt in 0 ..< maximumAttempts {
+            try Task.checkCancellation()
+            guard generation == outputRouteGeneration else {
+                throw CancellationError()
+            }
+            if !playbackEngine.isRunning {
+                do {
+                    tearDownPlaybackGraph()
+                    try startPlaybackGraph(allowsDefaultFallback: false, reselectCurrentDevice: false)
+                    voiceAudioLogger.info(
+                        "Rebuilt playback after configuration change; attempt=\(attempt + 1)"
+                    )
+                } catch {
+                    lastError = error
+                }
+            }
+            if playbackEngine.isRunning {
+                return
+            }
+            // Resume audio immediately on success; back off only while hardware is unavailable.
+            try await Task.sleep(for: .milliseconds(50 + attempt * 50))
+        }
+        throw lastError
+    }
+
+    private func tearDownCaptureGraph() {
+        captureOutput?.setSampleBufferDelegate(nil, queue: nil)
+        captureOutput = nil
+        // Asynchronous so stopRunning never blocks the main actor; later capture
+        // work is queued behind it on the same serial queue.
+        captureQueue.async { [captureSession, captureEncoder] in
+            if captureSession.isRunning {
+                captureSession.stopRunning()
+            }
+            captureSession.beginConfiguration()
+            for input in captureSession.inputs {
+                captureSession.removeInput(input)
+            }
+            for output in captureSession.outputs {
+                captureSession.removeOutput(output)
+            }
+            captureSession.commitConfiguration()
+            // After stopRunning no sample callback is in flight, so stale
+            // samples cannot land after the reset.
+            captureEncoder.reset()
+        }
+    }
+
+    private func tearDownPlaybackGraph() {
+        for player in players.values {
+            player.stop()
+            playbackEngine.disconnectNodeOutput(player)
+            playbackEngine.detach(player)
+        }
+        for id in Array(localSoundboardPlayers.keys) {
+            finishLocalSoundboardPlayback(id: id)
+        }
+        playbackEngine.stop()
+        playbackEngine.reset()
+        players.removeAll()
+        localSoundboardPlayers.removeAll()
+    }
+
+    public func selectInputDevice(_ deviceID: AudioDeviceID?) async throws {
+        guard isRunning else {
+            inputDeviceID = deviceID
+            return
+        }
+        inputRouteGeneration &+= 1
+        let generation = inputRouteGeneration
+        captureRecoveryTask?.cancel()
+        captureRecoveryTask = nil
+        isChangingCaptureRoute = true
+        defer {
+            if generation == inputRouteGeneration {
+                isChangingCaptureRoute = false
+            }
+        }
+        let (input, resolvedDeviceID) = try makeCaptureInput(
+            deviceID: deviceID,
+            allowsDefaultFallback: false
+        )
+        let previous = CaptureInputs()
+        try await onCaptureQueue { [captureSession] in
+            let previousInputs = captureSession.inputs
+            previous.inputs = previousInputs
+            captureSession.beginConfiguration()
+            defer { captureSession.commitConfiguration() }
+            for previousInput in previousInputs {
+                captureSession.removeInput(previousInput)
+            }
+            guard captureSession.canAddInput(input) else {
+                for previousInput in previousInputs where captureSession.canAddInput(previousInput) {
+                    captureSession.addInput(previousInput)
+                }
+                throw VoiceAudioEngineError.inputUnavailable
+            }
+            captureSession.addInput(input)
+        }
+        do {
+            try await stabilizeCaptureSession(generation: generation)
+            inputDeviceID = resolvedDeviceID
+            voiceAudioLogger.info("Voice capture switched without ending the voice session")
+        } catch {
+            guard generation == inputRouteGeneration else {
+                throw CancellationError()
+            }
+            try? await onCaptureQueue { [captureSession] in
+                captureSession.beginConfiguration()
+                defer { captureSession.commitConfiguration() }
+                for currentInput in captureSession.inputs {
+                    captureSession.removeInput(currentInput)
+                }
+                for previousInput in previous.inputs where captureSession.canAddInput(previousInput) {
+                    captureSession.addInput(previousInput)
+                }
+            }
+            try? await stabilizeCaptureSession(generation: generation)
+            throw error
+        }
+    }
+
+    public func selectOutputDevice(_ deviceID: AudioDeviceID?) async throws {
+        guard isRunning else {
+            outputDeviceID = deviceID
+            return
+        }
+        outputRouteGeneration &+= 1
+        let generation = outputRouteGeneration
+        playbackRecoveryTask?.cancel()
+        playbackRecoveryTask = nil
+        let previousDeviceID = outputDeviceID
+        isChangingPlaybackRoute = true
+        defer {
+            if generation == outputRouteGeneration {
+                isChangingPlaybackRoute = false
+            }
+        }
+        tearDownPlaybackGraph()
+        outputDeviceID = deviceID
+        do {
+            try startPlaybackGraph(allowsDefaultFallback: false)
+            try await stabilizePlaybackEngine(generation: generation)
+        } catch {
+            guard generation == outputRouteGeneration else {
+                throw CancellationError()
+            }
+            let selectionError = error
+            tearDownPlaybackGraph()
+            outputDeviceID = previousDeviceID
+            do {
+                try startPlaybackGraph(allowsDefaultFallback: false)
+                try await stabilizePlaybackEngine(generation: generation)
+            } catch {
+                voiceAudioLogger.error(
+                    "Previous output route could not be restored; trying the system default"
+                )
+                tearDownPlaybackGraph()
+                outputDeviceID = nil
+                do {
+                    try startPlaybackGraph(allowsDefaultFallback: false)
+                    try? await stabilizePlaybackEngine(generation: generation)
+                } catch {
+                    voiceAudioLogger.error(
+                        "System-default output route could not be started: \(String(reflecting: error), privacy: .public)"
+                    )
+                }
+            }
+            throw selectionError
+        }
+    }
+
+    public func setParticipantVolume(_ volume: Float, userID: String) {
+        let volume = min(max(volume, 0), 2)
+        participantVolumes[userID] = volume
+        players[userID]?.volume = volume
+    }
+
+    public func play(opusPacket: Data, from userID: String) throws {
+        guard !isDeafened, !isChangingPlaybackRoute else { return }
+        if !playbackEngine.isRunning {
+            schedulePlaybackRecovery()
+            return
+        }
+        let buffer = try codec.decode(opusPacket)
+        let player = try player(for: userID)
+        // The engine can stop during the decode and node setup above; scheduling or
+        // playing on a stopped engine raises an ObjC exception.
+        guard playbackEngine.isRunning else {
+            schedulePlaybackRecovery()
+            return
+        }
+        player.scheduleBuffer(buffer)
+        if !player.isPlaying {
+            do {
+                try player.playAudio()
+            } catch {
+                schedulePlaybackRecovery()
+            }
+        }
+    }
+
+    public func playSoundboardClipLocally(
+        _ clip: SoundboardPCMClip,
+        soundID: String,
+        volume: Float = 1,
+        completion: (@MainActor @Sendable () -> Void)? = nil
+    ) throws {
+        guard !isDeafened, !isChangingPlaybackRoute else {
+            completion?()
+            return
+        }
+        guard playbackEngine.isRunning else {
+            schedulePlaybackRecovery()
+            throw VoiceAudioEngineError.outputUnavailable
+        }
+        let buffer = try clip.audioBuffer()
+        for id in localSoundboardPlayers.compactMap({
+            $0.value.soundID == soundID ? $0.key : nil
+        }) {
+            finishLocalSoundboardPlayback(id: id)
+        }
+        let id = UUID()
+        let player = AVAudioPlayerNode()
+        player.volume = min(max(volume, 0), 2)
+        playbackEngine.attach(player)
+        guard playbackEngine.isRunning else {
+            playbackEngine.detach(player)
+            schedulePlaybackRecovery()
+            throw VoiceAudioEngineError.outputUnavailable
+        }
+        try playbackEngine.connectNode(
+            player,
+            to: playbackEngine.mainMixerNode,
+            format: OpusCodec.pcmFormat
+        )
+        localSoundboardPlayers[id] = LocalSoundboardPlayback(
+            soundID: soundID,
+            player: player,
+            completion: completion
+        )
+        player.scheduleBuffer(
+            buffer,
+            completionCallbackType: .dataPlayedBack
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.finishLocalSoundboardPlayback(id: id)
+            }
+        }
+        guard playbackEngine.isRunning else {
+            finishLocalSoundboardPlayback(id: id)
+            schedulePlaybackRecovery()
+            throw VoiceAudioEngineError.outputUnavailable
+        }
+        do {
+            try player.playAudio()
+        } catch {
+            finishLocalSoundboardPlayback(id: id)
+            throw error
+        }
+    }
+
+    @discardableResult
+    public func enqueueOutgoingSoundboardClip(
+        _ clip: SoundboardPCMClip,
+        soundID: String,
+        volume: Float = 1
+    ) -> Bool {
+        captureEncoder.enqueueInjectedAudio(clip, soundID: soundID, volume: volume)
+    }
+
+    public var hasActiveOutgoingSoundboardAudio: Bool {
+        captureEncoder.hasActiveInjectedAudio
+    }
+
+    public func stopOutgoingSoundboardAudio() {
+        captureEncoder.removeAllInjectedAudio()
+    }
+
+    private func finishLocalSoundboardPlayback(id: UUID) {
+        guard let playback = localSoundboardPlayers.removeValue(forKey: id) else { return }
+        playback.player.stop()
+        playbackEngine.disconnectNodeOutput(playback.player)
+        playbackEngine.detach(playback.player)
+        playback.completion?()
+    }
+
+    private func player(for userID: String) throws -> AVAudioPlayerNode {
+        if let player = players[userID], player.engine === playbackEngine {
+            return player
+        }
+        players[userID] = nil
+        let player = AVAudioPlayerNode()
+        player.volume = participantVolumes[userID] ?? 1
+        playbackEngine.attach(player)
+        try playbackEngine.connectNode(player, to: playbackEngine.mainMixerNode, format: OpusCodec.pcmFormat)
+        players[userID] = player
+        return player
+    }
+
+    private func applyOutputVolume() {
+        playbackEngine.mainMixerNode.outputVolume = isDeafened ? 0 : min(max(outputVolume, 0), 2)
+    }
+}
+
+final class OpusSampleBufferEncoder: NSObject,
+    AVCaptureAudioDataOutputSampleBufferDelegate,
+    @unchecked Sendable
+{
+    var handler: (@Sendable (CapturedOpusFrame) -> Void)? {
+        get { lock.withLock { _handler } }
+        set { lock.withLock { _handler = newValue } }
+    }
+
+    var inputVolume: Float {
+        get { lock.withLock { _inputVolume } }
+        set { lock.withLock { _inputVolume = newValue } }
+    }
+
+    var isMuted: Bool {
+        get { lock.withLock { _isMuted } }
+        set { lock.withLock { _isMuted = newValue } }
+    }
+
+    var levelHandler: (@Sendable (Float) -> Void)? {
+        get { lock.withLock { _levelHandler } }
+        set { lock.withLock { _levelHandler = newValue } }
+    }
+
+    private let codec: OpusCodec
+    private let activityThreshold: Float
+    private let lock = NSLock()
+    private let soundboardMixer = OutgoingSoundboardMixer()
+    private var converter: AVAudioConverter?
+    private var left: [Float] = []
+    private var right: [Float] = []
+    private var bufferedSampleOffset = 0
+    private var encodedSampleOffset: UInt64 = 0
+    private var _handler: (@Sendable (CapturedOpusFrame) -> Void)?
+    private var _levelHandler: (@Sendable (Float) -> Void)?
+    private var _inputVolume: Float = 1
+    private var _isMuted = false
+
+    init(codec: OpusCodec, activityThreshold: Float = 0.003) {
+        self.codec = codec
+        self.activityThreshold = activityThreshold
+        super.init()
+    }
+
+    convenience init(bitRate: Int = 64_000, activityThreshold: Float = 0.003) throws {
+        try self.init(
+            codec: OpusCodec(bitRate: bitRate),
+            activityThreshold: activityThreshold
+        )
+    }
+
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        process(sampleBuffer)
+    }
+
+    func process(_ sampleBuffer: CMSampleBuffer) {
+        guard let description = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
+        guard let format = AVAudioFormat(formatDescription: description) else { return }
+        let frameCount = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
+        guard frameCount > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
+        buffer.frameLength = frameCount
+        guard CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sampleBuffer,
+            at: 0,
+            frameCount: Int32(frameCount),
+            into: buffer.mutableAudioBufferList
+        ) == noErr else { return }
+        process(buffer)
+    }
+
+    func configure(inputFormat: AVAudioFormat) throws {
+        try lock.withLock {
+            if let converter, converter.inputFormat == inputFormat {
+                return
+            }
+            guard let converter = AVAudioConverter(from: inputFormat, to: OpusCodec.pcmFormat) else {
+                throw VoiceAudioEngineError.converterUnavailable
+            }
+            self.converter = converter
+            left.removeAll(keepingCapacity: true)
+            right.removeAll(keepingCapacity: true)
+            bufferedSampleOffset = 0
+        }
+    }
+
+    func reset() {
+        lock.withLock {
+            left.removeAll(keepingCapacity: true)
+            right.removeAll(keepingCapacity: true)
+            bufferedSampleOffset = 0
+        }
+    }
+
+    @discardableResult
+    func enqueueInjectedAudio(
+        _ clip: SoundboardPCMClip,
+        soundID: String,
+        volume: Float
+    ) -> Bool {
+        soundboardMixer.enqueue(clip, soundID: soundID, volume: volume)
+    }
+
+    var hasActiveInjectedAudio: Bool { soundboardMixer.hasActiveAudio }
+
+    func removeAllInjectedAudio() {
+        soundboardMixer.removeAll()
+    }
+
+    func process(_ input: AVAudioPCMBuffer) {
+        do { try configure(inputFormat: input.format) } catch { return }
+        let result: (frames: [CapturedOpusFrame], level: Float) = lock.withLock {
+            guard let converter else { return ([], 0) }
+            let ratio = OpusCodec.sampleRate / input.format.sampleRate
+            let capacity = AVAudioFrameCount(ceil(Double(input.frameLength) * ratio)) + 32
+            guard let converted = AVAudioPCMBuffer(
+                pcmFormat: OpusCodec.pcmFormat,
+                frameCapacity: capacity
+            ) else { return ([], 0) }
+            var supplied = false
+            var error: NSError?
+            _ = converter.convert(to: converted, error: &error) { _, status in
+                guard !supplied else {
+                    status.pointee = .noDataNow
+                    return nil
+                }
+                supplied = true
+                status.pointee = .haveData
+                return input
+            }
+            guard error == nil,
+                  let channels = converted.floatChannelData,
+                  converted.frameLength > 0 else { return ([], 0) }
+            left.append(contentsOf: UnsafeBufferPointer(start: channels[0], count: Int(converted.frameLength)))
+            right.append(contentsOf: UnsafeBufferPointer(start: channels[1], count: Int(converted.frameLength)))
+
+            var output: [CapturedOpusFrame] = []
+            var maximumLevel: Float = 0
+            let frameCount = Int(OpusCodec.frameSamples)
+            while left.count - bufferedSampleOffset >= frameCount,
+                  right.count - bufferedSampleOffset >= frameCount
+            {
+                guard let pcm = AVAudioPCMBuffer(pcmFormat: OpusCodec.pcmFormat, frameCapacity: OpusCodec.frameSamples),
+                      let outputChannels = pcm.floatChannelData else { break }
+                pcm.frameLength = OpusCodec.frameSamples
+                var microphoneEnergy: Float = 0
+                for index in 0 ..< frameCount {
+                    let bufferedIndex = bufferedSampleOffset + index
+                    let leftSample = _isMuted ? 0 : left[bufferedIndex] * _inputVolume
+                    let rightSample = _isMuted ? 0 : right[bufferedIndex] * _inputVolume
+                    outputChannels[0][index] = leftSample
+                    outputChannels[1][index] = rightSample
+                    microphoneEnergy += leftSample * leftSample + rightSample * rightSample
+                }
+                let containsInjectedAudio = soundboardMixer.mix(
+                    into: outputChannels[0],
+                    outputChannels[1],
+                    count: frameCount
+                )
+                bufferedSampleOffset += frameCount
+                if let packet = try? codec.encode(pcm) {
+                    encodedSampleOffset &+= UInt64(frameCount)
+                    let rms = sqrt(microphoneEnergy / Float(frameCount * 2))
+                    let containsMicrophoneVoice = !_isMuted && rms > activityThreshold
+                    maximumLevel = max(maximumLevel, Self.normalizedLevel(rms: rms))
+                    output.append(CapturedOpusFrame(
+                        data: packet,
+                        containsVoice: containsMicrophoneVoice || containsInjectedAudio,
+                        sampleOffset: encodedSampleOffset,
+                        containsMicrophoneVoice: containsMicrophoneVoice,
+                        containsInjectedAudio: containsInjectedAudio
+                    ))
+                }
+            }
+            compactBufferedSamples(frameCount: frameCount)
+            return (output, maximumLevel)
+        }
+        let handler = handler
+        for frame in result.frames {
+            handler?(frame)
+        }
+        levelHandler?(result.level)
+    }
+
+    private static func normalizedLevel(rms: Float) -> Float {
+        guard rms > 0 else { return 0 }
+        let decibels = 20 * log10(rms)
+        return min(max((decibels + 60) / 60, 0), 1)
+    }
+
+    private func compactBufferedSamples(frameCount: Int) {
+        guard bufferedSampleOffset > 0 else { return }
+        if bufferedSampleOffset == left.count {
+            left.removeAll(keepingCapacity: true)
+            right.removeAll(keepingCapacity: true)
+            bufferedSampleOffset = 0
+        } else if bufferedSampleOffset >= frameCount * 4 {
+            left.removeFirst(bufferedSampleOffset)
+            right.removeFirst(bufferedSampleOffset)
+            bufferedSampleOffset = 0
+        }
+    }
+}
+
+public enum VoiceAudioEngineError: Error, Equatable {
+    case inputUnavailable
+    case outputUnavailable
+    case converterUnavailable
+}
+
+extension VoiceAudioEngineError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .inputUnavailable:
+            "The selected microphone is not available."
+        case .outputUnavailable:
+            "The selected speaker is not available."
+        case .converterUnavailable:
+            "The selected microphone uses an unsupported audio format."
+        }
+    }
+}

@@ -1,0 +1,1225 @@
+import AppKit
+import CoreText
+import DiscordProtocol
+import Foundation
+import MessageRendering
+import SakuraCordModels
+
+nonisolated enum MemberStoreMerge {
+    static func merging(
+        existing: [UserID: Member],
+        updates: [Member]
+    ) -> [UserID: Member] {
+        var result = existing
+        for var member in updates {
+            if member.memberListIndex == nil {
+                member.memberListIndex = result[member.id]?.memberListIndex
+            }
+            result[member.id] = member
+        }
+        return result
+    }
+}
+
+actor OfflineCredentialStore: CredentialStore {
+    func store(_ credential: Data, accountID: String) async throws -> CredentialHandle {
+        throw ChatProviderError.invalidRequest(
+            "Credential storage is unavailable in offline testing mode.")
+    }
+
+    func credential(for handle: CredentialHandle) async throws -> Data {
+        throw ChatProviderError.invalidRequest(
+            "Credentials are unavailable in offline testing mode.")
+    }
+
+    func remove(_ handle: CredentialHandle) async throws {}
+
+    func handles() async throws -> [CredentialHandle] {
+        []
+    }
+}
+
+nonisolated final class NativeTimelineAttributedTextBox: @unchecked Sendable {
+    let value: NSAttributedString
+    let framesetter: CTFramesetter
+    let layoutHeightAdjustment: CGFloat
+
+    nonisolated init(
+        _ value: NSAttributedString,
+        layoutHeightAdjustment: CGFloat = 0
+    ) {
+        self.value = value
+        self.layoutHeightAdjustment = layoutHeightAdjustment
+        framesetter = CTFramesetterCreateWithAttributedString(value)
+    }
+}
+
+struct NativeTimelineTextPlan: Equatable, Sendable {
+    let preparedText: RichMessageAttributedText.Prepared?
+    let linkedImages: [LinkedImageReference]
+    let attributedText: NativeTimelineAttributedTextBox?
+    let baseFontSize: CGFloat
+
+    nonisolated static func == (
+        lhs: NativeTimelineTextPlan,
+        rhs: NativeTimelineTextPlan
+    ) -> Bool {
+        lhs.preparedText == rhs.preparedText
+            && lhs.linkedImages == rhs.linkedImages
+            && lhs.baseFontSize == rhs.baseFontSize
+    }
+
+    nonisolated static func make(
+        for message: Message,
+        currentUserID: UserID? = nil,
+        systemRecipient: User? = nil,
+        systemActorColor: NSColor? = nil,
+        systemLinkColor: NSColor? = nil
+    ) -> Self {
+        let baseFontSize: CGFloat =
+            if message.type.hasGeneratedContent {
+                13
+            } else {
+                15
+            }
+        let visibleContent =
+            if message.type.hasGeneratedContent {
+                SystemMessagePresentation.label(
+                    for: message,
+                    currentUserID: currentUserID,
+                    recipient: systemRecipient
+                )
+            } else {
+                MessageEmbedPresentation.visibleMessageContent(
+                    for: message
+                )
+            }
+        let linkedPresentation = LinkedImagePresentation(content: visibleContent)
+        let prepared = linkedPresentation.visibleText.isEmpty
+            ? nil
+            : RichMessageAttributedText.prepare(
+                source: linkedPresentation.visibleText
+            )
+        // Embed descriptions and field values are parsed again when their
+        // width-dependent Core Text boxes are built. Prime the bounded,
+        // process-local parse cache while message rows are already being
+        // prepared off-main so a cold rich channel cannot move markdown
+        // tokenization back onto the UI thread during first layout.
+        for embed in MessageEmbedPresentation.visibleEmbeds(
+            for: message
+        ) {
+            if let description = embed.description {
+                _ = RichMessageAttributedText.prepare(source: description)
+            }
+            for field in embed.fields {
+                _ = RichMessageAttributedText.prepare(source: field.value)
+            }
+        }
+        let attributed: NativeTimelineAttributedTextBox?
+        if message.type.hasGeneratedContent {
+            attributed = NativeTimelineAttributedTextBox(
+                SystemMessagePresentation.attributedLabel(
+                    for: message,
+                    currentUserID: currentUserID,
+                    recipient: systemRecipient,
+                    baseFontSize: baseFontSize,
+                    actorColor: systemActorColor,
+                    linkColor: systemLinkColor
+                )
+            )
+        } else if let prepared, prepared.tokens.isEmpty {
+            attributed = NativeTimelineAttributedTextBox(
+                DiscordMarkdown.appKitAttributed(
+                    prepared.markdownPlan,
+                    baseFontSize: prepared.isEmojiOnly
+                        ? 48
+                        : baseFontSize,
+                    usesMessageLineHeight: !prepared.isEmojiOnly,
+                    reservesCodeCopyButton: true
+                )
+            )
+        } else {
+            attributed = nil
+        }
+        return Self(
+            preparedText: prepared,
+            linkedImages: linkedPresentation.images,
+            attributedText: attributed,
+            baseFontSize: baseFontSize
+        )
+    }
+}
+
+nonisolated struct MessageSearchRowContext: Equatable, Sendable {
+    let channelID: ChannelID
+    let sectionTitle: String
+    let sectionSubtitle: String?
+    let systemImage: String
+    let showsSectionHeader: Bool
+    var isInbox: Bool = false
+}
+
+nonisolated enum MessageRowIdentity: Hashable, Sendable {
+    case server(channelID: ChannelID, messageID: MessageID)
+    case outgoing(channelID: ChannelID, nonce: String)
+
+    init(_ message: Message) {
+        if let nonce = message.nonce {
+            self = .outgoing(channelID: message.channelID, nonce: nonce)
+        } else {
+            self = .server(
+                channelID: message.channelID,
+                messageID: message.id
+            )
+        }
+    }
+}
+
+final class MessageRowPresentation: Identifiable, Equatable, Sendable {
+    var id: MessageID {
+        message.id
+    }
+
+    let message: Message
+    let startsGroup: Bool
+    let endsGroup: Bool
+    let startsDay: Bool
+    let replyPreview: MessageReplyPreview?
+    let isReplyAvailable: Bool
+    let textPlan: NativeTimelineTextPlan
+    let sakuraCordDeepLinks: [SakuraCordDeepLink]
+    let serverInvites: [ServerInviteReference]
+    let searchContext: MessageSearchRowContext?
+    let pinnedAt: Date?
+    let isResource: Bool
+
+    nonisolated var identity: MessageRowIdentity {
+        MessageRowIdentity(message)
+    }
+
+    /// A row in its own channel or thread, not a search, pin or Guide entry.
+    nonisolated var isConversationRow: Bool {
+        searchContext == nil && pinnedAt == nil && !isResource
+    }
+
+    var replyMessageID: MessageID? {
+        guard MessageReplyPresentationPolicy.showsPreview(for: message) else {
+            return nil
+        }
+        return message.replyTo ?? replyPreview?.messageID
+    }
+
+    nonisolated init(
+        message: Message,
+        startsGroup: Bool,
+        endsGroup: Bool = true,
+        startsDay: Bool,
+        replyPreview: MessageReplyPreview?,
+        isReplyAvailable: Bool,
+        textPlan: NativeTimelineTextPlan? = nil,
+        searchContext: MessageSearchRowContext? = nil,
+        pinnedAt: Date? = nil,
+        isResource: Bool = false
+    ) {
+        self.message = message
+        self.isResource = isResource
+        self.startsGroup = startsGroup
+        self.endsGroup = endsGroup
+        self.startsDay = startsDay
+        if MessageReplyPresentationPolicy.showsPreview(for: message) {
+            self.replyPreview = replyPreview
+            self.isReplyAvailable = isReplyAvailable
+        } else {
+            self.replyPreview = nil
+            self.isReplyAvailable = false
+        }
+        self.textPlan = textPlan ?? NativeTimelineTextPlan.make(for: message)
+        serverInvites = DiscordMarkdown.serverInviteReferences(in: message.content)
+        sakuraCordDeepLinks = SakuraCordDeepLinkPresentation.all(
+            in: message.content
+        )
+        self.searchContext = searchContext
+        self.pinnedAt = pinnedAt
+    }
+
+    /// The row with its own author header, as after a NEW divider, which
+    /// breaks a group like Discord's.
+    nonisolated func startingGroup() -> MessageRowPresentation {
+        guard !startsGroup else { return self }
+        return MessageRowPresentation(
+            message: message,
+            startsGroup: true,
+            endsGroup: endsGroup,
+            startsDay: startsDay,
+            replyPreview: replyPreview,
+            isReplyAvailable: isReplyAvailable,
+            textPlan: textPlan,
+            searchContext: searchContext,
+            pinnedAt: pinnedAt,
+            isResource: isResource
+        )
+    }
+
+    nonisolated static func == (
+        lhs: MessageRowPresentation,
+        rhs: MessageRowPresentation
+    ) -> Bool {
+        if lhs === rhs {
+            return true
+        }
+        return lhs.message == rhs.message
+            && lhs.startsGroup == rhs.startsGroup
+            && lhs.endsGroup == rhs.endsGroup
+            && lhs.startsDay == rhs.startsDay
+            && lhs.replyPreview == rhs.replyPreview
+            && lhs.isReplyAvailable == rhs.isReplyAvailable
+            && lhs.textPlan == rhs.textPlan
+            && lhs.sakuraCordDeepLinks == rhs.sakuraCordDeepLinks
+            && lhs.searchContext == rhs.searchContext
+            && lhs.pinnedAt == rhs.pinnedAt
+            && lhs.isResource == rhs.isResource
+    }
+}
+
+nonisolated enum MessageReplyPresentationPolicy {
+    static func allowsReplyAction(for message: Message) -> Bool {
+        !message.flags.contains(.ephemeral) && (!message.type.hasGeneratedContent || message.type == .userJoin)
+    }
+
+    static func showsPreview(for message: Message) -> Bool {
+        message.type != .channelPinnedMessage
+    }
+}
+
+nonisolated enum PinnedMessagePresentation {
+    static func reusingRows(
+        oldItems: [PinnedMessage],
+        oldRows: [MessageRowPresentation],
+        for newItems: [PinnedMessage]
+    ) -> [MessageRowPresentation] {
+        if newItems.count >= oldItems.count,
+           newItems.starts(with: oldItems)
+        {
+            return oldRows + rows(
+                for: Array(newItems.dropFirst(oldItems.count))
+            )
+        }
+        let oldPresentationsByID = Dictionary(
+            uniqueKeysWithValues: zip(oldItems, oldRows).map {
+                ($0.id, (item: $0, row: $1))
+            }
+        )
+        return newItems.map { item in
+            if let existing = oldPresentationsByID[item.id],
+               existing.item == item
+            {
+                return existing.row
+            }
+            return row(for: item)
+        }
+    }
+
+    static func rows(for items: [PinnedMessage]) -> [MessageRowPresentation] {
+        items.map(row(for:))
+    }
+
+    static func row(for item: PinnedMessage) -> MessageRowPresentation {
+        MessageRowPresentation(
+            message: item.message,
+            startsGroup: true,
+            startsDay: false,
+            replyPreview: item.message.replyPreview,
+            isReplyAvailable: item.message.replyPreview != nil,
+            pinnedAt: item.pinnedAt
+        )
+    }
+}
+
+nonisolated enum MessageSearchPresentation {
+    static func rows(
+        for page: MessageSearchPage,
+        channelsByID: [ChannelID: Channel]
+    ) -> [MessageRowPresentation] {
+        var previousChannelID: ChannelID?
+        return page.results.map { result in
+            let message = result.hit
+            let channel = channelsByID[message.channelID]
+            let contextMessagesByID = Dictionary(
+                uniqueKeysWithValues: result.messages.map { ($0.id, $0) }
+            )
+            let replyPreview = message.replyTo.flatMap { replyID in
+                contextMessagesByID[replyID].map(MessageReplyPreview.init(message:))
+                    ?? message.replyPreview
+            }
+            let showsSectionHeader = previousChannelID != message.channelID
+            previousChannelID = message.channelID
+            return MessageRowPresentation(
+                message: message,
+                startsGroup: true,
+                startsDay: false,
+                replyPreview: replyPreview,
+                isReplyAvailable: replyPreview != nil,
+                searchContext: MessageSearchRowContext(
+                    channelID: message.channelID,
+                    sectionTitle: sectionTitle(for: channel, message: message),
+                    sectionSubtitle: channel?.category,
+                    systemImage: sectionSystemImage(for: channel, channelsByID: channelsByID),
+                    showsSectionHeader: showsSectionHeader
+                )
+            )
+        }
+    }
+
+    private static func sectionTitle(
+        for channel: Channel?,
+        message: Message
+    ) -> String {
+        guard let channel else {
+            return "Channel \(message.channelID.description.suffix(6))"
+        }
+        // The section symbol already identifies the channel type.
+        return channel.name
+    }
+
+    private static func sectionSystemImage(
+        for channel: Channel?,
+        channelsByID: [ChannelID: Channel]
+    ) -> String {
+        // A thread's parent is a conversation channel rather than a category,
+        // and it takes the same symbol as its toolbar title.
+        if let parentID = channel?.categoryID, let parent = channelsByID[parentID] {
+            switch parent.kind {
+            case .forum: return "bubble.left.and.bubble.right.fill"
+            case .text, .announcement: return SakuraCordSystemSymbol.thread
+            case .voice, .directMessage, .groupDirectMessage, .unknown: break
+            }
+        }
+        switch channel?.kind {
+        case .directMessage:
+            return "at"
+        case .groupDirectMessage:
+            return "person.2.fill"
+        case .announcement:
+            return "megaphone.fill"
+        case .forum:
+            return "bubble.left.and.bubble.right.fill"
+        case .voice:
+            return "bubble.left.fill"
+        default:
+            return "number"
+        }
+    }
+}
+
+nonisolated enum MessageGrouping {
+    /// Discord's current cozy layout uses a seven-minute continuation barrier.
+    static let defaultContinuationInterval: TimeInterval = 7 * 60
+
+    static func rows(
+        for messages: [Message],
+        calendar: Calendar = .autoupdatingCurrent,
+        continuationInterval: TimeInterval = defaultContinuationInterval
+    )
+        -> [MessageRowPresentation]
+    {
+        let messagesByID = messageLookup(for: messages)
+        return messages.indices.map { index in
+            row(
+                at: index,
+                in: messages,
+                messagesByID: messagesByID,
+                calendar: calendar,
+                continuationInterval: continuationInterval
+            )
+        }
+    }
+
+    static func rowsCooperatively(
+        for messages: [Message],
+        calendar: Calendar = .autoupdatingCurrent,
+        continuationInterval: TimeInterval = defaultContinuationInterval,
+        batchSize: Int = 4,
+        checkpoint: (@Sendable (Int) async -> Void)? = nil
+    ) async -> [MessageRowPresentation] {
+        guard !Task.isCancelled else { return [] }
+        let messagesByID = messageLookup(for: messages)
+        let batchSize = max(1, batchSize)
+        var result: [MessageRowPresentation] = []
+        result.reserveCapacity(messages.count)
+        for index in messages.indices {
+            guard !Task.isCancelled else { return [] }
+            result.append(
+                autoreleasepool {
+                    row(
+                        at: index,
+                        in: messages,
+                        messagesByID: messagesByID,
+                        calendar: calendar,
+                        continuationInterval: continuationInterval
+                    )
+                }
+            )
+            if let checkpoint { await checkpoint(index + 1) }
+            if (index + 1).isMultiple(of: batchSize),
+               index + 1 < messages.endIndex
+            {
+                await Task.yield()
+            }
+        }
+        return result
+    }
+
+    private static func messageLookup(
+        for messages: [Message]
+    ) -> [MessageID: Message] {
+        guard messages.contains(where: { $0.replyTo != nil }) else {
+            return [:]
+        }
+        return Dictionary(
+            messages.map { ($0.id, $0) },
+            uniquingKeysWith: { _, newer in newer }
+        )
+    }
+
+    private static func row(
+        at index: Int,
+        in messages: [Message],
+        messagesByID: [MessageID: Message],
+        calendar: Calendar,
+        continuationInterval: TimeInterval
+    ) -> MessageRowPresentation {
+        let message = messages[index]
+        let replyPreview =
+            message.replyTo.flatMap { messageID -> MessageReplyPreview? in
+                if let referenced = messagesByID[messageID] {
+                    return MessageReplyPreview(message: referenced)
+                }
+                return message.replyPreview
+            }
+        let endsGroup = endsGroup(
+            at: index,
+            in: messages,
+            calendar: calendar,
+            continuationInterval: continuationInterval
+        )
+        guard index > 0 else {
+            return MessageRowPresentation(
+                message: message,
+                startsGroup: true,
+                endsGroup: endsGroup,
+                startsDay: true,
+                replyPreview: replyPreview,
+                isReplyAvailable:
+                    replyPreview.map {
+                        messagesByID[$0.messageID] != nil
+                    } ?? false
+            )
+        }
+        let previous = messages[index - 1]
+        return MessageRowPresentation(
+            message: message,
+            startsGroup: !continuesGroup(
+                from: previous,
+                to: message,
+                calendar: calendar,
+                continuationInterval: continuationInterval
+            ),
+            endsGroup: endsGroup,
+            startsDay: !calendar.isDate(
+                previous.timestamp,
+                inSameDayAs: message.timestamp
+            ),
+            replyPreview: replyPreview,
+            isReplyAvailable:
+                replyPreview.map {
+                    messagesByID[$0.messageID] != nil
+                } ?? false
+        )
+    }
+
+    /// Guide resources read as a document: every message is an ungrouped,
+    /// undated row without reply previews.
+    static func resourceRow(for message: Message) -> MessageRowPresentation {
+        MessageRowPresentation(
+            message: message,
+            startsGroup: false,
+            startsDay: false,
+            replyPreview: nil,
+            isReplyAvailable: false,
+            isResource: true
+        )
+    }
+
+    /// Resource rows for `messages`, reusing each unchanged existing row.
+    static func resourceRows(
+        for messages: [Message],
+        reusing existing: [MessageRowPresentation]
+    ) -> [MessageRowPresentation] {
+        let existingByID = Dictionary(existing.map { ($0.message.id, $0) }, uniquingKeysWith: { _, newer in newer })
+        return messages.map { message in
+            if let row = existingByID[message.id], row.message == message { return row }
+            return resourceRow(for: message)
+        }
+    }
+
+    private static func isGroupable(_ message: Message) -> Bool {
+        !message.type.hasGeneratedContent && message.type != .chatInputCommand
+            && message.type != .autoModerationAction
+    }
+
+    static func appendingRow(
+        for message: Message,
+        after previous: Message?,
+        before next: Message? = nil,
+        replyPreview: MessageReplyPreview?,
+        isReplyAvailable: Bool,
+        textPlan: NativeTimelineTextPlan? = nil,
+        calendar: Calendar = .autoupdatingCurrent,
+        continuationInterval: TimeInterval = defaultContinuationInterval
+    ) -> MessageRowPresentation {
+        let endsGroup = next.map {
+            !continuesGroup(
+                from: message,
+                to: $0,
+                calendar: calendar,
+                continuationInterval: continuationInterval
+            )
+        } ?? true
+        guard let previous else {
+            return MessageRowPresentation(
+                message: message,
+                startsGroup: true,
+                endsGroup: endsGroup,
+                startsDay: true,
+                replyPreview: replyPreview,
+                isReplyAvailable: isReplyAvailable,
+                textPlan: textPlan
+            )
+        }
+        return MessageRowPresentation(
+            message: message,
+            startsGroup: !continuesGroup(
+                from: previous,
+                to: message,
+                calendar: calendar,
+                continuationInterval: continuationInterval
+            ),
+            endsGroup: endsGroup,
+            startsDay: !calendar.isDate(
+                previous.timestamp,
+                inSameDayAs: message.timestamp
+            ),
+            replyPreview: replyPreview,
+            isReplyAvailable: isReplyAvailable,
+            textPlan: textPlan
+        )
+    }
+
+    static func reconcileChangedMessage(
+        id changedID: MessageID,
+        replacement: Message?,
+        messages: [Message],
+        availableMessageIDs: Set<MessageID>,
+        rows: inout [MessageRowPresentation],
+        neighborIndex: Int? = nil,
+        messageIndex: ((MessageID) -> Int?)? = nil,
+        replyingMessageIDs: Set<MessageID>? = nil,
+        replacementTextPlan: NativeTimelineTextPlan? = nil,
+        calendar: Calendar = .autoupdatingCurrent,
+        continuationInterval: TimeInterval = defaultContinuationInterval
+    ) -> IndexSet {
+        guard rows.count == messages.count else {
+            rows = self.rows(
+                for: messages,
+                calendar: calendar,
+                continuationInterval: continuationInterval
+            )
+            return IndexSet(integersIn: messages.indices)
+        }
+        var affected = IndexSet()
+        if let replacement,
+           let index =
+                messageIndex?(replacement.id)
+                ?? messages.firstIndex(where: { $0.id == replacement.id })
+        {
+            affected.insert(index)
+            if messages.indices.contains(index - 1) {
+                affected.insert(index - 1)
+            }
+            if messages.indices.contains(index + 1) {
+                affected.insert(index + 1)
+            }
+        } else if let neighborIndex {
+            // Deletion changes the group boundary on both sides of the gap.
+            if messages.indices.contains(neighborIndex - 1) {
+                affected.insert(neighborIndex - 1)
+            }
+            if messages.indices.contains(neighborIndex) {
+                affected.insert(neighborIndex)
+            }
+        }
+        if let replyingMessageIDs, let messageIndex {
+            for replyingMessageID in replyingMessageIDs {
+                if let index = messageIndex(replyingMessageID) {
+                    affected.insert(index)
+                }
+            }
+        } else {
+            for index in messages.indices
+            where messages[index].replyTo == changedID {
+                affected.insert(index)
+            }
+        }
+
+        for index in affected {
+            let message = messages[index]
+            let priorRow = rows[index]
+            let replyPreview: MessageReplyPreview?
+            if message.replyTo == changedID, let replacement {
+                replyPreview = MessageReplyPreview(message: replacement)
+            } else {
+                replyPreview = message.replyPreview ?? priorRow.replyPreview
+            }
+            let startsGroup: Bool
+            let startsDay: Bool
+            if index == messages.startIndex {
+                startsGroup = true
+                startsDay = true
+            } else {
+                startsGroup = !continuesGroup(
+                    from: messages[index - 1],
+                    to: message,
+                    calendar: calendar,
+                    continuationInterval: continuationInterval
+                )
+                startsDay = !calendar.isDate(
+                    messages[index - 1].timestamp,
+                    inSameDayAs: message.timestamp
+                )
+            }
+            rows[index] = MessageRowPresentation(
+                message: message,
+                startsGroup: startsGroup,
+                endsGroup: endsGroup(
+                    at: index,
+                    in: messages,
+                    calendar: calendar,
+                    continuationInterval: continuationInterval
+                ),
+                startsDay: startsDay,
+                replyPreview: replyPreview,
+                isReplyAvailable:
+                    replyPreview.map {
+                        availableMessageIDs.contains($0.messageID)
+                    } ?? false,
+                textPlan:
+                    priorRow.message == message
+                    ? priorRow.textPlan
+                    : message.id == replacement?.id
+                    ? replacementTextPlan
+                    : nil
+            )
+        }
+        return affected
+    }
+
+    static func prependRows(
+        for insertedMessages: [Message],
+        into existingRows: inout [MessageRowPresentation],
+        preparedInsertedRows: [MessageRowPresentation]? = nil,
+        existingMessageIndex: ((MessageID) -> Int?)? = nil,
+        replyingMessageIDsByTarget:
+            [MessageID: Set<MessageID>]? = nil,
+        calendar: Calendar = .autoupdatingCurrent,
+        continuationInterval: TimeInterval = defaultContinuationInterval
+    ) {
+        guard !insertedMessages.isEmpty else { return }
+        var insertedRows =
+            if let preparedInsertedRows,
+               preparedInsertedRows.count == insertedMessages.count,
+               zip(preparedInsertedRows, insertedMessages).allSatisfy({ pair in
+                   pair.0.message.id == pair.1.id
+               })
+            {
+                preparedInsertedRows
+            } else {
+                rows(
+                    for: insertedMessages,
+                    calendar: calendar,
+                    continuationInterval: continuationInterval
+                )
+            }
+        guard !existingRows.isEmpty else {
+            existingRows = insertedRows
+            return
+        }
+
+        let insertedByID = Dictionary(
+            uniqueKeysWithValues: insertedMessages.map { ($0.id, $0) }
+        )
+        let insertedLast = insertedMessages[insertedMessages.count - 1]
+        connectPrependingRows(
+            &insertedRows,
+            to: existingRows[0].message,
+            calendar: calendar,
+            continuationInterval: continuationInterval
+        )
+
+        var affectedExistingIndexes = IndexSet(integer: 0)
+        if let existingMessageIndex,
+           let replyingMessageIDsByTarget
+        {
+            for insertedMessage in insertedMessages {
+                for replyingMessageID in
+                    replyingMessageIDsByTarget[insertedMessage.id] ?? []
+                {
+                    if let index = existingMessageIndex(replyingMessageID) {
+                        affectedExistingIndexes.insert(index)
+                    }
+                }
+            }
+        } else {
+            for (index, row) in existingRows.enumerated()
+            where row.message.replyTo.map({
+                insertedByID[$0] != nil
+            }) == true {
+                affectedExistingIndexes.insert(index)
+            }
+        }
+
+        var replacements: [(index: Int, row: MessageRowPresentation)] = []
+        replacements.reserveCapacity(affectedExistingIndexes.count)
+        for index in affectedExistingIndexes
+        where existingRows.indices.contains(index) {
+            let row = existingRows[index]
+            let message = row.message
+            let referenced = message.replyTo.flatMap { insertedByID[$0] }
+            let replyPreview =
+                referenced.map {
+                    MessageReplyPreview(message: $0)
+                } ?? row.replyPreview
+            let startsGroup =
+                index == 0
+                ? !continuesGroup(
+                    from: insertedLast,
+                    to: message,
+                    calendar: calendar,
+                    continuationInterval: continuationInterval
+                )
+                : row.startsGroup
+            let startsDay =
+                index == 0
+                ? !calendar.isDate(
+                    insertedLast.timestamp,
+                    inSameDayAs: message.timestamp
+                )
+                : row.startsDay
+            replacements.append(
+                (
+                    index,
+                    MessageRowPresentation(
+                        message: message,
+                        startsGroup: startsGroup,
+                        endsGroup: row.endsGroup,
+                        startsDay: startsDay,
+                        replyPreview: replyPreview,
+                        isReplyAvailable:
+                            referenced != nil || row.isReplyAvailable,
+                        textPlan: row.textPlan
+                    )
+                )
+            )
+        }
+        // Mutate the existing buffer so its geometric spare capacity is
+        // reused across pagination. Rebuilding an exact-sized row array for
+        // every 50-message page left one progressively larger 4–9 MB malloc
+        // region behind per page, producing both the periodic hitch and a
+        // hundreds-of-megabytes allocator high-water mark after long runs.
+        existingRows.insert(contentsOf: insertedRows, at: 0)
+        for replacement in replacements {
+            existingRows[insertedMessages.count + replacement.index] =
+                replacement.row
+        }
+    }
+
+    static func appendRows(
+        for insertedMessages: [Message],
+        into existingRows: inout [MessageRowPresentation],
+        after previousMessage: Message?,
+        preparedInsertedRows: [MessageRowPresentation]? = nil,
+        existingMessage: ((MessageID) -> Message?)? = nil,
+        calendar: Calendar = .autoupdatingCurrent,
+        continuationInterval: TimeInterval = defaultContinuationInterval
+    ) {
+        guard !insertedMessages.isEmpty else { return }
+        var insertedRows =
+            if let preparedInsertedRows,
+               preparedInsertedRows.count == insertedMessages.count,
+               zip(preparedInsertedRows, insertedMessages).allSatisfy({ pair in
+                   pair.0.message.id == pair.1.id
+               })
+            {
+                preparedInsertedRows
+            } else {
+                rows(
+                    for: insertedMessages,
+                    calendar: calendar,
+                    continuationInterval: continuationInterval
+                )
+            }
+
+        if let lastIndex = existingRows.indices.last,
+           let previousMessage,
+           previousMessage.id == existingRows[lastIndex].message.id
+        {
+            existingRows[lastIndex] = replacingGroupEdges(
+                of: existingRows[lastIndex],
+                endsGroup: !continuesGroup(
+                    from: previousMessage,
+                    to: insertedMessages[insertedMessages.startIndex],
+                    calendar: calendar,
+                    continuationInterval: continuationInterval
+                )
+            )
+        }
+
+        for index in insertedMessages.indices {
+            let message = insertedMessages[index]
+            let prepared = insertedRows[index]
+            let predecessor =
+                index == insertedMessages.startIndex
+                    ? previousMessage
+                    : insertedMessages[index - 1]
+            let referenced = message.replyTo.flatMap { existingMessage?($0) }
+            insertedRows[index] = appendingRow(
+                for: message,
+                after: predecessor,
+                before: insertedMessages.indices.contains(index + 1)
+                    ? insertedMessages[index + 1]
+                    : nil,
+                replyPreview:
+                    referenced.map(MessageReplyPreview.init(message:))
+                        ?? prepared.replyPreview,
+                isReplyAvailable:
+                    referenced != nil || prepared.isReplyAvailable,
+                textPlan: prepared.textPlan,
+                calendar: calendar,
+                continuationInterval: continuationInterval
+            )
+        }
+        existingRows.append(contentsOf: insertedRows)
+    }
+
+    static func continuesGroup(
+        from previous: Message,
+        to message: Message,
+        calendar: Calendar,
+        continuationInterval: TimeInterval
+    ) -> Bool {
+        // An unconfirmed local send always follows the row above it, but its
+        // local timestamp can trail a confirmation's server timestamp.
+        let interval = message.timestamp.timeIntervalSince(previous.timestamp)
+        return isGroupable(previous)
+            && isGroupable(message)
+            && !previous.isPostStarter
+            && sharesAuthorIdentity(previous, message)
+            && message.replyTo == nil
+            && (interval >= 0 || message.isUnconfirmedLocalSend)
+            && abs(interval) < continuationInterval
+            && calendar.isDate(previous.timestamp, inSameDayAs: message.timestamp)
+    }
+
+    /// One webhook ID posts under many names and avatars; Discord starts a
+    /// new group whenever that presented identity changes.
+    private static func sharesAuthorIdentity(_ previous: Message, _ message: Message) -> Bool {
+        guard previous.author.id == message.author.id else { return false }
+        guard message.webhookID != nil || previous.webhookID != nil else { return true }
+        return previous.author.displayName == message.author.displayName
+            && previous.author.avatarURL == message.author.avatarURL
+    }
+
+    private static func endsGroup(
+        at index: Int,
+        in messages: [Message],
+        calendar: Calendar,
+        continuationInterval: TimeInterval
+    ) -> Bool {
+        guard messages.indices.contains(index + 1) else { return true }
+        return !continuesGroup(
+            from: messages[index],
+            to: messages[index + 1],
+            calendar: calendar,
+            continuationInterval: continuationInterval
+        )
+    }
+
+    private static func replacingGroupEdges(
+        of row: MessageRowPresentation,
+        startsGroup: Bool? = nil,
+        endsGroup: Bool? = nil
+    ) -> MessageRowPresentation {
+        MessageRowPresentation(
+            message: row.message,
+            startsGroup: startsGroup ?? row.startsGroup,
+            endsGroup: endsGroup ?? row.endsGroup,
+            startsDay: row.startsDay,
+            replyPreview: row.replyPreview,
+            isReplyAvailable: row.isReplyAvailable,
+            textPlan: row.textPlan,
+            searchContext: row.searchContext,
+            pinnedAt: row.pinnedAt,
+            isResource: row.isResource
+        )
+    }
+
+    private static func connectPrependingRows(
+        _ insertedRows: inout [MessageRowPresentation],
+        to existingFirstMessage: Message,
+        calendar: Calendar,
+        continuationInterval: TimeInterval
+    ) {
+        guard let lastIndex = insertedRows.indices.last else { return }
+        insertedRows[lastIndex] = replacingGroupEdges(
+            of: insertedRows[lastIndex],
+            endsGroup: !continuesGroup(
+                from: insertedRows[lastIndex].message,
+                to: existingFirstMessage,
+                calendar: calendar,
+                continuationInterval: continuationInterval
+            )
+        )
+    }
+
+    static func updating(
+        existing: [MessageRowPresentation], oldMessages: [Message], newMessages: [Message],
+        calendar: Calendar = .autoupdatingCurrent,
+        continuationInterval: TimeInterval = defaultContinuationInterval
+    ) -> [MessageRowPresentation] {
+        guard existing.count == oldMessages.count, !oldMessages.isEmpty else {
+            return rows(
+                for: newMessages,
+                calendar: calendar,
+                continuationInterval: continuationInterval
+            )
+        }
+
+        if newMessages.count >= oldMessages.count,
+           newMessages.prefix(oldMessages.count).elementsEqual(oldMessages)
+        {
+            return appendingUpdatedRows(
+                existing: existing,
+                oldMessageCount: oldMessages.count,
+                newMessages: newMessages,
+                calendar: calendar,
+                continuationInterval: continuationInterval
+            )
+        }
+
+        if newMessages.count > oldMessages.count {
+            let insertedCount = newMessages.count - oldMessages.count
+            if newMessages.suffix(oldMessages.count).elementsEqual(oldMessages) {
+                let insertedMessages = newMessages.prefix(insertedCount)
+                let insertedByID = Dictionary(
+                    uniqueKeysWithValues: insertedMessages.map { ($0.id, $0) }
+                )
+                var result =
+                    rows(
+                        for: Array(insertedMessages),
+                        calendar: calendar,
+                        continuationInterval: continuationInterval
+                    ) + existing
+                if insertedCount > 0 {
+                    result[insertedCount - 1] = presentation(
+                        at: insertedCount - 1,
+                        in: newMessages,
+                        messagesByID: insertedByID,
+                        calendar: calendar,
+                        continuationInterval: continuationInterval
+                    )
+                }
+                let insertedIDs = Set(insertedMessages.map(\.id))
+                var affected = Set<Int>()
+                for (index, message) in newMessages.enumerated()
+                    where message.replyTo.map(insertedIDs.contains) == true {
+                    affected.insert(index)
+                }
+                for index in affected where newMessages.indices.contains(index) {
+                    result[index] = presentation(
+                        at: index,
+                        in: newMessages,
+                        messagesByID: insertedByID,
+                        calendar: calendar,
+                        continuationInterval: continuationInterval
+                    )
+                }
+                if newMessages.indices.contains(insertedCount),
+                   !affected.contains(insertedCount)
+                {
+                    let prior = existing[0]
+                    let message = newMessages[insertedCount]
+                    result[insertedCount] = MessageRowPresentation(
+                        message: message,
+                        startsGroup: !continuesGroup(
+                            from: newMessages[insertedCount - 1],
+                            to: message,
+                            calendar: calendar,
+                            continuationInterval: continuationInterval
+                        ),
+                        endsGroup: prior.endsGroup,
+                        startsDay: !calendar.isDate(
+                            newMessages[insertedCount - 1].timestamp,
+                            inSameDayAs: message.timestamp
+                        ),
+                        replyPreview: prior.replyPreview,
+                        isReplyAvailable: prior.isReplyAvailable,
+                        textPlan: prior.textPlan
+                    )
+                }
+                return result
+            }
+        }
+
+        if newMessages.count == oldMessages.count,
+           zip(newMessages, oldMessages).allSatisfy({ $0.0.id == $0.1.id })
+        {
+            return updatingMatchingMessages(
+                existing: existing,
+                oldMessages: oldMessages,
+                newMessages: newMessages,
+                calendar: calendar,
+                continuationInterval: continuationInterval
+            )
+        }
+        return rows(
+            for: newMessages,
+            calendar: calendar,
+            continuationInterval: continuationInterval
+        )
+    }
+
+    private static func appendingUpdatedRows(
+        existing: [MessageRowPresentation],
+        oldMessageCount: Int,
+        newMessages: [Message],
+        calendar: Calendar,
+        continuationInterval: TimeInterval
+    ) -> [MessageRowPresentation] {
+        var result = existing
+        let appended = newMessages[oldMessageCount...]
+        let byID = appended.contains(where: { $0.replyTo != nil })
+            ? Dictionary(uniqueKeysWithValues: newMessages.map { ($0.id, $0) })
+            : [:]
+        if !appended.isEmpty, oldMessageCount > 0 {
+            result[oldMessageCount - 1] = replacingGroupEdges(
+                of: result[oldMessageCount - 1],
+                endsGroup: endsGroup(
+                    at: oldMessageCount - 1,
+                    in: newMessages,
+                    calendar: calendar,
+                    continuationInterval: continuationInterval
+                )
+            )
+        }
+        for index in oldMessageCount ..< newMessages.count {
+            result.append(presentation(
+                at: index,
+                in: newMessages,
+                messagesByID: byID,
+                calendar: calendar,
+                continuationInterval: continuationInterval
+            ))
+        }
+        return result
+    }
+
+    private static func updatingMatchingMessages(
+        existing: [MessageRowPresentation],
+        oldMessages: [Message],
+        newMessages: [Message],
+        calendar: Calendar,
+        continuationInterval: TimeInterval
+    ) -> [MessageRowPresentation] {
+        var result = existing
+        let changed = newMessages.indices.filter {
+            newMessages[$0] != oldMessages[$0]
+        }
+        guard !changed.isEmpty else { return result }
+        let byID = Dictionary(uniqueKeysWithValues: newMessages.map { ($0.id, $0) })
+        let changedIDs = Set(changed.lazy.map { newMessages[$0].id })
+        var affected = Set(changed)
+        for index in changed where newMessages.indices.contains(index - 1) {
+            affected.insert(index - 1)
+        }
+        for index in changed where newMessages.indices.contains(index + 1) {
+            affected.insert(index + 1)
+        }
+        for (index, message) in newMessages.enumerated()
+            where message.replyTo.map(changedIDs.contains) == true
+        {
+            affected.insert(index)
+        }
+        for index in affected {
+            result[index] = presentation(
+                at: index,
+                in: newMessages,
+                messagesByID: byID,
+                calendar: calendar,
+                continuationInterval: continuationInterval
+            )
+        }
+        return result
+    }
+
+    private static func presentation(
+        at index: Int, in messages: [Message], messagesByID: [MessageID: Message],
+        calendar: Calendar,
+        continuationInterval: TimeInterval
+    ) -> MessageRowPresentation {
+        let message = messages[index]
+        let replyPreview = message.replyTo.flatMap { id in
+            messagesByID[id].map {
+                MessageReplyPreview(message: $0)
+            } ?? message.replyPreview
+        }
+        let endsGroup = endsGroup(
+            at: index,
+            in: messages,
+            calendar: calendar,
+            continuationInterval: continuationInterval
+        )
+        guard index > 0 else {
+            return MessageRowPresentation(
+                message: message,
+                startsGroup: true,
+                endsGroup: endsGroup,
+                startsDay: true,
+                replyPreview: replyPreview,
+                isReplyAvailable: replyPreview.map { messagesByID[$0.messageID] != nil } ?? false
+            )
+        }
+        let continues = continuesGroup(
+            from: messages[index - 1],
+            to: message,
+            calendar: calendar,
+            continuationInterval: continuationInterval
+        )
+        return MessageRowPresentation(
+            message: message,
+            startsGroup: !continues,
+            endsGroup: endsGroup,
+            startsDay: !calendar.isDate(
+                messages[index - 1].timestamp,
+                inSameDayAs: message.timestamp
+            ),
+            replyPreview: replyPreview,
+            isReplyAvailable: replyPreview.map { messagesByID[$0.messageID] != nil } ?? false
+        )
+    }
+}
+
+nonisolated extension Message {
+    /// A forum or media post's original message, which shares its thread's ID.
+    var isPostStarter: Bool {
+        id.rawValue == channelID.rawValue
+    }
+}

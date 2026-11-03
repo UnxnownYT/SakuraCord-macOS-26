@@ -1,0 +1,354 @@
+import AppKit
+import Foundation
+
+nonisolated enum ExternalLinkConfirmationPolicy: String, CaseIterable, Identifiable, Sendable {
+    case untrustedDomains
+    case allLinks
+    case noLinks
+
+    var id: String { rawValue }
+
+    var title: LocalizedStringResource {
+        switch self {
+        case .untrustedDomains:
+            LocalizedStringResource("Untrusted Domains", bundle: #bundle)
+        case .allLinks:
+            LocalizedStringResource("Always Ask", bundle: #bundle)
+        case .noLinks:
+            LocalizedStringResource("Never Ask", bundle: #bundle)
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .untrustedDomains:
+            "shield"
+        case .allLinks:
+            "hand.raised"
+        case .noLinks:
+            "hand.raised.slash"
+        }
+    }
+
+    func requiresConfirmation(
+        for assessment: ExternalLinkSafetyAssessment,
+        trustedDomains: [String]
+    ) -> Bool {
+        if self == .untrustedDomains, assessment.isSuspicious {
+            return true
+        }
+        return requiresConfirmation(for: assessment.domain, trustedDomains: trustedDomains)
+    }
+
+    func requiresConfirmation(
+        for domain: String,
+        trustedDomains: [String]
+    ) -> Bool {
+        switch self {
+        case .untrustedDomains:
+            !trustedDomains.contains { ExternalLinkTrustedDomain.matches(domain, rule: $0) }
+        case .allLinks:
+            true
+        case .noLinks:
+            false
+        }
+    }
+}
+
+nonisolated struct PrivacySafetySettingsSnapshot: Equatable, Sendable {
+    static let defaults = Self(
+        sendsTypingIndicators: true,
+        externalLinkConfirmationPolicy: .untrustedDomains,
+        trustedDomains: ExternalLinkTrustedDomain.defaults
+    )
+
+    var removesMediaMetadata = true
+    var anonymisesFileNames = false
+    var sendsTypingIndicators: Bool
+    var externalLinkConfirmationPolicy: ExternalLinkConfirmationPolicy
+    var trustedDomains: [String]
+}
+
+@MainActor
+final class PrivacySafetySettingsStore {
+    static let shared = PrivacySafetySettingsStore()
+    nonisolated static let anonymiseFileNamesKey = "settings.privacy.anonymiseFileNames"
+
+    private let preferences: SettingsPreferenceStore
+
+    init(preferences: SettingsPreferenceStore = .shared) {
+        self.preferences = preferences
+    }
+
+    func load() -> PrivacySafetySettingsSnapshot {
+        var value = PrivacySafetySettingsSnapshot.defaults
+        if case let .bool(saved) = preferences.value(for: .removeMediaMetadata) {
+            value.removesMediaMetadata = saved
+        }
+        if case let .bool(saved) = preferences.value(for: .anonymiseFileNames) {
+            value.anonymisesFileNames = saved
+        }
+        if case let .bool(saved) = preferences.value(for: .privacyTypingIndicators) {
+            value.sendsTypingIndicators = saved
+        }
+        if case let .string(rawValue) = preferences.value(for: .externalLinkProtection),
+           let policy = ExternalLinkConfirmationPolicy(rawValue: rawValue)
+        {
+            value.externalLinkConfirmationPolicy = policy
+        }
+        if case let .strings(domains) = preferences.value(for: .trustedDomains) {
+            value.trustedDomains = ExternalLinkTrustedDomain.normalizedList(domains)
+        }
+        return value
+    }
+
+    func save(_ value: PrivacySafetySettingsSnapshot) {
+        preferences.set(.bool(value.removesMediaMetadata), for: .removeMediaMetadata)
+        preferences.set(.bool(value.anonymisesFileNames), for: .anonymiseFileNames)
+        preferences.set(.bool(value.sendsTypingIndicators), for: .privacyTypingIndicators)
+        preferences.set(
+            .string(value.externalLinkConfirmationPolicy.rawValue),
+            for: .externalLinkProtection
+        )
+        preferences.set(
+            .strings(ExternalLinkTrustedDomain.normalizedList(value.trustedDomains)),
+            for: .trustedDomains
+        )
+    }
+
+    func trust(_ domain: String) {
+        guard let domain = ExternalLinkTrustedDomain.normalized(domain) else { return }
+        var value = load()
+        guard !value.trustedDomains.contains(domain) else { return }
+        value.trustedDomains.append(domain)
+        save(value)
+    }
+}
+
+nonisolated struct ExternalLinkSafetyAssessment: Equatable, Sendable {
+    let url: URL
+    let domain: String
+    let warnings: [String]
+    let isAllowed: Bool
+
+    var isSuspicious: Bool { !warnings.isEmpty }
+}
+
+nonisolated enum ExternalLinkSafetyPolicy {
+    static func assess(
+        _ url: URL,
+        displayedText: String? = nil
+    ) -> ExternalLinkSafetyAssessment {
+        let scheme = url.scheme?.lowercased()
+        let host = url.host(percentEncoded: false)?.lowercased() ?? ""
+        guard scheme == "https" || scheme == "http", !host.isEmpty else {
+            return ExternalLinkSafetyAssessment(
+                url: url,
+                domain: host.isEmpty ? localized("Unknown destination") : host,
+                warnings: [localized("The destination does not use a supported web address.")],
+                isAllowed: false
+            )
+        }
+
+        var warnings: [String] = []
+        if scheme == "http" {
+            warnings.append(localized("This connection is not encrypted."))
+        }
+        if url.user != nil || url.password != nil {
+            warnings.append(localized(
+                "The address disguises its destination with user information."
+            ))
+        }
+        if host.contains("xn--") || host.unicodeScalars.contains(where: { !$0.isASCII }) {
+            warnings.append(localized(
+                "The domain contains an encoded or non-ASCII name that may resemble another site."
+            ))
+        }
+        if host.split(separator: ".").count < 2 || host.contains("..") {
+            warnings.append(localized(
+                "The destination has an unusual or malformed host name."
+            ))
+        }
+        if resemblesTrustedDomain(host) {
+            warnings.append(localized(
+                "The domain contains the name of a known service but is not that service's domain."
+            ))
+        }
+        if isGitHubDownload(url, host: host) {
+            warnings.append(localized(
+                "This GitHub link can open a user-uploaded file or download directly."
+            ))
+        }
+        if let displayedHost = displayedHost(in: displayedText),
+           displayedHost != host
+        {
+            warnings.append(localized(
+                "The displayed address names \(displayedHost), but the link opens \(host)."
+            ))
+        }
+
+        return ExternalLinkSafetyAssessment(
+            url: url,
+            domain: host,
+            warnings: warnings,
+            isAllowed: true
+        )
+    }
+
+    private static func isGitHubDownload(_ url: URL, host: String) -> Bool {
+        guard let normalizedHost = ExternalLinkTrustedDomain.normalized(host),
+              ["github.com", "www.github.com"].contains(normalizedHost)
+        else { return false }
+        let parts = url.standardized.path.split(separator: "/").map(String.init)
+        if parts.first == "user-attachments" { return true }
+        guard parts.count >= 3 else { return false }
+        let route = parts[2]
+        if ["raw", "archive", "zipball", "tarball", "files"].contains(route) { return true }
+        if route == "releases", parts.count >= 4 {
+            if parts[3] == "download" { return true }
+            if parts.count >= 5, parts[3] == "latest", parts[4] == "download" { return true }
+        }
+        if route == "blob" {
+            return URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                .contains { $0.name == "raw" || $0.name.hasPrefix("raw[") } == true
+        }
+        return false
+    }
+
+    private static func resemblesTrustedDomain(_ host: String) -> Bool {
+        trustedDomains.contains { trusted in
+            host != trusted
+                && !host.hasSuffix(".\(trusted)")
+                && host.contains(trusted)
+        }
+    }
+
+    private static func displayedHost(in displayedText: String?) -> String? {
+        guard let displayedText else { return nil }
+        let trimmed = displayedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.contains(".") else { return nil }
+        let candidate = trimmed.contains("://") ? trimmed : "https://\(trimmed)"
+        return URL(string: candidate)?.host(percentEncoded: false)?.lowercased()
+    }
+
+    private static let trustedDomains = [
+        "discord.com", "discordapp.com", "catbox.moe",
+    ]
+
+    private static func localized(_ value: String.LocalizationValue) -> String {
+        String(localized: LocalizedStringResource(value, bundle: #bundle))
+    }
+}
+
+@MainActor
+final class ExternalLinkConfirmationPresenter {
+    static let shared = ExternalLinkConfirmationPresenter()
+
+    private var activeAlert: NSAlert?
+    private let settingsStore: PrivacySafetySettingsStore
+    private let opener: (URL) -> Void
+    private let windowProvider: () -> NSWindow?
+
+    init(
+        settingsStore: PrivacySafetySettingsStore = .shared,
+        opener: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) },
+        windowProvider: @escaping () -> NSWindow? = {
+            NSApp.keyWindow ?? NSApp.mainWindow
+        }
+    ) {
+        self.settingsStore = settingsStore
+        self.opener = opener
+        self.windowProvider = windowProvider
+    }
+
+    func present(
+        _ assessment: ExternalLinkSafetyAssessment,
+        opener: ((URL) -> Void)? = nil
+    ) {
+        let open = opener ?? self.opener
+        guard assessment.isAllowed else {
+            NSSound.beep()
+            return
+        }
+        let settings = settingsStore.load()
+        guard settings.externalLinkConfirmationPolicy.requiresConfirmation(
+            for: assessment,
+            trustedDomains: settings.trustedDomains
+        ) else {
+            open(assessment.url)
+            return
+        }
+        guard activeAlert == nil, let window = windowProvider() else {
+            NSSound.beep()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = assessment.isSuspicious ? .critical : .warning
+        alert.messageText = assessment.isSuspicious
+            ? String(localized: LocalizedStringResource("Review Suspicious Link", bundle: #bundle))
+            : String(localized: LocalizedStringResource("Open External Link?", bundle: #bundle))
+        let warningText = assessment.warnings.isEmpty
+            ? String(localized: LocalizedStringResource(
+                "SakuraCord cannot determine whether an external link is safe.",
+                bundle: #bundle
+            ))
+            : assessment.warnings.joined(separator: "\n")
+        alert.informativeText = String(localized: LocalizedStringResource(
+            "Domain: \(assessment.domain)\n\n\(warningText)\n\n\(assessment.url.absoluteString)",
+            bundle: #bundle
+        ))
+        let openButton = alert.addButton(withTitle: String(localized: LocalizedStringResource(
+            "Open Link",
+            bundle: #bundle
+        )))
+        openButton.hasDestructiveAction = assessment.isSuspicious
+        alert.addButton(withTitle: String(localized: LocalizedStringResource(
+            "Cancel",
+            bundle: #bundle
+        )))
+        let trustDomainCheckbox: NSButton? = if settings.externalLinkConfirmationPolicy
+            == .untrustedDomains, !assessment.isSuspicious
+        {
+            NSButton(
+                checkboxWithTitle: String(localized: LocalizedStringResource(
+                    "Trust \(assessment.domain) for future links",
+                    bundle: #bundle,
+                    comment: "Checkbox in an external-link warning; the variable is the exact destination domain."
+                )),
+                target: nil,
+                action: nil
+            )
+        } else {
+            nil
+        }
+        alert.accessoryView = trustDomainCheckbox
+        activeAlert = alert
+        alert.beginSheetModal(for: window) { [weak self, domain = assessment.domain, url = assessment.url] response in
+            guard let self else { return }
+            activeAlert = nil
+            if response == .alertFirstButtonReturn {
+                if trustDomainCheckbox?.state == .on {
+                    settingsStore.trust(domain)
+                }
+                open(url)
+            }
+        }
+    }
+}
+
+@MainActor
+extension AppModel {
+    var privacySafetySettings: PrivacySafetySettingsSnapshot {
+        get { privacySafetySettingsStore.load() }
+        set { privacySafetySettingsStore.save(newValue) }
+    }
+
+    func applyPrivacySafetySettings(_ value: PrivacySafetySettingsSnapshot) {
+        let wasSendingTypingIndicators = privacySafetySettings.sendsTypingIndicators
+        privacySafetySettings = value
+        if wasSendingTypingIndicators, !value.sendsTypingIndicators {
+            stopLocalTyping(clearThrottle: false)
+        }
+    }
+}

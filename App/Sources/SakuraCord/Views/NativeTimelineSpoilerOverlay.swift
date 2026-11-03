@@ -1,0 +1,375 @@
+import AppKit
+import QuartzCore
+
+struct NativeTimelineSpoilerOverlayPresentation: Hashable {
+    let cornerRadius: CGFloat
+}
+
+/// Discord's one spoiler look, shared by text, media, files, embeds and
+/// components. Lengths are Discord's CSS pixels at SakuraCord's text size.
+nonisolated enum NativeTimelineSpoilerAppearance {
+    static var pillHeight: CGFloat { DiscordRichMessageMetrics.px(31) }
+    static var pillHorizontalPadding: CGFloat { DiscordRichMessageMetrics.px(12) }
+    static var textCornerRadius: CGFloat { DiscordRichMessageMetrics.px(4) }
+    /// Discord blurs hidden media by 44 pixels, past recognition.
+    static var blurRadius: CGFloat { DiscordRichMessageMetrics.px(44) }
+    static let mediaRevealDuration: CFTimeInterval = 0.1
+    static let textRevealDuration: CFTimeInterval = 0.2
+
+    /// Behind hidden media and over hidden text: Discord's midnight theme in
+    /// dark mode, which matches SakuraCord's near-black timeline, and its
+    /// light theme otherwise.
+    static let hiddenColor = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 0x59 / 255, green: 0x5A / 255, blue: 0x63 / 255, alpha: 1)
+            : NSColor(srgbRed: 0x8F / 255, green: 0x90 / 255, blue: 0x97 / 255, alpha: 1)
+    }
+
+    /// How far hover tints a hidden spoiler, the one strength every kind
+    /// shares: text's fill, and half as much over a media cover, whose pill
+    /// also darkens. Dark mode lightens toward white and light mode darkens
+    /// toward black, as Discord's hover does: dark text goes #595A63 →
+    /// #84858C, light #8F9097 → #6A6B70.
+    static let hoverTint: CGFloat = 0.26
+
+    static let hoverTintColor = NSColor(name: nil, dynamicProvider: hoverTintBase)
+
+    /// Over a media cover, which the hover tints by half of text's.
+    static let mediaHoverTintColor = NSColor(name: nil) { hoverTintBase($0).withAlphaComponent(hoverTint / 2) }
+
+    private static func hoverTintBase(_ appearance: NSAppearance) -> NSColor {
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .white : .black
+    }
+
+    /// A revealed text spoiler keeps a faint fill, so it still reads as one.
+    /// The light timeline is close to the fill's gray, so it takes more of it
+    /// to show as much.
+    static let revealedTextColor = NSColor(name: nil) { appearance in
+        NSColor(
+            srgbRed: 0x97 / 255, green: 0x97 / 255, blue: 0x9F / 255,
+            alpha: appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? 0.12 : 0.24
+        )
+    }
+
+    static let pillColor = NSColor.black.withAlphaComponent(0.6)
+    /// Over the drawn pill, this darkens it to Discord's hovered 88 percent.
+    static let hoveredPillOverlayColor = NSColor.black.withAlphaComponent(0.7)
+
+    /// Discord's pill sits on items at least as wide as its 216-pixel upload
+    /// tiles. A smaller tile, such as a staged attachment, scales the pill to
+    /// match; on a thumbnail too small to read it, the blur stands alone.
+    static func pillScale(forTileWidth width: CGFloat) -> CGFloat? {
+        let scale = min(1, width / DiscordRichMessageMetrics.px(216))
+        return scale >= 0.5 ? scale : nil
+    }
+
+    /// A hidden text spoiler's fill, `hover` of the way into its hover.
+    static func textBackgroundColor(hover: CGFloat) -> NSColor {
+        guard hover > 0 else { return hiddenColor }
+        return hiddenColor.blended(withFraction: hoverTint * hover, of: hoverTintColor) ?? hiddenColor
+    }
+
+    static func pillLabel(isHovered: Bool, scale: CGFloat = 1) -> NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        return NSAttributedString(
+            string: "SPOILER",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: DiscordRichMessageMetrics.px(15) * scale, weight: .semibold),
+                .foregroundColor: isHovered
+                    ? NSColor.white
+                    : NSColor(srgbRed: 0xE4 / 255, green: 0xE4 / 255, blue: 0xE6 / 255, alpha: 1),
+                .kern: DiscordRichMessageMetrics.px(0.5) * scale,
+                .paragraphStyle: paragraph,
+            ]
+        )
+    }
+
+    /// Hides the glyphs and text decorations of a hidden text spoiler while
+    /// keeping its layout. Apply it after every other color adjustment; a
+    /// revealed spoiler omits it and keeps its real colors.
+    static func concealText(
+        in value: NSMutableAttributedString,
+        range: NSRange
+    ) {
+        for key: NSAttributedString.Key in [
+            .foregroundColor,
+            .underlineColor,
+            .strikethroughColor,
+        ] {
+            value.addAttribute(key, value: NSColor.clear, range: range)
+        }
+    }
+
+    static func pillFrame(
+        in bounds: CGRect,
+        measuredLabelWidth: CGFloat,
+        scale: CGFloat
+    ) -> CGRect {
+        let width = min(
+            max(1, bounds.width),
+            ceil(measuredLabelWidth) + pillHorizontalPadding * 2 * scale
+        )
+        let height = min(max(1, bounds.height), pillHeight * scale)
+        return CGRect(
+            x: bounds.midX - width / 2,
+            y: bounds.midY - height / 2,
+            width: width,
+            height: height
+        )
+    }
+
+    static func labelFrame(
+        in bounds: CGRect,
+        measuredLabelHeight: CGFloat
+    ) -> CGRect {
+        let height = min(
+            max(1, bounds.height),
+            ceil(measuredLabelHeight)
+        )
+        return CGRect(
+            x: bounds.minX,
+            y: bounds.midY - height / 2,
+            width: bounds.width,
+            height: height
+        )
+    }
+
+    static func isActivationKey(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(
+            .deviceIndependentFlagsMask
+        )
+        guard modifiers.isEmpty else { return false }
+        switch event.keyCode {
+        case 36, 49, 76:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+/// The interactive part of a media spoiler cover. The row draws the cover
+/// itself, so the cover is never missing while this view comes and goes;
+/// this view adds hover, keyboard focus and activation.
+@MainActor
+final class NativeTimelineSpoilerOverlayHost: NSView {
+    let cornerRadius: CGFloat
+    let revealAction: () -> Void
+    /// Tints the cover while the pointer is over it, as a text spoiler's
+    /// fill tints.
+    let tintView = NSView()
+    /// Darkens the row's pill while the pointer is over the cover.
+    let pillView = NSView()
+    let pillLabel = NSTextField(labelWithString: "SPOILER")
+    var trackingArea: NSTrackingArea?
+    var isHovered = false {
+        didSet { updateHover(animated: true) }
+    }
+    var isPressed = false
+    var didActivate = false
+
+    override var isFlipped: Bool { true }
+    override var acceptsFirstResponder: Bool { true }
+
+    init(
+        frame: CGRect,
+        cornerRadius: CGFloat,
+        reveal: @escaping () -> Void
+    ) {
+        self.cornerRadius = cornerRadius
+        revealAction = reveal
+        super.init(frame: frame)
+        wantsLayer = true
+        tintView.wantsLayer = true
+        tintView.layer?.cornerRadius = cornerRadius
+        tintView.layer?.cornerCurve = .continuous
+        tintView.alphaValue = 0
+        tintView.setAccessibilityElement(false)
+        addSubview(tintView)
+        pillView.wantsLayer = true
+        pillView.layer?.masksToBounds = true
+        pillView.layer?.backgroundColor =
+            NativeTimelineSpoilerAppearance.hoveredPillOverlayColor.cgColor
+        pillView.setAccessibilityElement(false)
+        addSubview(pillView)
+        pillLabel.alignment = .center
+        pillLabel.lineBreakMode = .byClipping
+        pillLabel.setAccessibilityElement(false)
+        pillView.addSubview(pillLabel)
+        pillView.alphaValue = 0
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("Reveal spoiler")
+        setAccessibilityHelp("Reveals the spoiler without opening it")
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layout() {
+        super.layout()
+        tintView.frame = bounds
+        updateHover(animated: false)
+        // The same pill the row draws under this view.
+        guard let pill = NativeTimelineSpoilerCover.pill(in: bounds, isHovered: true) else { return }
+        pillLabel.attributedStringValue = pill.label
+        pillView.frame = pill.frame
+        pillView.layer?.cornerRadius = pill.frame.height / 2
+        pillLabel.frame = NativeTimelineSpoilerAppearance.labelFrame(
+            in: pillView.bounds,
+            measuredLabelHeight: pill.label.size().height
+        )
+    }
+
+    /// Eases the hover in or out on the timeline's hover curve.
+    private func updateHover(animated: Bool) {
+        // A cover too small for the row to draw a pill on has none to darken.
+        let hasPill = NativeTimelineSpoilerAppearance.pillScale(forTileWidth: bounds.width) != nil
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = animated && AppMotionPolicy.animatesUncategorized
+                ? NativeTimelineComponentButtonVisualState.hoverAnimationDuration : 0
+            context.timingFunction = NativeTimelineComponentButtonVisualState.hoverTimingFunction
+            tintView.animator().alphaValue = isHovered ? 1 : 0
+            pillView.animator().alphaValue = isHovered && hasPill ? 1 : 0
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateTintColor()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateTintColor()
+    }
+
+    private func updateTintColor() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            tintView.layer?.backgroundColor = NativeTimelineSpoilerAppearance.mediaHoverTintColor.cgColor
+        }
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func updateTrackingAreas() {
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [
+                .activeInKeyWindow,
+                .inVisibleRect,
+                .mouseEnteredAndExited,
+            ],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+        super.updateTrackingAreas()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // `point` is in the superview's coordinates.
+        frame.contains(point) ? self : nil
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard WindowModalCoordinator.allowsInput(for: self) else { return }
+        isHovered = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        isPressed = false
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard event.buttonNumber == 0 else { return }
+        window?.makeFirstResponder(self)
+        isPressed = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        isPressed = bounds.contains(convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard event.buttonNumber == 0 else { return }
+        let activates =
+            isPressed
+            && bounds.contains(convert(event.locationInWindow, from: nil))
+        isPressed = false
+        if activates {
+            activate()
+        }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+    }
+
+    override func otherMouseDown(with event: NSEvent) {}
+
+    override func keyDown(with event: NSEvent) {
+        if NativeTimelineSpoilerAppearance.isActivationKey(event) {
+            activate()
+        } else {
+            super.keyDown(with: event)
+        }
+    }
+
+    nonisolated override func accessibilityActionNames()
+        -> [NSAccessibility.Action]
+    {
+        [.press]
+    }
+
+    nonisolated override func accessibilityPerformPress() -> Bool {
+        MainActor.assumeIsolated {
+            activate()
+            return true
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        if window?.firstResponder === self {
+            NSColor.sakuraCordAccentColor.setStroke()
+            let focus = NSBezierPath(
+                concentricRoundedRect: bounds.insetBy(dx: InterfaceScale.metric(2), dy: InterfaceScale.metric(2)),
+                cornerRadius: max(1, cornerRadius - 2)
+            )
+            focus.lineWidth = 2
+            focus.stroke()
+        }
+    }
+
+#if DEBUG
+    var hasPersistentPillForTesting: Bool {
+        pillView.superview === self
+            && pillLabel.superview === pillView
+    }
+#endif
+
+    func activate() {
+        guard !didActivate else { return }
+        didActivate = true
+        revealAction()
+    }
+}
+
+/// Presents decoded raster animation frames on Core Animation's compositor.
+/// The outer view is deliberately transparent so the selection tint can
+/// extend beyond the clipped media box exactly as the Core Text painter does.

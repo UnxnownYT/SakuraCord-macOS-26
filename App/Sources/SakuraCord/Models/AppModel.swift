@@ -1,0 +1,1303 @@
+import CoreAudio
+import CoreText
+import DiscordProtocol
+import Foundation
+import ImageIO
+import MediaPipeline
+import MessageRendering
+import OSLog
+import Observation
+import SakuraCordModels
+import SakuraCordPersistence
+import UniformTypeIdentifiers
+import UserNotifications
+
+enum ServerRailNavigationDestination: Equatable {
+    case directMessages
+    case guild(GuildID)
+}
+
+enum ApplicationStreamPlaybackState: Equatable {
+    case available
+    case connecting
+    case watching
+    case broadcasting
+    case reconnecting
+    case failed(String)
+}
+
+struct ApplicationStreamDemandIntent: Equatable {
+    var isEnabled: Bool
+    var pixelCount: Int?
+}
+
+nonisolated struct ConversationPermissionBasis: Sendable {
+    let guild: Guild
+    let resolvedBasePermissions: UInt64?
+    let overwritePrincipals: PermissionOverwritePrincipals
+    let hasCurrentRoleIdentity: Bool
+    let currentUserIsPending: Bool
+    var currentUserCommunicationDisabledUntil: Date?
+    var currentUserRequiresOnboarding: Bool = false
+    var currentUserOnboardingIsKnown: Bool = true
+}
+
+struct CommandMemberQuery: Hashable {
+    var guildID: GuildID
+    var query: String
+}
+
+struct MentionMemberSearchCacheEntry {
+    var members: [Member]
+    var storedAt: Date
+}
+
+struct ComponentInteractionPresentationState {
+    var pendingControls: Set<ComponentControlKey> = []
+    var pendingMessages: Set<MessageID> = []
+    var errors: [ComponentControlKey: String] = [:]
+    var selections: [ComponentControlKey: [ComponentSelectOption]] = [:]
+}
+
+@Observable
+final class AppModel {
+    enum ThreadErrorScope {
+        case initialPage
+        case earlierPage
+        case laterPage
+        case newestWindow
+        case action
+    }
+
+    struct MemberListViewportRequest: Equatable {
+        var guildID: GuildID
+        var channelID: ChannelID
+        var visibleRange: ClosedRange<Int>
+    }
+
+    struct ReactionReactorLoadKey: Hashable {
+        var channelID: ChannelID
+        var messageID: MessageID
+        var reactionID: String
+    }
+
+    struct ReactionMutationKey: Hashable {
+        var channelID: ChannelID
+        var messageID: MessageID
+        var reactionID: String
+    }
+
+    struct ReactionMutationState {
+        var emoji: String
+        var confirmedReacted: Bool
+        var desiredReacted: Bool
+        var generation: UInt64
+        var isSending: Bool
+        var hasRetriedRateLimit = false
+    }
+
+    static let unreadDiagnosticsLogger = Logger(
+        subsystem: "dev.sakuracord.SakuraCord",
+        category: "Unread"
+    )
+    static let memberListLogger = Logger(
+        subsystem: "dev.sakuracord.SakuraCord",
+        category: "MemberList"
+    )
+    static let forumPerformanceSignposter = OSSignposter(
+        subsystem: "dev.sakuracord.SakuraCord",
+        category: "PointsOfInterest"
+    )
+    nonisolated static let maximumConcurrentReactionReactorLoads = 4
+
+    enum SessionState: Equatable {
+        case restoring
+        case signedOut
+        case connecting
+        case workspace
+    }
+
+    struct LocalTypingTiming: Sendable {
+        var debounce: Duration = .seconds(1.5)
+        var throttle: Duration = .seconds(8)
+    }
+
+    struct ReadAcknowledgementTiming: Sendable {
+        var debounce: Duration = .zero
+    }
+
+    struct ReadStateMutation: Sendable {
+        var messageID: MessageID
+        var flags: UInt64?
+        var lastViewed: Int?
+    }
+
+    struct CategoryCollapseMutationState {
+        var guildID: GuildID
+        var confirmedCollapsed: Bool
+        var desiredCollapsed: Bool
+    }
+
+    @ObservationIgnored var snapshotStorage: BootstrapSnapshot?
+    // Keep workspace chrome independent of unrelated channel and member changes.
+    private(set) var currentUser: User?
+    private(set) var selectedGuild: Guild?
+    private(set) var guildIDs: [GuildID] = []
+    private(set) var threads: [MessageThreadSummary] = []
+    private(set) var relationshipNicknamesByUserID: [UserID: String] = [:]
+    private(set) var relationships: [Relationship] = []
+    private(set) var blockedOrIgnoredUserIDs: Set<UserID> = []
+    private(set) var friendUserIDs: Set<UserID> = []
+    private(set) var messageSearchSourceUsers: [User] = []
+    private(set) var messageSearchUserBoosterChannelIDs: Set<ChannelID> = []
+    private(set) var userSearchAliasesByUserID: [UserID: [String]] = [:]
+    private(set) var quickSwitcherGuildMemberUserIDs: [GuildID: [UserID]] = [:]
+    private(set) var quickSwitcherJoinedGuildMemberUserIDs: [GuildID: [UserID]] = [:]
+    private(set) var quickSwitcherGuildMemberAliases: [GuildID: [UserID: String]] = [:]
+    private(set) var messagePresentationChannelsByID: [ChannelID: Channel] = [:]
+    private(set) var messagePresentationChannels: [Channel] = []
+    /// Conversations waiting in Message Requests, which stay read-only.
+    private(set) var messageRequestChannelIDs: Set<ChannelID> = []
+    private(set) var activeJoinedThreads: [MessageThreadSummary] = []
+    private(set) var knownThreadIDs: Set<ChannelID> = []
+    private(set) var guildIDsWithResourceChannels: Set<GuildID> = []
+
+    @ObservationIgnored let serverRailPresentation =
+        ServerRailPresentationStore()
+    @ObservationIgnored let onboarding = GuildOnboardingStore()
+    @ObservationIgnored let serverInvites = ServerInvitePresentationStore()
+    @ObservationIgnored let captcha = HumanCaptchaStore()
+    @ObservationIgnored let friends = FriendsState()
+    @ObservationIgnored let ignoredUsers = IgnoredUsersState()
+    @ObservationIgnored let serverTagCards = ServerTagCardStore()
+    @ObservationIgnored let messageInteractionData = MessageInteractionDataStore()
+    @ObservationIgnored let issueReports = IssueReportStore()
+    @ObservationIgnored let nicknameEditor = NicknameEditorStore()
+    @ObservationIgnored let groupDirectMessageEditor = GroupDirectMessageEditorStore()
+    @ObservationIgnored let groupDirectMessageLeave = GroupDirectMessageLeaveStore()
+    @ObservationIgnored let threadActions = ThreadActionStore()
+    @ObservationIgnored let voiceSidebarPresentation =
+        VoiceSidebarPresentationStore()
+    var serverRailGuildsByID: [GuildID: Guild] = [:] {
+        didSet { updateServerRailMembership(replacing: oldValue) }
+    }
+    var serverRailItems: [GuildRailItem] = [] {
+        didSet {
+            serverRailPresentation.updateLayout(serverRailItems)
+            requestOrderedCustomEmojiUpdate()
+        }
+    }
+    @ObservationIgnored var serverRailLayoutTask: Task<Void, Never>?
+    var visibleChannels: [Channel] = [] {
+        didSet {
+            refreshVisibleChannelGroups()
+        }
+    }
+    var visibleChannelGroups: [ChannelGroup] = []
+    var pinnedDirectMessageIDs: Set<ChannelID> {
+        guard let settings = readState.settingsByGuild[nil]
+        else { return [] }
+        return Set(settings.channelOverrides.filter(\.isPinnedDirectMessage).map(\.channelID))
+    }
+    var unreadCategoryIDsByGuild: [GuildID: Set<ChannelID>] = [:]
+    var hiddenChannelIDs: Set<ChannelID> = [] {
+        didSet { refreshVisibleChannelGroups() }
+    }
+    var checkingChannelIDs: Set<ChannelID> = []
+    var selectedChannel: Channel?
+    var workspaceNavigationOverlay: WorkspaceNavigationOverlay?
+    var messageSearch = MessageSearchState()
+    @ObservationIgnored var messageSearchesByGuildID: [GuildID?: MessageSearchState] = [:]
+    let pinnedMessages = PinnedMessagesState()
+    let threadBrowser = ThreadBrowserState()
+    let inbox = InboxState()
+    @ObservationIgnored var lastDirectMessageSelection: DirectMessageSidebarSelection?
+    @ObservationIgnored var lastOpenedChannelIDsByGuild: [GuildID: ChannelID] = [:]
+    @ObservationIgnored var threadTimelinePosition = TimelineReadingPosition()
+    @ObservationIgnored var channelTimelinePosition = TimelineReadingPosition()
+    /// The content height of the window hosting the message timeline, which
+    /// sizes history reads.
+    @ObservationIgnored var timelineWindowHeight: CGFloat?
+    /// A message the next selection of its channel jumps to, so a cold
+    /// selection reads only the window around it.
+    @ObservationIgnored var pendingChannelJumpTarget: (channelID: ChannelID, messageID: MessageID)?
+    @ObservationIgnored var messages: [Message] = []
+    @ObservationIgnored var messageRows: [MessageRowPresentation] = []
+    @ObservationIgnored var messageRowsRevision: UInt64 = 0
+    var timelinePresentationRevision: UInt64 = 0
+    var appearanceSettings: AppearanceSettingsSnapshot
+    var interfaceSettings: InterfaceSettingsSnapshot
+    var generalInputSettings: GeneralInputSettingsSnapshot
+    var featuresSettings: FeaturesSettingsSnapshot
+    var attachmentSettings: AttachmentSettingsSnapshot
+    var accessibilitySettings: AccessibilitySettingsSnapshot
+    @ObservationIgnored var messageRowsUpdateHint: MessageRowsUpdateHint?
+    @ObservationIgnored let messageRowsUpdateJournal = MessageRowsUpdateJournal()
+    @ObservationIgnored let timelineSpoilerRevealStore =
+        NativeTimelineSpoilerRevealStore()
+    @ObservationIgnored let timelineSendTransitionStore =
+        NativeTimelineSendTransitionStore()
+    @ObservationIgnored var latestMessageRowsRevision: UInt64 = 0
+    @ObservationIgnored var messageRowsNonAppendRevision: UInt64 = 0
+    @ObservationIgnored var selectedMessageIDs: Set<MessageID> = []
+    @ObservationIgnored var selectedMessageStoredIndexByID: [MessageID: Int] = [:]
+    /// Stored indexes use a movable origin so prepending a history page does
+    /// not rewrite every existing message's dictionary value. A logical array
+    /// index is `stored - selectedMessageIndexOrigin`.
+    @ObservationIgnored var selectedMessageIndexOrigin = 0
+    @ObservationIgnored var selectedReplyMessageIDsByTarget:
+        [MessageID: Set<MessageID>] = [:]
+    var messageNavigationRequest: MessageNavigationRequest?
+    /// Only keyboard reply navigation scrolls; a pointer-chosen reply is on screen.
+    var replyRevealRequest: ReplyRevealRequest?
+    @ObservationIgnored var replyRevealRequestID: UInt64 = 0
+    var conversationNewestRequest: ConversationNewestRequest?
+    var presentedProfileGame: ProfileGame?
+    var mediaViewerPresentation: NativeTimelineMediaViewerPresentation?
+    /// The item the open media viewer shows as the user pages through it.
+    var mediaViewerSelectedItemID: String?
+    var unreadDividerMessageIDs: [ChannelID: MessageID] = [:]
+    var members: [Member] = [] {
+        didSet {
+            guard oldValue != members else { return }
+            let previousMembersByID = membersByID
+            if !defersMemberPresentationRebuild {
+                rebuildMemberSections()
+            }
+            let indexed = mergedMemberStore(with: members)
+            if membersByID != indexed {
+                membersByID = indexed
+                for commandComposer in commandComposers { commandComposer.refreshApplicationIdentities { indexed[$0]?.user } }
+            }
+            refreshVoiceSidebarPresentation(using: indexed)
+            var permissionsChanged = false
+            if let guildID = selectedGuildID,
+               let currentUserID = currentUser?.id,
+               let currentMember = indexed[currentUserID]
+            {
+                let roleIDs = Set(currentMember.roles.map(\.id))
+                if currentUserRoleIDsByGuild[guildID] != roleIDs {
+                    currentUserRoleIDsByGuild[guildID] = roleIDs
+                    readState.updateCurrentUserRoles(roleIDs, guildID: guildID)
+                    permissionsChanged = true
+                }
+            }
+            if permissionsChanged {
+                refreshUnreadPresentation(
+                    appliesAccessImmediately: true,
+                    accessAffectedGuildIDs: selectedGuildID.map { [$0] }
+                )
+            }
+            if !defersMemberPresentationRebuild {
+                publishTimelineMemberPresentationChanges(
+                    from: previousMembersByID,
+                    to: indexed
+                )
+            }
+        }
+    }
+
+    var membersByID: [UserID: Member] = [:]
+    @ObservationIgnored var membersByGuildID: [GuildID: [UserID: Member]] = [:]
+    var profileCustomStatus: ProfileCustomStatus?
+    var profileCustomStatusUserID: UserID?
+    var profileWidgetConnectionsRevision = UUID()
+    var profileInvalidationRevision = UUID()
+    @ObservationIgnored var memberListsByGuildID: [GuildID: [Member]] = [:]
+    @ObservationIgnored var memberListGroupsByGuildID: [GuildID: [GuildMemberListGroup]] = [:]
+    @ObservationIgnored var defersMemberPresentationRebuild = false
+    var memberSections: [MemberSection] = []
+    var threadMembersByID: [ChannelID: [Member]] = [:]
+    var memberListGroups: [GuildMemberListGroup] = [] {
+        didSet {
+            if oldValue != memberListGroups, !defersMemberPresentationRebuild {
+                rebuildMemberSections()
+            }
+        }
+    }
+    var guildRoles: [GuildRole] = [] {
+        didSet {
+            let presentationChanged = oldValue != guildRoles
+            if presentationChanged, !defersMemberPresentationRebuild {
+                rebuildMemberSections()
+                AppPerformanceSignposts.signposter.emitEvent(
+                    "TimelineInvalidationGuildRoles"
+                )
+                invalidateTimelinePresentation()
+            }
+        }
+    }
+    @ObservationIgnored var guildRolesByGuildID: [GuildID: [GuildRole]] = [:] {
+        didSet { if oldValue != guildRolesByGuildID { emojiEligibilityRevision &+= 1 } }
+    }
+    var mentionMemberResults: [Member] = []
+    var mentionAutocompleteMembers: [Member] = []
+    var knownMentionMembers: [UserID: Member] = [:] {
+        didSet {
+            if oldValue != knownMentionMembers {
+                AppPerformanceSignposts.signposter.emitEvent(
+                    "TimelineInvalidationKnownMentionMembers"
+                )
+                invalidateTimelinePresentation()
+            }
+        }
+    }
+    var roleMemberResult: RoleMemberResult?
+    var isLoadingRoleMembers = false
+    var roleMemberErrorMessage: String?
+    @ObservationIgnored var currentStatusRevision: UInt64 = 0
+    var currentStatus: PresenceStatus = .offline {
+        didSet {
+            guard oldValue != currentStatus else { return }
+            notificationService.setSuppressed(currentStatus == .dnd)
+            reconcilePrivateCallSounds()
+        }
+    }
+    var connectionState: ConnectionState = .disconnected
+    var isAuthenticated = false
+    var isSwitchingAccounts = false
+    var savedAccounts: [SavedAccount] = []
+    var activeAccountID: String?
+    @ObservationIgnored var diagnosticsShareInFlight = false
+    var sessionState: SessionState
+    var hasPendingLaunchWelcome: Bool
+    let launchMode: AppLaunchMode
+    let typingState: TypingStateModel
+    let commandComposer = ApplicationCommandComposerModel()
+    let translation: TranslationState
+    @ObservationIgnored lazy var threadCommandComposer = ApplicationCommandComposerModel(frecencyStore: commandComposer.frecencyStore)
+    let readState = AccountReadStateModel()
+    let notificationPreferences: NotificationPreferences
+    let voiceVideoPreferences: VoiceVideoPreferences
+    @ObservationIgnored let accessibilityMessageAnnouncer: AccessibilityMessageAnnouncer
+    @ObservationIgnored let notificationService: any NativeNotificationService
+    @ObservationIgnored let soundPlayer: any AppSoundPlaying
+    var isLoading = false
+    var isLoadingMessages = false
+    var hasCompletedInitialMessageLoad = false
+    var isLoadingEarlier = false
+    var isLoadingLater = false
+    var hasMoreMessages = false
+    var hasMoreLaterMessages = false {
+        didSet {
+            if hasMoreLaterMessages, !oldValue { detachedWindowEpoch = historyEpoch }
+        }
+    }
+    var messageLoadError: String?
+    @ObservationIgnored var messageLoadErrorIsEarlierPage = false
+    @ObservationIgnored var messageLoadErrorIsLaterPage = false
+    var forumPosts: [ForumPost] = []
+    var forumCataloguePosts: [ForumPost] = []
+    var forumCatalogueIndexByID: [ChannelID: Int] = [:]
+    var forumRecentPostCount = 0
+    var isLoadingForumPosts = false
+    var isSearchingForumPosts = false
+    var hasLoadedForumPosts = false
+    var isLoadingMoreForumPosts = false
+    var hasMoreForumPosts = false
+    var forumPostError: String?
+    var forumActionError: String?
+    var forumPaginationError: String?
+    var forumCreateProgress: MessageSendProgress?
+    var forwardingMessage: Message?
+    var forwardingErrorMessage: String?
+    var isForwardingMessages = false
+    var forwardDestinationHistory: [ChannelID] = []
+    var quickSwitcherDraftChannelIDs: [ChannelID] = []
+    var forwardSearchSourceRevision: UInt64 = 0
+    var forumCreateGeneration: UInt64 = 0
+    var forumSearchText = ""
+    var forumSelectedTagIDs: Set<ForumTagID> = []
+    var forumSortOrder: ForumSortOrder = .latestActivity
+    var forumLayout: ForumLayout = .list
+    var forumTagMatch: ForumTagMatch = .matchSome
+    @ObservationIgnored lazy var forumViewMemory = ForumViewMemory(defaults: launchMode == .normal ? PRBuildProfile.defaults : nil)
+    var interactionModalForm: InteractionModalFormState?
+    /// The open side chats: the single source of truth for threads, voice
+    /// chat, Guide resources and channel previews beside the primary
+    /// conversation. Change it through AppModelSideConversations.swift.
+    var sideConversations = SideConversationStack() { didSet { sideConversationsDidChange() } }
+    /// `isThreadFullWidth` for the menu commands' enabled states, which every
+    /// side chat change re-evaluated: they read only this, which changes
+    /// only when the full-width state does.
+    var shortcutThreadIsFullWidth = false
+    /// The Guide resource store; it lives exactly as long as its side chat.
+    var guideResource: GuildResourceState?
+    /// Re-resolution of the open private thread after a fresh READY did not
+    /// confirm it. Closing or reopening the conversation clears it.
+    var openThreadResolution: OpenThreadResolution?
+    var openThreadStarter: User?
+    var openThreadStartedAt: Date?
+    @ObservationIgnored var openThreadStarterMessageID: MessageID?
+    var threadMessages: [Message] = [] {
+        didSet {
+            let oldRows = threadMessageRows
+            let newRows = MessageGrouping.updating(
+                existing: threadMessageRows,
+                oldMessages: oldValue,
+                newMessages: threadMessages
+            )
+            let nextRevision = threadMessageRowsRevision &+ 1
+            let record = MessageRowsUpdateRecordBuilder.make(
+                oldRows: oldRows,
+                newRows: newRows,
+                revision: nextRevision
+            )
+            threadMessageRows = newRows
+            threadMessageRowsUpdateHint = record.change.map {
+                MessageRowsUpdateHint(
+                    revision: nextRevision,
+                    change: $0
+                )
+            }
+            threadMessageRowsUpdateJournal.append(record)
+            threadMessageRowsRevision = nextRevision
+            NotificationCenter.default.post(
+                name: .sakuracordMessageRowsDidChange,
+                object: self
+            )
+        }
+    }
+    @ObservationIgnored var threadMessageRows:
+        [MessageRowPresentation] = []
+    @ObservationIgnored var threadMessageRowsUpdateHint:
+        MessageRowsUpdateHint?
+    @ObservationIgnored let threadMessageRowsUpdateJournal = MessageRowsUpdateJournal()
+    @ObservationIgnored var threadMessageRowsRevision: UInt64 = 0
+    var isLoadingThread = false
+    var hasCompletedInitialThreadLoad = false
+    var isLoadingEarlierThread = false
+    var isLoadingLaterThread = false
+    var hasMoreThreadMessages = false
+    /// The thread window is detached from the newest message, as after
+    /// jumping to an older message.
+    var hasMoreLaterThreadMessages = false
+    /// Identifies the open thread instance. Loads started for an earlier
+    /// instance, including one of the same thread, are discarded.
+    @ObservationIgnored var threadLoadGeneration = 0
+    @ObservationIgnored var threadWindow = ThreadWindowOwnership()
+    /// Advanced at every Gateway gap. History read in an earlier epoch cannot
+    /// prove that a window reaches the newest message.
+    @ObservationIgnored var historyEpoch = 0
+    var threadErrorMessage: String?
+    @ObservationIgnored var threadErrorScope: ThreadErrorScope?
+    var canRetryThreadLoad: Bool { threadErrorScope.map { $0 != .action } ?? false }
+    @ObservationIgnored let composer: MessageComposerState
+    @ObservationIgnored let voiceMessagePlayback = VoiceMessagePlaybackStore()
+    @ObservationIgnored let attachmentDownloads = AttachmentDownloadStore()
+    @ObservationIgnored let attachmentUploads = AttachmentUploadProgressStore()
+    @ObservationIgnored let channelVoiceMessageComposer = VoiceMessageComposerState(destination: .channel)
+    @ObservationIgnored let threadVoiceMessageComposer = VoiceMessageComposerState(destination: .thread)
+    var gifResults: [GIFSearchResult] = []
+    var gifCategories: [GIFPickerCategory] = []
+    var gifTrendingPreviewURL: URL?
+    var favoriteGIFs: [GIFSearchResult] = []
+    var isLoadingGIFs = false
+    var isLoadingGIFPicker = false
+    var gifErrorMessage: String?
+    var gifFavoriteMutationURL: URL?
+    @ObservationIgnored var gameMentions = GameMentionState()
+    var stickerPickerState = StickerPickerPresentationState()
+    /// `/gif` and `/sticker` open the composer's pickers.
+    var builtInExpressionPickerRequest: BuiltInExpressionPickerRequest?
+    var soundboardState = SoundboardPresentationState()
+    var supportedCapabilities: Set<ChatCapability> = []
+    var componentInteractionPresentation =
+        ComponentInteractionPresentationState()
+    /// Views render profiles through `liveProfilePresentation(for:)`.
+    var inspectorProfilePresentation:
+        ProfilePresentationState?
+    var contextualProfilePresentation:
+        ProfilePresentationState?
+    var expandedProfilePresentation: ProfilePresentationState?
+    var isInspectorProfilePresented = false
+    var selectedMember: Member? {
+        inspectorProfilePresentation?.member
+    }
+    var selectedProfile: UserProfile? {
+        inspectorProfilePresentation?.profile
+    }
+    var isLoadingProfile: Bool {
+        inspectorProfilePresentation?.isLoading ?? false
+    }
+    var profileErrorMessage: String? {
+        inspectorProfilePresentation?.errorMessage
+    }
+    var activeVoiceChannel: Channel? {
+        didSet {
+            guard oldValue != activeVoiceChannel else { return }
+            refreshVoiceSidebarPresentation()
+        }
+    }
+    var voiceSessionState: VoiceSessionState = .idle
+    var voiceConnectedAt: Date?
+    var voiceParticipants: [VoiceRemoteParticipant] = []
+    var isLocallySpeaking = false
+    var voiceVideoFrames: [String: VoiceVideoFrame] = [:]
+    var voiceEncryptionVersion: UInt16?
+    var voiceLatencyMilliseconds: Int?
+    var voiceErrorMessage: String?
+    var applicationStreams: [ApplicationStreamKey: ApplicationStream] = [:]
+    var applicationStreamStates: [ApplicationStreamKey: ApplicationStreamPlaybackState] = [:]
+    var applicationStreamFrames: [ApplicationStreamKey: VoiceVideoFrame] = [:]
+    var localApplicationStreamKey: ApplicationStreamKey?
+    var isScreenSharePreviewPresented = false
+    var screenShareSettings = ScreenShareSettings()
+    var screenSharePreviewFrame: VoiceVideoFrame?
+    var screenShareCaptureState: ScreenShareCaptureState = .idle
+    var screenShareSourceName = "Choose a source"
+    var screenShareErrorMessage: String?
+    var isStartingScreenShare = false
+    var isScreenShareCaptureAvailable = false
+    var isLocalScreenSharePreviewPaused = false
+    var voiceDeviceStatusMessage: String?
+    var selectedCameraUID: String?
+    @ObservationIgnored var defersVoiceSidebarPresentation = false
+    var voiceStates: [UserID: VoiceParticipantState] = [:] {
+        didSet {
+            guard !defersVoiceSidebarPresentation, oldValue != voiceStates else { return }
+            refreshVoiceSidebarPresentation()
+            reconcileIgnoredVoiceParticipants(previous: oldValue)
+        }
+    }
+    var privateCallsByChannel: [ChannelID: PrivateCall] = [:]
+    var privateCallActionChannelIDs: Set<ChannelID> = []
+    var mediaDevices: MediaDeviceSnapshot = .empty
+    var emojisByGuild: [GuildID: [DiscordEmoji]] = [:] {
+        didSet { requestOrderedCustomEmojiUpdate() }
+    }
+    var loadingEmojiGuildIDs: Set<GuildID> = []
+    var emojiLoadErrorsByGuild: [GuildID: String] = [:]
+    @ObservationIgnored let emojiFrecency = DiscordFrecencyStore(kind: .emoji)
+    @ObservationIgnored let reactionEmojiFrecency = DiscordFrecencyStore(kind: .reaction)
+    @ObservationIgnored var emojiFrecencySaveTask: Task<Bool, Never>?
+    @ObservationIgnored var emojiSettingsLoadTask: Task<EmojiUserSettings?, Never>?
+    @ObservationIgnored var deferredEmojiSettings: EmojiUserSettings?
+    @ObservationIgnored var emojiSettingsDataVersion: UInt32?
+    var discordFrequentlyUsedReactionKeys: [String] = []
+    var discordReactionUsageScores: [String: Int] = [:]
+    var discordFavoriteEmojiKeys: [String] = []
+    var discordFrequentlyUsedEmojiKeys: [String] = []
+    var discordEmojiUsageScores: [String: Int] = [:]
+    var discordGuildAndChannelUsageScores: [String: Int] = [:]
+    var discordSyncedGuildAndChannelUsageScores: [String: Int] = [:]
+    var discordGuildAndChannelUsage: [String: DiscordFrecencyUsage] = [:]
+    var discordGuildAndChannelUsageOrder: [String] = []
+    @ObservationIgnored var forwardDestinationHistoryDefaultsKey = "dev.sakuracord.forward-destination-history.signed-out"
+    @ObservationIgnored var pendingDiscordFrecencyUses: [(key: String, timestamp: UInt64)] = []
+    @ObservationIgnored var persistedDiscordFrecencyUsageDeltas: [String: DiscordFrecencyUsage] = [:]
+    @ObservationIgnored var discordFrecencyUsageDeltasDefaultsKey = "dev.sakuracord.forward-frecency-deltas.signed-out"
+    @ObservationIgnored var appliedDiscordFrecencyDeltasKey: String?
+    @ObservationIgnored var lastDiscordFrecencyChannelID: ChannelID?
+    @ObservationIgnored var lastDiscordFrecencyGuildID: GuildID?
+    var hasLoadedDiscordEmojiSettings = false
+    var orderedCustomEmojis: [DiscordEmoji] = []
+    var customEmojiURLsByID: CustomEmojiImageURLs = [:]
+    @ObservationIgnored var orderedCustomEmojiUpdateTask: Task<Void, Never>?
+    @ObservationIgnored var orderedCustomEmojiUpdateGeneration: UInt64 = 0
+
+    var isVoiceMuted = false {
+        didSet {
+            guard oldValue != isVoiceMuted else { return }
+            refreshVoiceSidebarPresentation()
+        }
+    }
+    var isVoiceDeafened = false {
+        didSet {
+            guard oldValue != isVoiceDeafened else { return }
+            refreshVoiceSidebarPresentation()
+        }
+    }
+    /// Whether the current mute came from deafening, so undeafening restores it.
+    @ObservationIgnored var voiceMutedByDeafen = false
+    var isCameraEnabled = false {
+        didSet {
+            guard oldValue != isCameraEnabled else { return }
+            refreshVoiceSidebarPresentation()
+        }
+    }
+    var selectedGuildID: GuildID? {
+        didSet {
+            if oldValue != selectedGuildID { switchMessageSearchScope(from: oldValue) }
+            refreshServerRailSelection()
+            refreshSelectedGuildPresentation()
+        }
+    }
+    var selectedConversationAccess: ConversationAccess {
+        guard let channel = selectedChannel else { return .checking }
+        return conversationAccess(for: channel)
+    }
+
+    var canCreateForumPosts: Bool {
+        selectedConversationAccess.canSend
+            && supportedCapabilities.contains(.forums)
+    }
+
+    var canManageForumPosts: Bool {
+        guard let permissions = selectedEffectivePermissions else { return false }
+        return permissions & DiscordPermissionBits.manageThreads != 0
+    }
+
+    var canAttachFilesToForumPosts: Bool {
+        guard canCreateForumPosts, let permissions = selectedEffectivePermissions else { return false }
+        return permissions & DiscordPermissionBits.attachFiles != 0
+    }
+
+    func currentUserRoleIDs(for guildID: GuildID?) -> Set<RoleID> {
+        guard let guildID else { return [] }
+        return currentUserRoleIDsByGuild[guildID] ?? []
+    }
+
+    var selectedEffectivePermissions: UInt64? {
+        guard let channel = selectedChannel else { return nil }
+        guard let guildID = channel.guildID else { return .max }
+        guard let guild = serverRailGuildsByID[guildID],
+              let currentUserID = currentUser?.id
+        else {
+            return nil
+        }
+        return ConversationPermissionResolver.effectivePermissions(
+            guild: guild,
+            channel: channel,
+            currentUserID: currentUserID,
+            currentMember: onboardingMember(in: guildID),
+            roles: guildRoles,
+            currentRoleIDs: currentUserRoleIDsByGuild[guildID]
+        )
+    }
+
+    func conversationAccess(for channel: Channel) -> ConversationAccess {
+        Self.resolveConversationAccess(
+            for: channel,
+            permissionBasis: channel.guildID.flatMap(conversationPermissionBasis(for:))
+        )
+    }
+
+    func conversationPermissionBasis(
+        for guildID: GuildID
+    ) -> ConversationPermissionBasis? {
+        guard let guild = serverRailGuildsByID[guildID],
+              let currentUserID = currentUser?.id
+        else {
+            return nil
+        }
+        let member = onboardingMember(in: guildID)
+        let roles =
+            guildRolesByGuildID[guildID]
+            ?? (guildID == selectedGuildID ? guildRoles : [])
+        let storedRoleIDs = currentUserRoleIDsByGuild[guildID]
+        let roleIDs = storedRoleIDs ?? Set(member?.roles.map(\.id) ?? [])
+        return ConversationPermissionBasis(
+            guild: guild,
+            resolvedBasePermissions: guild.currentUserPermissions
+                ?? ConversationPermissionResolver.basePermissions(
+                    guildID: guildID,
+                    roleIDs: roleIDs,
+                    roles: roles
+                ),
+            overwritePrincipals: PermissionOverwritePrincipals(
+                guildID: guildID,
+                currentUserID: currentUserID,
+                roleIDs: roleIDs
+            ),
+            hasCurrentRoleIdentity: storedRoleIDs != nil || member != nil,
+            currentUserIsPending: onboardingMember(in: guildID)?.isPending == true,
+            currentUserCommunicationDisabledUntil: member?.communicationDisabledUntil,
+            currentUserRequiresOnboarding: requiresOnboarding(in: guildID),
+            currentUserOnboardingIsKnown: !guild.features.contains("GUILD_ONBOARDING") || onboardingMember(in: guildID)?.flags != nil
+        )
+    }
+
+    func effectiveMessagePermissions(in channel: Channel) -> UInt64? {
+        guard let guildID = channel.guildID,
+              let basis = conversationPermissionBasis(for: guildID)
+        else { return channel.guildID == nil ? .max : nil }
+        return ConversationPermissionResolver.effectivePermissions(
+            guild: basis.guild,
+            channel: channel,
+            resolvedBasePermissions: basis.resolvedBasePermissions,
+            overwritePrincipals: basis.overwritePrincipals,
+            hasCurrentRoleIdentity: basis.hasCurrentRoleIdentity,
+            communicationDisabledUntil: basis.currentUserCommunicationDisabledUntil
+        )
+    }
+
+    func conversationAccess(
+        for channel: Channel,
+        permissionBasis: ConversationPermissionBasis?
+    ) -> ConversationAccess {
+        Self.resolveConversationAccess(
+            for: channel,
+            permissionBasis: permissionBasis
+        )
+    }
+
+    func canJoinVoice(_ channel: Channel) -> Bool {
+        guard channel.kind == .voice
+                || channel.kind == .directMessage
+                || channel.kind == .groupDirectMessage
+        else { return false }
+        // A message request takes no calls until it is accepted; call setup
+        // can hold an older channel value, so read the current set.
+        return !awaitsMessageRequestDecision(in: channel.id) && conversationAccess(for: channel).isReadable
+    }
+
+    var conversationNavigationHistory = ConversationNavigationHistory()
+    var selectedChannelID: ChannelID? {
+        didSet {
+            guard selectedChannelID != oldValue else { return }
+            channelVoiceMessageComposer.discard(playback: voiceMessagePlayback)
+            // Only a conversation in Direct Messages replaces its Friends home.
+            if selectedChannelID != nil, selectedGuildID == nil {
+                friends.isPresented = false
+                friends.messageRequestsTab = nil
+            }
+            let keepsGuildPage = selectionChangeKeepsGuildPage
+            if !keepsGuildPage {
+                onboarding.presentedGuildID = nil
+            }
+            refreshServerRailSelection()
+            if !keepsGuildPage { recordConversationNavigation() }
+            timelineSpoilerRevealStore.reset()
+            if !keepsGuildPage, let previousChannel = selectedChannel,
+               let guildID = previousChannel.guildID
+            {
+                lastOpenedChannelIDsByGuild[guildID] = previousChannel.id
+            }
+            if pendingAutomaticChannelAccessID != selectedChannelID {
+                pendingAutomaticChannelAccessID = nil
+            }
+            memberListViewportRequest = nil
+            if let retainedMemberViewport = lastMemberListVisibleRange {
+                updateMemberListViewport(retainedMemberViewport)
+            }
+            if let selectedChannelID {
+                AppPerformanceSignposts.ensureConversationNavigation(
+                    to: selectedChannelID
+                )
+            } else {
+                AppPerformanceSignposts.cancelConversationNavigation()
+            }
+            dismissInspectorProfile()
+            if let oldValue {
+                cancelConversationRefresh(in: oldValue)
+                unreadDividerMessageIDs[oldValue] = nil
+                if conversationNewestRequest?.channelID == oldValue {
+                    conversationNewestRequest = nil
+                }
+                retainSelectedMessageWindow(for: oldValue)
+                lastTypingRequestAt[oldValue] = nil
+                _ = readState.updatePresentation(channelID: oldValue, isPresented: false)
+                if readState.endForumVisit(channelID: oldValue) {
+                    refreshUnreadPresentation()
+                }
+            }
+            selectedChannel =
+                snapshot?.channels.first { $0.id == selectedChannelID }
+                    ?? visibleChannels.first { $0.id == selectedChannelID }
+            if let selectedChannel,
+               let guildID = selectedChannel.guildID
+            {
+                lastOpenedChannelIDsByGuild[guildID] = selectedChannel.id
+            }
+            if let selectedChannel, selectedChannel.kind == .directMessage || selectedChannel.kind == .groupDirectMessage {
+                lastDirectMessageSelection = .channel(selectedChannel.id)
+            }
+            builtInExpressionPickerRequest = nil
+            cancelApplicationCommandAutocompleteTask()
+            cancelApplicationCommandMemberSearch()
+            commandComposer.resetForChannelChange()
+            clearComposerAttachments(for: .channel)
+            translation.resetDraft(.channel)
+            synchronizeSideConversationsWithSelection(keepsGuildPage: keepsGuildPage)
+            if let selectedChannelID {
+                _ = readState.updatePresentation(
+                    channelID: selectedChannelID,
+                    isPresented: isConversationPresented(selectedChannelID),
+                    initialHistoryLoaded: false,
+                    initialPositionEstablished: false,
+                    windowIsActive: mainWindowIsActive,
+                    hasReachedReadBoundary: false,
+                    blocksAutomaticAcknowledgement: false
+                )
+            }
+            if selectedChannel?.kind == .forum {
+                if let selectedChannelID {
+                    readState.beginForumVisit(channelID: selectedChannelID)
+                }
+                beginForumLoad()
+            } else {
+                beginSelectedChannelLoad()
+            }
+            if let channel = selectedChannel,
+               channel.kind == .directMessage || channel.kind == .groupDirectMessage
+            {
+                let account = accountSession()
+                startAccountChildTask(account: account) { model, account in
+                    await model.observePrivateCall(in: channel, account: account)
+                }
+            }
+        }
+    }
+
+    var oversizedAttachmentPrompt: OversizedAttachmentPrompt?
+    var attachmentCompactionPresentation: OversizedAttachmentPrompt?
+    var externalAttachmentUploadPresentation: ExternalAttachmentUploadPresentation?
+    var showInspector = true
+    var errorMessage: String?
+
+    @ObservationIgnored var provider: any ChatProvider
+    @ObservationIgnored var database: SakuraCordDatabase?
+    @ObservationIgnored var accountSessionGeneration: UInt64 = 0
+    @ObservationIgnored var installedAccountSessionRevision: UInt64 = 0
+    @ObservationIgnored let accountTransitionCoordinator = AccountTransitionCoordinator()
+    @ObservationIgnored var accountTransitionIsActive = false
+    @ObservationIgnored var accountChildTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored let runsChatPerformanceBenchmark: Bool
+    @ObservationIgnored var eventTask: Task<Void, Never>?
+    @ObservationIgnored var locallyStartedOutgoingPrivateCallRings:
+        Set<ChannelID> = []
+    @ObservationIgnored var outgoingPrivateCallRingTimeoutTasks:
+        [ChannelID: Task<Void, Never>] = [:]
+    @ObservationIgnored var pendingCreatedMessages:
+        [PreparedCreatedMessage] = []
+    @ObservationIgnored var createdMessageFlushTask: Task<Void, Never>?
+    @ObservationIgnored var isFlushingCreatedMessageBatch = false
+    @ObservationIgnored var batchedSelectedMessages: [Message] = []
+    @ObservationIgnored var batchedSelectedTextPlansByID:
+        [MessageID: NativeTimelineTextPlan] = [:]
+    @ObservationIgnored var batchedUnreadPresentationNeedsRefresh = false
+    @ObservationIgnored var hasDeferredUnreadPresentationRefresh = false
+    @ObservationIgnored var unreadPresentationRefreshTask: Task<Void, Never>?
+    @ObservationIgnored var unreadPresentationPreparationTask: Task<Void, Never>?
+    @ObservationIgnored var unreadPresentationPreparationGeneration: UInt64 = 0
+    @ObservationIgnored var unreadPresentationPreparationSequence: UInt64 = 0
+    @ObservationIgnored var activeUnreadPreparationGeneration: UInt64?
+    @ObservationIgnored var unreadAccessProjectionGeneration: UInt64 = 0
+    @ObservationIgnored var snapshotSourceRevision: UInt64 = 0
+    @ObservationIgnored var shortcutUnreadNavigationCandidateIndex: Int?
+    @ObservationIgnored var shortcutMentionNavigationCandidateIndex: Int?
+    @ObservationIgnored var batchedAcknowledgementChannelIDs:
+        Set<ChannelID> = []
+    @ObservationIgnored let maximumCreatedMessagesPerFlush = 4
+    @ObservationIgnored var localTypingTask: Task<Void, Never>?
+    @ObservationIgnored var localTypingChannelID: ChannelID?
+    @ObservationIgnored var lastTypingRequestAt: [ChannelID: Date] = [:]
+    @ObservationIgnored var localTypingGeneration: UInt64 = 0
+    @ObservationIgnored let localTypingTiming: LocalTypingTiming
+    @ObservationIgnored var inspectorProfileTask:
+        Task<Void, Never>?
+    @ObservationIgnored var contextualProfileTask:
+        Task<Void, Never>?
+    @ObservationIgnored var expandedProfileTask: Task<Void, Never>?
+    @ObservationIgnored var preparedProfileEditingSnapshot: ProfileEditingSnapshot?
+    @ObservationIgnored var currentUserProfilePrefetch: CurrentUserProfilePrefetch?
+    @ObservationIgnored var profileCache: [ProfileCacheKey: UserProfile] = [:]
+    @ObservationIgnored var channelLoadTask: Task<Void, Never>?
+    @ObservationIgnored var bootstrapHistoryPrefetch: BootstrapHistoryPrefetch?
+    @ObservationIgnored var conversationRefreshJournals:
+        [ChannelID: ConversationRefreshJournal] = [:]
+    @ObservationIgnored var conversationRefreshJournalRevision: UInt64 = 0
+    @ObservationIgnored var scopedRefreshJournals: [UInt64: ScopedConversationRefreshJournal] = [:]
+    /// The newest message through which a conversation's retained messages
+    /// are known to be gap-free. Messages after it arrived live after a
+    /// Gateway gap or while a thread was closed, so they cannot prove that a
+    /// fresh newest page connects to the older retained history.
+    @ObservationIgnored var contiguousHistoryBoundaries: [ChannelID: MessageID] = [:]
+    @ObservationIgnored var forumLoadTask: Task<Void, Never>?
+    @ObservationIgnored var forumNextOffset: Int?
+    @ObservationIgnored var forumLoadGeneration: UInt64 = 0
+    @ObservationIgnored var threadLoadTask: Task<Void, Never>?
+    /// Set while closing a channel preview restores the selection it borrowed.
+    @ObservationIgnored var isRestoringPreviewSelection = false
+    @ObservationIgnored var gifSearchTask: Task<Void, Never>?
+    @ObservationIgnored var gifPickerLoadTask: Task<Void, Never>?
+    @ObservationIgnored var gifPickerLoadGeneration: UInt64 = 0
+    @ObservationIgnored var soundboardLoadTask: Task<Void, Never>?
+    @ObservationIgnored var soundboardLoadGeneration: UInt64 = 0
+    @ObservationIgnored var commandFrecencySaveTask: Task<Void, Never>?
+    @ObservationIgnored var deferredCommandFrecency: DiscordFrecencyHistory?
+    @ObservationIgnored var commandFrecencyLoadTask: Task<Void, Never>?
+    @ObservationIgnored var commandFrecencyFlushTask: Task<Void, Never>?
+    @ObservationIgnored var mentionMemberSearchTask: Task<Void, Never>?
+    @ObservationIgnored var mentionMemberSearchQuery: CommandMemberQuery?
+    @ObservationIgnored var mentionMemberSearchCache:
+        [CommandMemberQuery: MentionMemberSearchCacheEntry] = [:]
+    @ObservationIgnored var roleMemberTask: Task<Void, Never>?
+    @ObservationIgnored var stickerLoadTasks: [GuildID: Task<Void, Never>] = [:]
+    @ObservationIgnored var stickerLoadGeneration: UInt64 = 0
+    @ObservationIgnored var interactionDeadlineTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored var pendingInteractions: [String: PendingInteractionRecord] = [:]
+    @ObservationIgnored var pendingInteractionOrder: [String] = []
+    @ObservationIgnored var reactionReactorLoadTasks: [ReactionReactorLoadKey: Task<Void, Never>] = [:]
+    @ObservationIgnored var reactionReactorLoadIDs: [ReactionReactorLoadKey: UUID] = [:]
+    @ObservationIgnored var loadedReactionReactorPreviews:
+        [ReactionReactorLoadKey: (count: Int, reactors: [ReactionReactor])] = [:]
+    @ObservationIgnored var failedReactionReactorLoads: [ReactionReactorLoadKey: Date] = [:]
+    @ObservationIgnored var liveScrollingConversationIDs:
+        Set<ChannelID> = []
+    @ObservationIgnored var timelineScrollActivityRevision: UInt64 = 0
+    @ObservationIgnored let reactionReactorLoadLimiter = ReactionReactorLoadLimiter(
+        maximumConcurrentLoads: maximumConcurrentReactionReactorLoads
+    )
+    @ObservationIgnored var reactionMutations:
+        [ReactionMutationKey: ReactionMutationState] = [:]
+    @ObservationIgnored var reactionMutationTasks:
+        [ReactionMutationKey: Task<Void, Never>] = [:]
+    @ObservationIgnored let reactionMutationTiming: ReactionMutationTiming
+    @ObservationIgnored var pollVoteMutations: [MessageID: PollVoteMutationState] = [:]
+    @ObservationIgnored var pollResultRefreshJournals: [MessageID: ConversationRefreshJournal] = [:]
+    @ObservationIgnored var guildActivationTask: Task<Void, Never>?
+    @ObservationIgnored var openThreadResolutionTask: Task<Void, Never>?
+    @ObservationIgnored var conversationNavigationTarget: PendingConversationNavigation?
+    /// Advanced whenever the side conversation or guild page changes outside a
+    /// navigation's own work: closing, opening or creating a thread, or
+    /// opening a guild page.
+    @ObservationIgnored var sideConversationRevision: UInt64 = 0
+    @ObservationIgnored var memberLoadTask: Task<Void, Never>?
+    @ObservationIgnored var memberLoadGeneration: UInt64 = 0
+    @ObservationIgnored var memberListViewportRequest: MemberListViewportRequest?
+    @ObservationIgnored var lastMemberListVisibleRange: ClosedRange<Int>?
+    @ObservationIgnored var pendingAutomaticChannelAccessID: ChannelID?
+    @ObservationIgnored var voiceEventTask: Task<Void, Never>?
+    @ObservationIgnored var voiceMigrationTask: Task<Void, Never>?
+    @ObservationIgnored var voiceSession: DiscordVoiceSession?
+    @ObservationIgnored var applicationStreamSessions:
+        [ApplicationStreamKey: DiscordVoiceSession] = [:]
+    @ObservationIgnored var applicationStreamEventTasks:
+        [ApplicationStreamKey: Task<Void, Never>] = [:]
+    @ObservationIgnored var applicationStreamOperationGenerations:
+        [ApplicationStreamKey: UInt64] = [:]
+    @ObservationIgnored var applicationStreamDemandGenerations:
+        [ApplicationStreamKey: UInt64] = [:]
+    @ObservationIgnored var applicationStreamDemandUpdateTasks = [ApplicationStreamKey: Task<Void, Never>]()
+    @ObservationIgnored var manuallyStoppedApplicationStreamKeys = Set<ApplicationStreamKey>()
+    @ObservationIgnored var applicationStreamDemandIntents:
+        [ApplicationStreamKey: ApplicationStreamDemandIntent] = [:]
+    @ObservationIgnored var screenShareCaptureEngine: ScreenShareCaptureEngine?
+    @ObservationIgnored var screenSharePreviewTask: Task<Void, Never>?
+    @ObservationIgnored var screenShareCaptureEventTask: Task<Void, Never>?
+    @ObservationIgnored var mediaDeviceMonitor: MediaDeviceMonitor?
+    @ObservationIgnored var voiceMigrationGeneration = 0
+    @ObservationIgnored var voiceActionGeneration: UInt64 = 0
+    @ObservationIgnored var privateCallActionGeneration: UInt64 = 0
+    @ObservationIgnored var channelLoadGeneration = 0
+    @ObservationIgnored var messageNavigationRequestID: UInt64 = 0
+    @ObservationIgnored var conversationNewestRequestID: UInt64 = 0
+    @ObservationIgnored var messageCache: [ChannelID: [Message]] = [:]
+    @ObservationIgnored var messageCacheOrder: [ChannelID] = []
+    @ObservationIgnored var messageRowCache:
+        [ChannelID: [MessageRowPresentation]] = [:]
+    @ObservationIgnored var messageRowCacheOrder: [ChannelID] = []
+    @ObservationIgnored var hasMoreCache: [ChannelID: Bool] = [:]
+    /// Cached windows that do not reach the channel's newest message.
+    @ObservationIgnored var detachedMessageWindows: [ChannelID: DetachedMessageWindow] = [:]
+    /// The Gateway epoch the selected channel's window was detached in.
+    @ObservationIgnored var detachedWindowEpoch = 0
+    /// Latest known message per thread, drawn in timeline thread cards.
+    @ObservationIgnored var threadPreviewMessages: [ChannelID: Message] = [:]
+    @ObservationIgnored var threadPreviewParentIDs: [ChannelID: ChannelID] = [:]
+    @ObservationIgnored let discordNetworkDisabled: Bool
+    @ObservationIgnored let usesInsecureDebugCredentials: Bool
+    @ObservationIgnored let restoresStoredSession: Bool
+    @ObservationIgnored let credentialStore: any CredentialStore
+    @ObservationIgnored let savedAccountStore: any SavedAccountStoring
+    @ObservationIgnored let authenticatedProviderFactory:
+        (CredentialHandle, String?) -> any ChatProvider
+    @ObservationIgnored let pendingAuthenticatedProviderFactory:
+        (PendingDiscordCredential, String?) -> any PendingCredentialChatProvider
+    @ObservationIgnored let accountDatabaseFactory:
+        (AccountID) -> SakuraCordDatabase?
+    @ObservationIgnored let persistsEmojiPreferences: Bool
+    @ObservationIgnored var didAttemptSessionRestore = false
+    @ObservationIgnored var credentialHandle: CredentialHandle?
+    @ObservationIgnored var credentialHandlesByAccountID: [String: CredentialHandle] = [:]
+    @ObservationIgnored var didAttemptDiscordEmojiSettings = false
+    @ObservationIgnored var acknowledgementTasks: [ChannelID: Task<Void, Never>] = [:]
+    /// The target each debounced acknowledgement task will send.
+    @ObservationIgnored var queuedAcknowledgements: [(channelID: ChannelID, mutation: ReadStateMutation)] = []
+    @ObservationIgnored var acknowledgementProcessorTask: Task<Void, Never>?
+    @ObservationIgnored var acknowledgementGeneration = 0
+    var isMarkingAllServersRead = false
+    @ObservationIgnored var allServersReadTask: Task<Void, Never>?
+    @ObservationIgnored var guildAcknowledgementTasks:
+        [GuildID: Task<Void, Never>] = [:]
+    @ObservationIgnored var guildNotificationMutationTasks: [GuildID: Task<Void, Never>] = [:]
+    @ObservationIgnored var guildNotificationSettingsRevisions: [GuildID: UInt64] = [:]
+    @ObservationIgnored var channelNotificationMutationTasks: [ChannelID: Task<Void, Never>] = [:]
+    @ObservationIgnored var categoryCollapseMutationTasks: [ChannelID: Task<Void, Never>] = [:]
+    @ObservationIgnored var categoryCollapseMutationStates:
+        [ChannelID: CategoryCollapseMutationState] = [:]
+    var optimisticCategoryCollapsedByID: [ChannelID: Bool] = [:]
+    @ObservationIgnored var channelNotificationMutationGeneration = 0
+    @ObservationIgnored var forumNotificationMutationTasks:
+        [ChannelID: Task<Void, Never>] = [:]
+    @ObservationIgnored var forumNotificationMutationGeneration = 0
+    @ObservationIgnored var mainWindowIsActive = false
+    @ObservationIgnored var applicationIsActive = false
+    /// The Dock bounce requested for a call ringing in the background.
+    @ObservationIgnored var incomingCallAttentionRequest: Int?
+    @ObservationIgnored var ringingMuteExpiryTask: Task<Void, Never>?
+    @ObservationIgnored var clientAppStateUpdateTask: Task<Void, Never>?
+    var emojiEligibilityRevision: UInt64 = 0
+    @ObservationIgnored var currentUserRoleIDsByGuild: [GuildID: Set<RoleID>] = [:] {
+        didSet { if oldValue != currentUserRoleIDsByGuild { emojiEligibilityRevision &+= 1 } }
+    }
+    @ObservationIgnored let readAcknowledgementTiming: ReadAcknowledgementTiming
+    @ObservationIgnored let externalAttachmentUploader: any ExternalAttachmentUploading
+    @ObservationIgnored let attachmentCompactor: any AttachmentCompacting
+    @ObservationIgnored let attachmentSettingsStore: AttachmentSettingsStore
+    @ObservationIgnored var attachmentCompactionTask: Task<Void, Never>?
+    @ObservationIgnored var attachmentCompactionGeneration: UInt64 = 0
+    @ObservationIgnored let uploadPrivacyPreparation: UploadPrivacyPreparation
+    @ObservationIgnored let privacySafetySettingsStore: PrivacySafetySettingsStore
+    @ObservationIgnored var queuedOversizedAttachmentPrompts: [OversizedAttachmentPrompt] = []
+    @ObservationIgnored var activeAttachmentUploadCount = 0
+    @ObservationIgnored var externalAttachmentUploadTask: Task<Void, Never>?
+    @ObservationIgnored var externalAttachmentUploadGeneration: UInt64 = 0
+    @ObservationIgnored var promisedAttachmentDirectoryByFileURL: [URL: URL] = [:]
+    @ObservationIgnored var promisedAttachmentFilesInFlight: Set<URL> = []
+    @ObservationIgnored var externalAttachmentUploadFileURL: URL?
+
+    let includesOfflineSignIn: Bool
+    var awaitsOfflineSignIn: Bool
+
+    init(
+        launchMode: AppLaunchMode,
+        awaitsOfflineSignIn: Bool = false,
+        hasSavedAccountsAtLaunch: Bool = false,
+        provider: (any ChatProvider)? = nil,
+        discordNetworkDisabledOverride: Bool? = nil,
+        usesInsecureDebugCredentialsOverride: Bool? = nil,
+        restoresStoredSession: Bool = true,
+        credentialStore: (any CredentialStore)? = nil,
+        savedAccountStore: (any SavedAccountStoring)? = nil,
+        authenticatedProviderFactory: ((CredentialHandle, String?) -> any ChatProvider)? = nil,
+        pendingAuthenticatedProviderFactory:
+            ((PendingDiscordCredential, String?) -> any PendingCredentialChatProvider)? = nil,
+        accountDatabaseFactory: ((AccountID) -> SakuraCordDatabase?)? = nil,
+        notificationService: (any NativeNotificationService)? = nil,
+        soundPlayer: (any AppSoundPlaying)? = nil,
+        notificationPreferences: NotificationPreferences? = nil,
+        voiceVideoPreferences: VoiceVideoPreferences? = nil,
+        accessibilityMessageAnnouncer: AccessibilityMessageAnnouncer? = nil,
+        localTypingTiming: LocalTypingTiming = LocalTypingTiming(),
+        reactionMutationTiming: ReactionMutationTiming = ReactionMutationTiming(),
+        readAcknowledgementTiming: ReadAcknowledgementTiming = ReadAcknowledgementTiming(),
+        runsChatPerformanceBenchmarkOverride: Bool? = nil,
+        externalAttachmentUploader: (any ExternalAttachmentUploading)? = nil,
+        attachmentCompactor: any AttachmentCompacting = AttachmentCompactor(),
+        attachmentSettingsStore: AttachmentSettingsStore? = nil,
+        privacySafetySettingsStore: PrivacySafetySettingsStore? = nil,
+        uploadPrivacyPreparation: UploadPrivacyPreparation? = nil,
+        translation: TranslationState? = nil,
+        composerPreferences: SettingsPreferenceStore? = nil
+    ) {
+        self.launchMode = launchMode
+        includesOfflineSignIn = launchMode == .offlineTesting && awaitsOfflineSignIn
+        self.awaitsOfflineSignIn = includesOfflineSignIn
+        composer = MessageComposerState(
+            preferences: composerPreferences ?? (launchMode == .normal ? .shared : nil)
+        )
+        appearanceSettings = AppearanceSettingsStore.shared.load()
+        interfaceSettings = InterfaceSettingsStore.shared.load()
+        generalInputSettings = GeneralInputSettingsStore.shared.load()
+        featuresSettings = FeaturesSettingsStore.shared.load()
+        self.translation = translation ?? TranslationState()
+        let resolvedAttachmentStore = attachmentSettingsStore ?? .shared
+        self.attachmentSettingsStore = resolvedAttachmentStore
+        attachmentSettings = resolvedAttachmentStore.load()
+        self.attachmentCompactor = attachmentCompactor
+        AppMotionPolicy.settings = AccessibilitySettingsStore.shared.load()
+        accessibilitySettings = AppMotionPolicy.settings
+        self.notificationService =
+            notificationService ?? NoopNativeNotificationService()
+        self.soundPlayer = soundPlayer ?? NoopAppSoundPlayer()
+        self.notificationPreferences = notificationPreferences ?? NotificationPreferences()
+        let resolvedVoicePreferences = voiceVideoPreferences ?? VoiceVideoPreferences()
+        self.voiceVideoPreferences = resolvedVoicePreferences
+        self.accessibilityMessageAnnouncer = accessibilityMessageAnnouncer ?? AccessibilityMessageAnnouncer()
+        selectedCameraUID = resolvedVoicePreferences.remembersCamera && !resolvedVoicePreferences.cameraUID.isEmpty ? resolvedVoicePreferences.cameraUID : nil
+        screenShareSettings = resolvedVoicePreferences.screenShareDefaults
+        self.provider =
+            provider
+                ?? (launchMode == .offlineTesting ? MockChatProvider() : SignedOutChatProvider())
+        hasPendingLaunchWelcome = includesOfflineSignIn
+        typingState = TypingStateModel()
+        self.localTypingTiming = localTypingTiming
+        self.reactionMutationTiming = reactionMutationTiming
+        self.readAcknowledgementTiming = readAcknowledgementTiming
+        let resolvedPrivacyStore = privacySafetySettingsStore ?? .shared
+        let anonymisesUploadFilenames: @Sendable () async -> Bool = { await resolvedPrivacyStore.load().anonymisesFileNames }
+        let uploadPrivacy = uploadPrivacyPreparation ?? UploadPrivacyPreparation(store: resolvedPrivacyStore)
+        self.uploadPrivacyPreparation = uploadPrivacy
+        let prepareUploadFile: @Sendable (URL) async throws -> PreparedUploadFile = { try await uploadPrivacy.prepare($0) }
+        self.externalAttachmentUploader = externalAttachmentUploader ?? CatboxAttachmentUploader(
+            anonymisesUploadFilenames: anonymisesUploadFilenames, prepareUploadFile: prepareUploadFile
+        )
+        self.privacySafetySettingsStore = resolvedPrivacyStore
+        runsChatPerformanceBenchmark =
+            runsChatPerformanceBenchmarkOverride
+                ?? AppLaunchConfiguration(
+                    arguments: ProcessInfo.processInfo.arguments
+                ).runsAnyReadOnlyPerformanceBenchmark
+        discordNetworkDisabled =
+            discordNetworkDisabledOverride
+                ?? (launchMode == .offlineTesting
+                    || ProcessInfo.processInfo.environment["SAKURACORD_DISABLE_DISCORD_NETWORK"] == "1")
+        sessionState = includesOfflineSignIn ? .signedOut
+            : (launchMode == .offlineTesting || (hasSavedAccountsAtLaunch && restoresStoredSession && !discordNetworkDisabled) ? .connecting : .restoring)
+        self.restoresStoredSession = restoresStoredSession
+        usesInsecureDebugCredentials =
+            usesInsecureDebugCredentialsOverride
+                ?? (launchMode == .normal
+                    && Bundle.main.object(
+                        forInfoDictionaryKey: "SakuraCordInsecureDebugCredentialsEnabled"
+                    ) as? Bool == true)
+        let resolvedCredentialStore = credentialStore ?? Self.defaultCredentialStore(
+            launchMode: launchMode, usesInsecureDebugCredentials: usesInsecureDebugCredentials
+        )
+        self.credentialStore = resolvedCredentialStore
+        self.savedAccountStore = savedAccountStore ?? UserDefaultsSavedAccountStore.shared
+        self.authenticatedProviderFactory =
+            authenticatedProviderFactory ?? { handle, installationID in
+                DiscordRESTProvider(
+                    credentials: resolvedCredentialStore, handle: handle,
+                    installationID: installationID, anonymisesUploadFilenames: anonymisesUploadFilenames, prepareUploadFile: prepareUploadFile
+                )
+            }
+        self.pendingAuthenticatedProviderFactory =
+            pendingAuthenticatedProviderFactory ?? { credential, installationID in
+                DiscordRESTProvider(
+                    pendingCredential: credential, installationID: installationID, anonymisesUploadFilenames: anonymisesUploadFilenames, prepareUploadFile: prepareUploadFile
+                )
+            }
+        self.accountDatabaseFactory = accountDatabaseFactory ?? { accountID in
+            try? SakuraCordDatabase(accountID: accountID)
+        }
+        persistsEmojiPreferences = launchMode == .normal
+        // A normal launch does not know the account yet. Opening the historical
+        // account-1 fallback here only to replace it during credential restore
+        // duplicates filesystem and SQLite work on every startup.
+        database = launchMode == .offlineTesting
+            ? try? SakuraCordDatabase(inMemory: true)
+            : nil
+        commandComposer.configureFrecencyScope(
+            launchMode == .offlineTesting ? "offline" : "signed-out"
+        )
+        configureEmojiFrecency(scope: launchMode == .offlineTesting ? "offline" : "signed-out")
+        readState.reset(accountID: launchMode == .offlineTesting ? "offline" : nil)
+        mediaDeviceMonitor = MediaDeviceMonitor { [weak self] snapshot in
+            Task { @MainActor [weak self] in
+                await self?.installMediaDeviceSnapshot(snapshot)
+            }
+        }
+        configureAttachmentMedia()
+    }
+}
+
+extension AppModel {
+    static let messageSendLogger = Logger(
+        subsystem: "dev.sakuracord.SakuraCord",
+        category: "MessageSend"
+    )
+
+    private static func defaultCredentialStore(launchMode: AppLaunchMode, usesInsecureDebugCredentials: Bool) -> any CredentialStore {
+        if launchMode == .offlineTesting { return OfflineCredentialStore() }
+        if usesInsecureDebugCredentials { return InsecureDebugMigratingCredentialStore() }
+        return KeychainCredentialStore()
+    }
+
+    var snapshot: BootstrapSnapshot? {
+        get {
+            access(keyPath: \.snapshot)
+            return snapshotStorage
+        }
+        set {
+            let previous = snapshotStorage
+            withMutation(keyPath: \.snapshot) { snapshotStorage = newValue }
+            refreshSnapshotPresentation(replacing: previous)
+        }
+    }
+
+    private func refreshSnapshotPresentation(replacing previous: BootstrapSnapshot?) {
+        snapshotSourceRevision &+= 1
+        currentUser = snapshot?.currentUser
+        guildIDs = snapshot?.guilds.map(\.id) ?? []
+        threads = snapshot?.threads ?? []
+        relationshipNicknamesByUserID = snapshot?.relationshipNicknamesByUserID ?? [:]
+        relationships = snapshot?.relationships ?? []
+        blockedOrIgnoredUserIDs = snapshot?.blockedOrIgnoredUserIDs ?? []
+        friendUserIDs = snapshot?.friendUserIDs ?? []
+        refreshSearchSnapshotPresentation()
+        messageSearchUserBoosterChannelIDs = snapshot?.messageSearchUserBoosterChannelIDs ?? []
+        messagePresentationChannels = (snapshot?.channels ?? []).map { channel in
+            var channel = channel
+            channel.unreadCount = 0
+            channel.mentionCount = 0
+            return channel
+        }
+        messagePresentationChannelsByID = Dictionary(
+            messagePresentationChannels.map { ($0.id, $0) },
+            uniquingKeysWith: { _, newer in newer }
+        )
+        let requestChannelIDs = Set(messagePresentationChannels.lazy.filter { $0.messageRequest != nil }.map(\.id))
+        if requestChannelIDs != messageRequestChannelIDs {
+            messageRequestChannelIDs = requestChannelIDs
+            // Timeline layouts, including retained ones, draw a request's
+            // controls disabled until it is decided.
+            invalidateTimelinePresentation()
+        }
+        activeJoinedThreads = snapshot?.activeJoinedThreads ?? []
+        knownThreadIDs = Set(threads.map(\.id)).union(activeJoinedThreads.map(\.id))
+        guildIDsWithResourceChannels = Set((snapshot?.channels ?? []).compactMap { channel in
+            channel.flags & (1 << 7) != 0 ? channel.guildID : nil
+        })
+        refreshServerRailDirectMessages(replacing: previous)
+        refreshSelectedGuildPresentation()
+        invalidateChangedSystemMessageRecipients(replacing: previous)
+        if previous?.relationshipNicknamesByUserID != snapshot?.relationshipNicknamesByUserID {
+            invalidateTimelinePresentation()
+        }
+        if previous?.currentUser != snapshot?.currentUser {
+            refreshVoiceSidebarPresentation()
+        }
+    }
+
+    func refreshSearchSnapshotPresentation() {
+        messageSearchSourceUsers = snapshotStorage?.messageSearchUsers ?? []
+        userSearchAliasesByUserID = snapshotStorage?.userSearchAliasesByUserID ?? [:]
+        quickSwitcherGuildMemberUserIDs = snapshotStorage?.quickSwitcherGuildMemberUserIDs ?? [:]
+        quickSwitcherJoinedGuildMemberUserIDs = snapshotStorage?.quickSwitcherJoinedGuildMemberUserIDs ?? [:]
+        quickSwitcherGuildMemberAliases = snapshotStorage?.quickSwitcherGuildMemberAliases ?? [:]
+    }
+
+    private func refreshSelectedGuildPresentation() {
+        selectedGuild = selectedGuildID.flatMap { guildID in
+            snapshot?.guilds.first(where: { $0.id == guildID })
+        }
+    }
+
+    var incomingPrivateCalls: [PrivateCall] {
+        guard let currentUserID = currentUser?.id else { return [] }
+        return privateCallsByChannel.values
+            .filter {
+                !$0.isUnavailable
+                    && $0.isRinging(currentUserID)
+                    && !isIncomingCallSuppressed($0)
+                    && activeVoiceChannel?.id != $0.channelID
+            }
+            .sorted { $0.channelID.rawValue < $1.channelID.rawValue }
+    }
+
+    func privateCall(in channelID: ChannelID) -> PrivateCall? {
+        guard let call = privateCallsByChannel[channelID], !call.isUnavailable else {
+            return nil
+        }
+        return call
+    }
+
+    func isPrivateCallActionInFlight(in channelID: ChannelID) -> Bool {
+        privateCallActionChannelIDs.contains(channelID)
+    }
+}

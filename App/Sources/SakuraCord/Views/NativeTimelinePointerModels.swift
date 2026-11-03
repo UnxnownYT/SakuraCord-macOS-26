@@ -1,0 +1,314 @@
+import Foundation
+import QuartzCore
+import SakuraCordModels
+
+nonisolated struct NativeTimelineFooterActionTarget: Equatable {
+    enum Kind: Hashable {
+        case ephemeralDismiss
+        case translation
+        /// Keyed by the run's first message, which a revealed header shares with its first row.
+        case suppressedToggle
+        case retrySend
+    }
+
+    let messageID: MessageID
+    let kind: Kind
+}
+
+nonisolated struct NativeTimelineMentionHover: Equatable {
+    let itemIdentifier: NativeMessageTimelineItem.Identifier
+    let region: NativeTimelineTextRegion
+    let characterIndex: Int
+    let rawToken: String
+}
+
+nonisolated struct NativeTimelineTextLinkHover: Equatable {
+    let itemIdentifier: NativeMessageTimelineItem.Identifier
+    let region: NativeTimelineTextRegion
+    let characterIndex: Int
+}
+
+nonisolated struct NativeTimelineTextSpoilerHover: Hashable {
+    let itemIdentifier: NativeMessageTimelineItem.Identifier
+    let region: NativeTimelineTextRegion
+    let rangeLocation: Int
+}
+
+extension [NativeTimelineTextSpoilerHover: CGFloat] {
+    /// How far each spoiler in one text region is hovered, by where its
+    /// range starts.
+    func progress(
+        in itemIdentifier: NativeMessageTimelineItem.Identifier,
+        region: NativeTimelineTextRegion
+    ) -> [Int: CGFloat] {
+        reduce(into: [:]) { result, entry in
+            guard entry.key.itemIdentifier == itemIdentifier, entry.key.region == region else { return }
+            result[entry.key.rangeLocation] = entry.value
+        }
+    }
+}
+
+struct NativeTimelineMentionHitRegion {
+    let characterIndex: Int
+    let presentation: MentionPresentation
+    let frame: CGRect
+}
+
+enum NativeTimelineMentionAppearance {
+    /// A timestamp's neutral pill is fainter than a coloured mention's.
+    static func backgroundAlpha(isHovered: Bool, isTimestamp: Bool = false) -> CGFloat {
+        isTimestamp ? (isHovered ? 0.18 : 0.12) : (isHovered ? 0.34 : 0.18)
+    }
+}
+
+nonisolated struct NativeTimelineComponentButtonTarget: Hashable {
+    let messageID: MessageID
+    let componentID: String
+}
+
+nonisolated struct NativeTimelineComponentSelectTarget: Hashable {
+    let messageID: MessageID
+    let componentID: String
+}
+
+nonisolated enum NativeTimelineComponentButtonVisualState {
+    static let pressAnimationDuration: TimeInterval = 0.09
+    /// Long enough, eased at both ends, that a round button's growth reads
+    /// as motion rather than a snap.
+    static let hoverAnimationDuration: TimeInterval = 0.2
+    /// `easeInOut`'s cubic curve, for hovers Core Animation runs.
+    static var hoverTimingFunction: CAMediaTimingFunction { CAMediaTimingFunction(controlPoints: 0.65, 0, 0.35, 1) }
+
+    static func scale(pressProgress: CGFloat) -> CGFloat {
+        1 - 0.015 * min(max(pressProgress, 0), 1)
+    }
+
+    static func brightness(
+        isHovered: Bool,
+        pressProgress: CGFloat
+    ) -> CGFloat {
+        let pressProgress = min(max(pressProgress, 0), 1)
+        let hoverBrightness: CGFloat = isHovered ? 0.035 : 0
+        return hoverBrightness * (1 - pressProgress)
+            - 0.07 * pressProgress
+    }
+
+    static func borderAlpha(
+        isHovered: Bool,
+        isEnabled: Bool
+    ) -> CGFloat {
+        isHovered && isEnabled ? 0.14 : 0.07
+    }
+
+    /// A round button, such as a file's download or a voice message's play
+    /// button, grows 6% under the pointer and returns to rest while pressed.
+    static func roundButtonScale(hover: CGFloat, press: CGFloat, growth: CGFloat = 0.06) -> CGFloat {
+        1 + growth * hover * (1 - press)
+    }
+
+    static func easeOut(_ progress: CGFloat) -> CGFloat {
+        let progress = min(max(progress, 0), 1)
+        return 1 - pow(1 - progress, 3)
+    }
+
+    static func easeInOut(_ progress: CGFloat) -> CGFloat {
+        let progress = min(max(progress, 0), 1)
+        return progress < 0.5 ? 4 * pow(progress, 3) : 1 - pow(2 - 2 * progress, 3) / 2
+    }
+}
+
+/// A round button's hover easing in or out from wherever it was, with the
+/// press animation's curve.
+nonisolated struct NativeTimelineHoverFade {
+    let from: CGFloat
+    let to: CGFloat
+    let start: TimeInterval
+
+    func progress(at time: TimeInterval) -> CGFloat {
+        let elapsed = (time - start) / NativeTimelineComponentButtonVisualState.hoverAnimationDuration
+        return from + (to - from) * NativeTimelineComponentButtonVisualState.easeInOut(elapsed)
+    }
+
+    func isSettled(at time: TimeInterval) -> Bool {
+        time - start >= NativeTimelineComponentButtonVisualState.hoverAnimationDuration
+    }
+
+    func delayed(by interval: TimeInterval) -> Self {
+        Self(from: from, to: to, start: start + interval)
+    }
+}
+
+nonisolated enum TimelineButtonActivationPolicy {
+    static func activates(
+        pressed: NativeTimelineComponentButtonTarget?,
+        released: NativeTimelineComponentButtonTarget?
+    ) -> Bool {
+        NativeTimelinePointerActivationPolicy.activates(
+            pressed: pressed,
+            released: released
+        )
+    }
+}
+
+nonisolated enum NativeTimelinePointerActivationTarget: Hashable {
+    case loader
+    case suppressedMessages(MessageID)
+    case message(MessageID)
+    case componentReveal(MessageID, String)
+    case componentImage(MessageID, String)
+    case componentMedia(MessageID, String)
+    case componentFile(MessageID, String)
+    case componentSelect(MessageID, String)
+    case textMention(
+        MessageID,
+        NativeTimelineTextRegion,
+        characterIndex: Int,
+        rawToken: String
+    )
+    case textURL(
+        MessageID,
+        NativeTimelineTextRegion,
+        characterIndex: Int,
+        url: URL
+    )
+    case textSpoiler(
+        MessageID,
+        NativeTimelineTextRegion,
+        rangeLocation: Int
+    )
+    case ephemeralDismiss(MessageID)
+    case deliveryAction(MessageID, NativeTimelineFooterActionTarget.Kind)
+    case translationAction(MessageID)
+    case authorProfile(MessageID)
+    case serverTag(MessageID, GuildID)
+    case invocationProfile(MessageID)
+    case commandPill(MessageID)
+    case reply(MessageID, MessageID)
+    case forwardedSource(MessageID, ChannelID, GuildID?, MessageID?)
+    case linkedImage(MessageID, URL)
+    case attachment(MessageID, String)
+    case embedMedia(MessageID, String)
+    case thread(MessageID, ChannelID)
+
+    var supportsTextSelection: Bool {
+        switch self {
+        case .message, .textMention, .textURL:
+            true
+        default:
+            false
+        }
+    }
+}
+
+nonisolated enum NativeTimelinePointerActivationPolicy {
+    static func activates<T: Equatable>(
+        pressed: T?,
+        released: T?
+    ) -> Bool {
+        pressed != nil && pressed == released
+    }
+}
+
+nonisolated enum NativeTimelineResultActivationPolicy {
+    static func frame(
+        for context: NativeTimelineMessageInteractionContext,
+        searchCardFrame: CGRect?,
+        highlightFrame: CGRect?
+    ) -> CGRect? {
+        switch context {
+        case .searchResult:
+            searchCardFrame
+        case .pinnedResult, .inboxResult, .inboxMention:
+            highlightFrame
+        case .conversation:
+            nil
+        }
+    }
+}
+
+nonisolated enum NativeTimelineAuthorProfileGeometry {
+    static func hitFrames(
+        avatarFrame: CGRect?,
+        authorFrame: CGRect?
+    ) -> [CGRect] {
+        [avatarFrame, authorFrame].compactMap { $0 }
+    }
+
+    static func hitFrame(
+        at point: CGPoint,
+        avatarFrame: CGRect?,
+        authorFrame: CGRect?
+    ) -> CGRect? {
+        hitFrames(
+            avatarFrame: avatarFrame,
+            authorFrame: authorFrame
+        ).first(where: { $0.contains(point) })
+    }
+}
+
+nonisolated enum NativeTimelineAvatarPresentation {
+    static let decorationScale: CGFloat = 1.16
+
+    static func decorationFrame(around avatarFrame: CGRect) -> CGRect {
+        let width = avatarFrame.width * decorationScale
+        let height = avatarFrame.height * decorationScale
+        return CGRect(
+            x: avatarFrame.midX - width / 2,
+            y: avatarFrame.midY - height / 2,
+            width: width,
+            height: height
+        )
+    }
+
+    static func replyAvatarFrame(in replyContentFrame: CGRect) -> CGRect {
+        CGRect(
+            x: replyContentFrame.minX,
+            y: replyContentFrame.minY + (NativeTimelineReplyMetrics.lineHeight - NativeTimelineReplyMetrics.avatarDiameter) / 2,
+            width: NativeTimelineReplyMetrics.avatarDiameter,
+            height: NativeTimelineReplyMetrics.avatarDiameter
+        )
+    }
+
+    static func shouldDecodeAnimation(for url: URL) -> Bool {
+        switch url.pathExtension.lowercased() {
+        case "gif", "apng":
+            return true
+        default:
+            return URLComponents(
+                url: url,
+                resolvingAgainstBaseURL: false
+            )?.queryItems?.contains {
+                $0.name == "animated"
+                    && $0.value?.lowercased() == "true"
+            } == true
+        }
+    }
+}
+
+nonisolated enum NativeTimelineScrollingRenderPolicy {
+    static func usesDirectPainter(
+        isScrolling: Bool,
+        hasCachedBitmap: Bool,
+        estimatedBitmapCost: Int,
+        cacheCostLimit: Int
+    ) -> Bool {
+        isScrolling
+            && !hasCachedBitmap
+            && estimatedBitmapCost > cacheCostLimit / 2
+    }
+}
+
+nonisolated enum NativeTimelineShortContentRedrawPolicy {
+    static func redrawsSynchronously(
+        conversationChanged: Bool,
+        appendedAtTail: Bool
+    ) -> Bool {
+        appendedAtTail && !conversationChanged
+    }
+}
+
+nonisolated struct NativeTimelineTextSelection: Equatable {
+    let itemIdentifier: NativeMessageTimelineItem.Identifier
+    let region: NativeTimelineTextRegion
+    let range: NSRange
+}

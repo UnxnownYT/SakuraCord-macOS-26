@@ -1,0 +1,1016 @@
+@testable import DiscordProtocol
+import Foundation
+import SakuraCordModels
+import Testing
+
+@Test func `json gateway codec round trips unknown events`() throws {
+    let codec = JSONGatewayCodec()
+    let envelope = GatewayEnvelope(op: 0, data: .object(["future": .bool(true)]), sequence: 42, eventName: "FUTURE_EVENT")
+    #expect(try codec.decode(codec.encode(envelope)) == envelope)
+}
+
+@Test func `desktop ETF codec round trips Discord JSON compatible terms`() throws {
+    let codec = ETFGatewayCodec()
+    let envelope = GatewayEnvelope(
+        op: 40,
+        data: .object([
+            "seq": .number(42),
+            "qos": .object([
+                "ver": .number(29),
+                "active": .bool(true),
+                "reasons": .array([.string("foregrounded")]),
+                "optional": .null,
+            ]),
+        ])
+    )
+    let encoded = try codec.encode(envelope)
+    #expect(encoded.first == 131)
+    #expect(try codec.decode(encoded) == envelope)
+}
+
+@Test func `desktop ETF codec decodes a sanitized official erlpack fixture`() throws {
+    // Packed by the clean stable desktop's native discord_erlpack module. The
+    // synthetic QoS envelope contains no account or session identifiers.
+    let fixture = try #require(Data(base64Encoded:
+        "g3QAAAACbQAAAAJvcGEobQAAAAFkdAAAAAJtAAAAA3NlcWEHbQAAAANxb3N0AAAAA20AAAAGYWN0aXZlcwVmYWxzZW0AAAADdmVyYR1tAAAAB3JlYXNvbnNq"
+    ))
+    let envelope = try ETFGatewayCodec().decode(fixture)
+    #expect(envelope == GatewayEnvelope(
+        op: 40,
+        data: .object([
+            "seq": .number(7),
+            "qos": .object([
+                "active": .bool(false),
+                "ver": .number(29),
+                "reasons": .array([]),
+            ]),
+        ])
+    ))
+}
+
+@Test func `desktop ETF string extension preserves member list byte ranges`() throws {
+    var fixture = Data([131, 116, 0, 0, 0, 4])
+    appendETFBinary("op", to: &fixture)
+    fixture.append(contentsOf: [97, 0])
+    appendETFBinary("d", to: &fixture)
+    fixture.append(contentsOf: [116, 0, 0, 0, 1])
+    appendETFBinary("range", to: &fixture)
+    fixture.append(contentsOf: [107, 0, 2, 0, 99])
+    appendETFBinary("s", to: &fixture)
+    fixture.append(contentsOf: [97, 1])
+    appendETFBinary("t", to: &fixture)
+    appendETFBinary("GUILD_MEMBER_LIST_UPDATE", to: &fixture)
+
+    let envelope = try ETFGatewayCodec().decode(fixture)
+
+    #expect(envelope == GatewayEnvelope(
+        op: 0,
+        data: .object([
+            "range": .array([.number(0), .number(99)])
+        ]),
+        sequence: 1,
+        eventName: "GUILD_MEMBER_LIST_UPDATE"
+    ))
+}
+
+@Test func `ETF collection counts are bounded by remaining encoded bytes`() {
+    let declaredCount: [UInt8] = [0, 255, 255, 255]
+    let malformedCollections = [
+        Data([131, 105] + declaredCount), // LARGE_TUPLE_EXT
+        Data([131, 108] + declaredCount), // LIST_EXT, also missing its tail
+        Data([131, 116] + declaredCount), // MAP_EXT
+    ]
+
+    for fixture in malformedCollections {
+        #expect(throws: GatewaySessionError.malformedPayload) {
+            try ETFGatewayCodec().decode(fixture)
+        }
+    }
+}
+
+@Test func `desktop ETF codec preserves integer map keys exactly`() throws {
+    var fixture = Data([131, 116, 0, 0, 0, 4])
+    appendETFBinary("op", to: &fixture)
+    fixture.append(contentsOf: [97, 0])
+    appendETFBinary("d", to: &fixture)
+    fixture.append(contentsOf: [116, 0, 0, 0, 2, 110, 8, 0])
+    fixture.append(contentsOf: [255, 255, 255, 255, 255, 255, 255, 127])
+    appendETFBinary("present", to: &fixture)
+    appendETFBinary("id", to: &fixture)
+    fixture.append(contentsOf: [110, 8, 0])
+    fixture.append(contentsOf: [255, 255, 255, 255, 255, 255, 255, 127])
+    appendETFBinary("s", to: &fixture)
+    fixture.append(contentsOf: [97, 1])
+    appendETFBinary("t", to: &fixture)
+    appendETFBinary("READY", to: &fixture)
+
+    let envelope = try ETFGatewayCodec().decode(fixture)
+    #expect(envelope == GatewayEnvelope(
+        op: 0,
+        data: .object([
+            "9223372036854775807": .string("present"),
+            "id": .string("9223372036854775807"),
+        ]),
+        sequence: 1,
+        eventName: "READY"
+    ))
+}
+
+@Test func `desktop ETF integer guild permissions decode as a numeric field`() throws {
+    var fixture = Data([131, 116, 0, 0, 0, 4])
+    appendETFBinary("op", to: &fixture)
+    fixture.append(contentsOf: [97, 0])
+    appendETFBinary("d", to: &fixture)
+    fixture.append(contentsOf: [116, 0, 0, 0, 3])
+    appendETFBinary("id", to: &fixture)
+    appendETFBinary("100", to: &fixture)
+    appendETFBinary("name", to: &fixture)
+    appendETFBinary("Numeric Permissions", to: &fixture)
+    appendETFBinary("permissions", to: &fixture)
+    fixture.append(contentsOf: [98, 0, 0, 4, 0])
+    appendETFBinary("s", to: &fixture)
+    fixture.append(contentsOf: [97, 1])
+    appendETFBinary("t", to: &fixture)
+    appendETFBinary("GUILD_CREATE", to: &fixture)
+
+    let envelope = try ETFGatewayCodec().decode(fixture)
+
+    #expect(envelope.eventName == "GUILD_CREATE")
+    guard case .object(let guild) = envelope.data else {
+        Issue.record("Guild Create data must remain an object")
+        return
+    }
+    #expect(guild["permissions"] == .number(1_024))
+}
+
+private func appendETFBinary(_ value: String, to data: inout Data) {
+    let bytes = Data(value.utf8)
+    data.append(109)
+    var count = UInt32(bytes.count).bigEndian
+    withUnsafeBytes(of: &count) { data.append(contentsOf: $0) }
+    data.append(bytes)
+}
+
+@Test func `production baseline matches observed bootstrap`() {
+    let baseline = DiscordProductionBaseline.current
+    #expect(baseline.apiVersion == 9)
+    #expect(baseline.webBuildNumber == 607_562)
+    #expect(baseline.desktopVersion == "0.0.408")
+    #expect(baseline.electronVersion == "42.7.1")
+    #expect(baseline.chromiumVersion == "148.0.7778.280")
+    #expect(baseline.nativeBuildNumber == 89_799)
+    #expect(baseline.webGatewayEncoding == "json")
+    #expect(baseline.webGatewayCompression == "zlib-stream")
+    #expect(baseline.desktopGatewayEncoding == "etf")
+    #expect(baseline.desktopGatewayCompression == "zstd-stream")
+    #expect(baseline.defaultCapabilities == 1_734_653)
+    #expect(baseline.qosHeartbeatVersion == 29)
+}
+
+@Test func `desktop metadata matches current non-secret official request fields`() throws {
+    let metadata = DiscordClientMetadata(
+        locale: "en-GB",
+        systemLocale: "en-US",
+        acceptLanguage: "en-US,en-GB;q=0.9",
+        osVersion: "27.0.0"
+    )
+
+    #expect(metadata.acceptLanguage == "en-US,en-GB;q=0.9")
+    #expect(metadata.properties["client_version"] == .string("0.0.408"))
+    #expect(metadata.properties["client_build_number"] == .number(607_562))
+    #expect(metadata.properties["os_version"] == .string("27.0.0"))
+    #expect(metadata.properties["os_sdk_version"] == .string("27"))
+    #expect(metadata.properties["system_locale"] == .string("en-US"))
+    #expect(metadata.properties["client_launch_id"] != nil)
+    #expect(metadata.properties["launch_signature"] != nil)
+    #expect(metadata.properties["client_heartbeat_session_id"] != nil)
+    #expect(metadata.properties["client_event_source"] == .null)
+    #expect(metadata.properties["client_app_state"] == .string("focused"))
+    #expect(
+        metadata.properties(clientAppState: "unfocused")["client_app_state"]
+            == .string("unfocused")
+    )
+    #expect(metadata.properties["native_build_number"] == .number(89_799))
+    #expect(metadata.userAgent.contains("discord/0.0.408"))
+    #expect(metadata.userAgent.contains("Chrome/148.0.7778.280"))
+    #expect(metadata.userAgent.contains("Electron/42.7.1"))
+
+    guard case let .string(signature)? = metadata.properties["launch_signature"],
+          let signatureUUID = UUID(uuidString: signature)
+    else {
+        Issue.record("Launch signature must be a UUID")
+        return
+    }
+    let bytes = withUnsafeBytes(of: signatureUUID.uuid) { Array($0) }
+    let requiredBits: [UInt8] = [
+        0x00, 0x80, 0x10, 0x10, 0x08, 0x10, 0x08, 0x00,
+        0x20, 0x81, 0x00, 0x40, 0x01, 0x00, 0x08, 0x00,
+    ]
+    #expect(zip(bytes, requiredBits).allSatisfy { byte, mask in byte & mask == mask })
+}
+
+@Test func `desktop gateway and REST metadata use their exact separate shapes`() throws {
+    let metadata = DiscordClientMetadata(
+        locale: "en-US",
+        systemLocale: "en-US",
+        timeZone: "Europe/Kyiv",
+        acceptLanguage: "en-US",
+        osVersion: "27.0.0",
+        installationID: "server-issued-installation"
+    )
+    let gateway = metadata.gatewayProperties()
+    #expect(Set(gateway.keys) == Set([
+        "os", "browser", "release_channel", "client_version", "os_version",
+        "os_arch", "app_arch", "system_locale", "has_client_mods",
+        "client_launch_id", "browser_user_agent", "browser_version",
+        "os_sdk_version", "client_build_number", "native_build_number", "client_event_source",
+        "is_fast_connect", "installation_id",
+    ]))
+    #expect(gateway["installation_id"] == .string("server-issued-installation"))
+    #expect(gateway["launch_signature"] == nil)
+    #expect(gateway["client_heartbeat_session_id"] == nil)
+    #expect(gateway["client_app_state"] == nil)
+
+    var get = URLRequest(url: URL(string: "https://discord.com/api/v9/users/@me")!)
+    get.httpMethod = "GET"
+    try metadata.apply(to: &get, clientAppState: "unfocused")
+    #expect(get.value(forHTTPHeaderField: "X-Installation-ID") == "server-issued-installation")
+    #expect(get.value(forHTTPHeaderField: "X-Fingerprint") == nil)
+    #expect(get.value(forHTTPHeaderField: "Origin") == nil)
+
+    var post = URLRequest(url: URL(string: "https://discord.com/api/v9/channels/1/messages")!)
+    post.httpMethod = "POST"
+    try metadata.apply(to: &post)
+    #expect(post.value(forHTTPHeaderField: "Origin") == "https://discord.com")
+}
+
+@Test func `client hints derive their Chromium major version from the baseline`() throws {
+    var baseline = DiscordProductionBaseline.current
+    baseline.chromiumVersion = "151.2.3456.7"
+    let metadata = DiscordClientMetadata(baseline: baseline)
+    var request = URLRequest(url: URL(string: "https://discord.com/api/v9/users/@me")!)
+
+    try metadata.apply(to: &request)
+
+    #expect(metadata.userAgent.contains("Chrome/151.2.3456.7"))
+    #expect(
+        request.value(forHTTPHeaderField: "Sec-CH-UA")
+            == "\"Not/A)Brand\";v=\"99\", \"Chromium\";v=\"151\""
+    )
+}
+
+@Test func `ready guild decodes the designated community rules channel`() throws {
+    let payload = Data(
+        """
+        {
+          "guilds": [
+            {
+              "id": "100",
+              "rules_channel_id": "101",
+              "channels": [
+                {"id": "101", "name": "read-me-first", "type": 0},
+                {"id": "102", "name": "rules", "type": 0}
+              ]
+            }
+          ]
+        }
+        """.utf8
+    )
+
+    let ready = try JSONDecoder().decode(GatewayReadyGuildsDTO.self, from: payload)
+    let guild = try #require(ready.guilds.first)
+    #expect(guild.rulesChannelID == "101")
+    #expect(guild.channels.map(\.id) == ["101", "102"])
+}
+
+@Test func `desktop ETF numeric guild permissions remain available after ready decoding`() throws {
+    let payload = Data(
+        """
+        {
+          "guilds": [
+            {
+              "id": "100",
+              "name": "Numeric Permissions",
+              "permissions": 1024
+            }
+          ]
+        }
+        """.utf8
+    )
+
+    let ready = try JSONDecoder().decode(GatewayReadyGuildsDTO.self, from: payload)
+    let guild = try #require(ready.guilds.first?.domain(currentUserID: nil))
+    #expect(guild.currentUserPermissions == 1_024)
+}
+
+@Test func `desktop ready guild decodes nested properties`() throws {
+    let payload = Data(
+        """
+        {
+          "guilds": [
+            {
+              "id": "100",
+              "data_mode": "full",
+              "properties": {
+                "name": "Nested Properties",
+                "permissions": 2048,
+                "rules_channel_id": "101"
+              },
+              "channels": []
+            }
+          ]
+        }
+        """.utf8
+    )
+
+    let ready = try JSONDecoder().decode(GatewayReadyGuildsDTO.self, from: payload)
+    let guild = try #require(ready.guilds.first?.domain(currentUserID: nil))
+    #expect(guild.name == "Nested Properties")
+    #expect(guild.currentUserPermissions == 2_048)
+    #expect(guild.rulesChannelID == ChannelID(rawValue: 101))
+}
+
+@Test func `settings proto preserves discord guild folder order`() {
+    func fixed64(_ value: UInt64) -> [UInt8] {
+        (0 ..< 8).map { UInt8(truncatingIfNeeded: value >> UInt64($0 * 8)) }
+    }
+    func folder(_ ids: [UInt64]) -> [UInt8] {
+        let packed = ids.flatMap(fixed64)
+        return [0x0A, UInt8(packed.count)] + packed
+    }
+    let firstFolder = folder([300, 100])
+    let standalone = folder([200])
+    let guildFolders = [0x0A, UInt8(firstFolder.count)] + firstFolder
+        + [0x0A, UInt8(standalone.count)] + standalone
+    let topLevel = Data([0x72, UInt8(guildFolders.count)] + guildFolders)
+
+    #expect(DiscordSettingsProto.guildOrder(from: topLevel) == [
+        GuildID(rawValue: 300), GuildID(rawValue: 100), GuildID(rawValue: 200)
+    ])
+}
+
+@Test func `settings proto keeps folder order when positions contain an unlisted guild`() {
+    func fixed64(_ value: UInt64) -> [UInt8] {
+        (0 ..< 8).map { UInt8(truncatingIfNeeded: value >> UInt64($0 * 8)) }
+    }
+    func folder(_ ids: [UInt64]) -> [UInt8] {
+        let packed = ids.flatMap(fixed64)
+        return [0x0A, UInt8(packed.count)] + packed
+    }
+
+    let folderPayload = folder([300, 100, 200])
+    let completePositions = [400, 300, 100, 200].flatMap(fixed64)
+    let guildFolders = [0x0A, UInt8(folderPayload.count)] + folderPayload
+        + [0x12, UInt8(completePositions.count)] + completePositions
+    let topLevel = Data([0x72, UInt8(guildFolders.count)] + guildFolders)
+
+    #expect(DiscordSettingsProto.guildOrder(from: topLevel) == [
+        GuildID(rawValue: 300), GuildID(rawValue: 100), GuildID(rawValue: 200)
+    ])
+}
+
+@Test func `settings proto decodes full guild folder metadata`() throws {
+    func field(_ number: Int, payload: [UInt8]) -> [UInt8] {
+        encodeProtoVarint(UInt64(number << 3 | 2)) + encodeProtoVarint(UInt64(payload.count)) + payload
+    }
+    func fixed64(_ value: UInt64) -> [UInt8] {
+        (0 ..< 8).map { UInt8(truncatingIfNeeded: value >> UInt64($0 * 8)) }
+    }
+
+    let guildIDs = field(1, payload: [300, 100].flatMap(fixed64))
+    let folderID = field(2, payload: encodeProtoVarint(1 << 3) + encodeProtoVarint(42))
+    let name = field(3, payload: field(1, payload: Array("Design".utf8)))
+    let color = field(4, payload: encodeProtoVarint(1 << 3) + encodeProtoVarint(0x58_65_F2))
+    let folder = field(1, payload: guildIDs + folderID + name + color)
+    let topLevel = Data(field(14, payload: folder))
+
+    let layout = try #require(DiscordSettingsProto.guildLayout(from: topLevel))
+    let decoded = try #require(layout.folders.first)
+    #expect(decoded.guildIDs == [GuildID(rawValue: 300), GuildID(rawValue: 100)])
+    #expect(decoded.id == 42)
+    #expect(decoded.name == "Design")
+    #expect(decoded.colorHex == 0x58_65_F2)
+}
+
+@Test func `guild folder layout keeps unlisted guilds above expandable folders`() throws {
+    let stored = Guild(id: GuildID(rawValue: 100), name: "Stored")
+    let folderChild = Guild(id: GuildID(rawValue: 200), name: "Folder child")
+    let unlisted = Guild(id: GuildID(rawValue: 400), name: "Unlisted")
+    let layout = DiscordGuildLayout(
+        folders: [DiscordGuildLayout.Folder(
+            guildIDs: [stored.id, folderChild.id],
+            id: 42,
+            name: "Design",
+            colorHex: 0x58_65_F2
+        )],
+        guildPositions: []
+    )
+
+    let result = DiscordRESTProvider.applyingGuildLayout(
+        layout,
+        to: [stored, unlisted, folderChild]
+    )
+    #expect(result.guilds.map(\.id) == [unlisted.id, stored.id, folderChild.id])
+    #expect(result.railItems.first == .guild(unlisted.id))
+    let folder = try #require(result.railItems.last)
+    #expect(folder == .folder(GuildFolder(
+        id: 42,
+        name: "Design",
+        colorHex: 0x58_65_F2,
+        guildIDs: [stored.id, folderChild.id]
+    )))
+}
+
+@Test func `emoji settings preserve favorites and separate message frecency from reactions`() {
+    func field(_ number: Int, payload: [UInt8]) -> [UInt8] {
+        encodeProtoVarint(UInt64(number << 3 | 2)) + encodeProtoVarint(UInt64(payload.count)) + payload
+    }
+    func stringField(_ number: Int, _ value: String) -> [UInt8] {
+        field(number, payload: Array(value.utf8))
+    }
+    func frecencyEntry(key: String, totalUses: UInt64, recentUses: [UInt64]) -> [UInt8] {
+        let item = encodeProtoVarint(UInt64(1 << 3)) + encodeProtoVarint(totalUses)
+            + field(2, payload: recentUses.flatMap(encodeProtoVarint))
+            // Discord recomputes from recent uses and ignores these stale fields.
+            + encodeProtoVarint(UInt64(4 << 3)) + encodeProtoVarint(1)
+        return field(1, payload: stringField(1, key) + field(2, payload: item))
+    }
+    func fixed64Field(_ number: Int, _ value: UInt64) -> [UInt8] {
+        var bytes = encodeProtoVarint(UInt64(number << 3 | 1))
+        bytes.append(contentsOf: (0 ..< 8).map { UInt8((value >> UInt64($0 * 8)) & 0xFF) })
+        return bytes
+    }
+    func guildAndChannelEntry(
+        key: UInt64,
+        totalUses: UInt64,
+        recentUses: [UInt64],
+        storedFrecency: UInt64 = 0
+    ) -> [UInt8] {
+        let item = encodeProtoVarint(UInt64(1 << 3)) + encodeProtoVarint(totalUses)
+            + field(2, payload: recentUses.flatMap(encodeProtoVarint))
+            + (storedFrecency == 0
+                ? []
+                : encodeProtoVarint(UInt64(3 << 3)) + encodeProtoVarint(storedFrecency))
+        return field(1, payload: fixed64Field(1, key) + field(2, payload: item))
+    }
+
+    let now: UInt64 = 1_800_000_000_000
+
+    let favorites = field(
+        5,
+        payload: stringField(1, "22")
+            + stringField(1, "white_heart")
+            + stringField(1, "11")
+    )
+    let messageFrecency = field(
+        6,
+        payload: frecencyEntry(
+            key: "white_heart",
+            totalUses: 1,
+            recentUses: [now - 20 * 86_400_000]
+        )
+            + frecencyEntry(key: "22", totalUses: 5, recentUses: [now, now - 1, now - 2])
+            + frecencyEntry(key: "11", totalUses: 4, recentUses: [now, now - 1])
+    )
+    let reactionFrecency = field(
+        13,
+        payload: frecencyEntry(key: "reaction_only", totalUses: 20, recentUses: [now])
+    )
+    let guildAndChannelFrecency = field(
+        12,
+        payload: guildAndChannelEntry(
+            key: 123,
+            totalUses: 5,
+            recentUses: [now, now - 1, now - 2]
+        )
+            + guildAndChannelEntry(
+                key: 456,
+                totalUses: 2,
+                recentUses: [],
+                storedFrecency: 9
+            )
+            + guildAndChannelEntry(
+                key: 789,
+                totalUses: 9,
+                recentUses: [0, 1, 2, 3, 4, 6, 7, 80, 81].map {
+                    now - UInt64($0) * 86_400_000
+                }
+            )
+    )
+
+    let settings = DiscordSettingsProto.emojiSettings(
+        from: Data(favorites + messageFrecency + guildAndChannelFrecency + reactionFrecency),
+        nowMilliseconds: now
+    )
+    #expect(settings.favoriteKeys == ["22", "white_heart", "11"])
+    #expect(settings.messageHistory.entries.map(\.key) == ["white_heart", "22", "11"])
+    #expect(settings.messageHistory.entries[1].recentUses == [now, now - 1, now - 2])
+    #expect(settings.reactionHistory.entries.map(\.key) == ["reaction_only"])
+    #expect(settings.guildAndChannelUsageScores["123"] == 500)
+    #expect(settings.guildAndChannelUsageScores["456"] == nil)
+    #expect(settings.guildAndChannelUsageScores["789"] == 360)
+    #expect(settings.guildAndChannelUsage["123"] == DiscordFrecencyUsage(
+        totalUses: 5,
+        recentUses: [now, now - 1, now - 2]
+    ))
+    #expect(settings.guildAndChannelUsage["456"] == DiscordFrecencyUsage(
+        totalUses: 2,
+        recentUses: []
+    ))
+    #expect(settings.guildAndChannelUsageOrder == ["123", "456", "789"])
+}
+
+@Test func `emoji settings retain full histories for client ranking`() {
+    func field(_ number: Int, payload: [UInt8]) -> [UInt8] {
+        encodeProtoVarint(UInt64(number << 3 | 2)) + encodeProtoVarint(UInt64(payload.count)) + payload
+    }
+    let now: UInt64 = 1_800_000_000_000
+    let entries = (0 ..< 19).flatMap { index -> [UInt8] in
+        let key = Array("e\(index)".utf8)
+        let item = encodeProtoVarint(UInt64(1 << 3)) + encodeProtoVarint(UInt64(19 - index))
+            + field(2, payload: encodeProtoVarint(now))
+        let entry = field(1, payload: key) + field(2, payload: item)
+        return field(1, payload: entry)
+    }
+    let settings = DiscordSettingsProto.emojiSettings(
+        from: Data(field(6, payload: entries)),
+        nowMilliseconds: now
+    )
+    #expect(settings.messageHistory.entries.count == 19)
+    #expect(settings.messageHistory.entries.first?.key == "e0")
+    #expect(settings.messageHistory.entries.last?.key == "e18")
+}
+
+@Test func `sticker settings preserve favorite order and reproduce desktop frecency`() throws {
+    func field(_ number: Int, payload: [UInt8]) -> [UInt8] {
+        encodeProtoVarint(UInt64(number << 3 | 2))
+            + encodeProtoVarint(UInt64(payload.count))
+            + payload
+    }
+    func fixed64(_ value: UInt64) -> [UInt8] {
+        (0 ..< 8).map { UInt8(truncatingIfNeeded: value >> UInt64($0 * 8)) }
+    }
+    func varintField(_ number: Int, _ value: UInt64) -> [UInt8] {
+        encodeProtoVarint(UInt64(number << 3)) + encodeProtoVarint(value)
+    }
+    func usageEntry(
+        id: UInt64,
+        totalUses: UInt64,
+        timestamps: [UInt64],
+        valueSuffix: [UInt8] = [],
+        entrySuffix: [UInt8] = []
+    ) -> [UInt8] {
+        let value = varintField(1, totalUses)
+            + field(2, payload: timestamps.flatMap(encodeProtoVarint))
+            + valueSuffix
+        let mapEntry = encodeProtoVarint(UInt64(1 << 3 | 1)) + fixed64(id)
+            + field(2, payload: value)
+            + entrySuffix
+        return field(1, payload: mapEntry)
+    }
+
+    let now: UInt64 = 1_800_000_000_000
+    let day: UInt64 = 86_400_000
+    let favorites = field(
+        3,
+        payload: field(1, payload: [11, 22, 33].flatMap(fixed64))
+    )
+    let observedWeightAges: [UInt64] = [0, 4, 31, 81, 81, 81, 81, 81, 81, 81]
+    let usage = field(
+        4,
+        payload: usageEntry(
+            id: 22,
+            totalUses: 13,
+            timestamps: observedWeightAges.map { now - $0 * day }
+        ) + usageEntry(id: 11, totalUses: 1, timestamps: [now])
+    )
+
+    let settings = DiscordSettingsProto.stickerSettings(
+        from: Data(favorites + usage),
+        nowMilliseconds: now
+    )
+    #expect(settings.favoriteIDs == ["11", "22", "33"])
+    #expect(settings.frequentlyUsedIDs == ["22", "11"])
+    #expect(settings.usageScores["22"] == 270)
+    #expect(settings.usage["22"]?.totalUses == 13)
+    #expect(settings.usage["22"]?.recentUses.count == 10)
+
+    let removed = try DiscordSettingsProto.updatingStickerFavorite(
+        in: Data(favorites + usage),
+        stickerID: "11",
+        isFavorite: false
+    )
+    #expect(removed.settings.favoriteIDs == ["22", "33"])
+    let emptied = try DiscordSettingsProto.updatingStickerFavorite(
+        in: Data(field(3, payload: field(1, payload: fixed64(11)))),
+        stickerID: "11",
+        isFavorite: false
+    )
+    #expect(emptied.patch == Data([0x1a, 0x00]))
+
+    let targetUnknownValue = varintField(9, 777)
+    let targetUnknownEntry = varintField(8, 42)
+    let untouchedEntry = usageEntry(
+        id: 33,
+        totalUses: 7,
+        timestamps: [now - day],
+        valueSuffix: varintField(9, 999),
+        entrySuffix: field(8, payload: [1, 2, 3])
+    )
+    let preservingUsage = field(
+        4,
+        payload: usageEntry(
+            id: 22,
+            totalUses: 13,
+            timestamps: observedWeightAges.map { now - $0 * day },
+            valueSuffix: targetUnknownValue,
+            entrySuffix: targetUnknownEntry
+        ) + untouchedEntry
+    )
+    let recorded = try DiscordSettingsProto.recordingStickerUse(
+        in: Data(favorites + preservingUsage),
+        stickerID: "22",
+        timestamp: now
+    )
+    #expect(recorded.settings.usage["22"]?.totalUses == 14)
+    #expect(recorded.settings.usage["22"]?.recentUses.first == now)
+    #expect(recorded.patch.range(of: Data(targetUnknownValue)) != nil)
+    #expect(recorded.patch.range(of: Data(targetUnknownEntry)) != nil)
+    #expect(recorded.patch.suffix(untouchedEntry.count) == Data(untouchedEntry))
+}
+
+@Test func `desktop ready decodes guild sticker catalog`() throws {
+    let payload = Data(
+        #"{"guilds":[{"id":"100","name":"Stickers","stickers":[{"id":"200","name":"Wave","format_type":2,"available":true}],"channels":[]}]}"#.utf8
+    )
+    let ready = try JSONDecoder().decode(GatewayReadyGuildsDTO.self, from: payload)
+    let guildID = GuildID(rawValue: 100)
+    let sticker = try #require(
+        ready.guilds.first?.stickers.first?.domain(guildID: guildID)
+    )
+    #expect(sticker.id == "200")
+    #expect(sticker.name == "Wave")
+    #expect(sticker.format == .apng)
+    #expect(sticker.guildID == guildID)
+}
+
+@Test func `soundboard settings keep Discord's 32 ranked frequent candidates`() {
+    func field(_ number: Int, payload: [UInt8]) -> [UInt8] {
+        encodeProtoVarint(UInt64(number << 3 | 2))
+            + encodeProtoVarint(UInt64(payload.count))
+            + payload
+    }
+    func frecencyEntry(key: String, totalUses: UInt64, timestamp: UInt64) -> [UInt8] {
+        let item = encodeProtoVarint(UInt64(1 << 3)) + encodeProtoVarint(totalUses)
+            + field(2, payload: encodeProtoVarint(timestamp))
+        let entry = field(1, payload: Array(key.utf8)) + field(2, payload: item)
+        return field(1, payload: entry)
+    }
+
+    let now: UInt64 = 1_800_000_000_000
+    let entries = (0 ..< 40).flatMap { index in
+        frecencyEntry(
+            key: "s\(index)",
+            totalUses: UInt64(40 - index),
+            timestamp: now
+        )
+    }
+    let settings = DiscordSettingsProto.soundboardSettings(
+        from: Data(field(11, payload: entries)),
+        nowMilliseconds: now
+    )
+
+    #expect(settings.frequentlyUsedSoundIDs.count == 32)
+    #expect(settings.frequentlyUsedSoundIDs.first == "s0")
+    #expect(settings.frequentlyUsedSoundIDs.last == "s31")
+}
+
+@Test func `guilds missing from settings appear above the stored sequence`() {
+    let stored = Guild(id: GuildID(rawValue: 100), name: "Stored")
+    let newlyCreated = Guild(id: GuildID(rawValue: 400), name: "Testing Server 2")
+    let olderUnlisted = Guild(id: GuildID(rawValue: 300), name: "Older unlisted")
+
+    #expect(DiscordRESTProvider.applyingGuildOrder(
+        [stored.id], to: [stored, olderUnlisted, newlyCreated]
+    ).map(\.id) == [
+        newlyCreated.id, olderUnlisted.id, stored.id
+    ])
+}
+
+@Test func `guild member subscription matches current discord bulk shape`() throws {
+    let payload = DiscordGatewayPayloadFactory.guildSubscriptions(
+        guildID: GuildID(rawValue: 100),
+        channelID: ChannelID(rawValue: 200)
+    )
+    #expect(payload["op"] as? Int == 37)
+    let data = try #require(payload["d"] as? [String: Any])
+    let subscriptions = try #require(data["subscriptions"] as? [String: Any])
+    let guild = try #require(subscriptions["100"] as? [String: Any])
+    #expect(guild["typing"] as? Bool == true)
+    #expect(guild["activities"] as? Bool == true)
+    #expect(guild["threads"] as? Bool == true)
+    let channels = try #require(guild["channels"] as? [String: Any])
+    #expect(channels["200"] as? [[Int]] == [[0, 99]])
+}
+
+@Test func `member list viewport ranges retain initial block and prewarm adjacent blocks`() {
+    #expect(DiscordMemberListRangePolicy.ranges(around: 0 ... 16) == [0 ... 99])
+    #expect(DiscordMemberListRangePolicy.ranges(around: 94 ... 111) == [
+        0 ... 99, 100 ... 199,
+    ])
+    #expect(DiscordMemberListRangePolicy.ranges(around: 205 ... 221) == [
+        0 ... 99, 100 ... 199, 200 ... 299,
+    ])
+}
+
+@Test func `member list viewport payload is bounded deduplicated and channel scoped`() throws {
+    let ranges = DiscordMemberListRangePolicy.ranges(around: 10_000 ... 20_000)
+    #expect(ranges.count == DiscordMemberListRangePolicy.maximumRangePairs)
+    #expect(ranges.first == 0 ... 99)
+    #expect(Set(ranges).count == ranges.count)
+
+    let payload = DiscordGatewayPayloadFactory.guildSubscriptions(
+        guildID: GuildID(rawValue: 100),
+        channelID: ChannelID(rawValue: 200),
+        ranges: [0 ... 99, 200 ... 299]
+    )
+    let data = try #require(payload["d"] as? [String: Any])
+    let subscriptions = try #require(data["subscriptions"] as? [String: Any])
+    let guild = try #require(subscriptions["100"] as? [String: Any])
+    let channels = try #require(guild["channels"] as? [String: Any])
+    #expect(channels["200"] as? [[Int]] == [[0, 99], [200, 299]])
+}
+
+@Test func `member list subscription cache is a five list id lru`() {
+    let memberListIDs = (1 ... 6).map { "list-\($0)" }
+    var retained: [String] = []
+    for memberListID in memberListIDs {
+        retained = DiscordMemberListRangePolicy.retainedMemberListOrder(
+            selecting: memberListID,
+            from: retained
+        )
+    }
+    #expect(retained == Array(memberListIDs.suffix(5)))
+
+    retained = DiscordMemberListRangePolicy.retainedMemberListOrder(
+        selecting: memberListIDs[2],
+        from: retained
+    )
+    #expect(retained == [
+        memberListIDs[1], memberListIDs[3], memberListIDs[4],
+        memberListIDs[5], memberListIDs[2],
+    ])
+}
+
+@Test func `member list subscription update sends one channel per retained list id`() throws {
+    let channels = (1 ... 6).map { ChannelID(rawValue: UInt64($0)) }
+    let memberListIDs = (1 ... 6).map { "list-\($0)" }
+    let existing = Dictionary(
+        uniqueKeysWithValues: zip(memberListIDs.prefix(5), channels.prefix(5)).map {
+            ($0, DiscordMemberListSubscription(channelID: $1, ranges: [0 ... 99]))
+        }
+    )
+    let state = DiscordMemberListRangePolicy.subscriptionState(
+        selecting: memberListIDs[5],
+        channelID: channels[5],
+        ranges: [0 ... 99, 200 ... 299],
+        currentSubscriptions: existing,
+        currentOrder: Array(memberListIDs.prefix(5))
+    )
+
+    #expect(state.memberListOrder == Array(memberListIDs.suffix(5)))
+    #expect(state.rangesByChannel[channels[0]] == nil)
+    #expect(state.rangesByChannel[channels[5]] == [0 ... 99, 200 ... 299])
+
+    let payload = DiscordGatewayPayloadFactory.guildSubscriptions(
+        guildID: GuildID(rawValue: 100),
+        channelRanges: state.rangesByChannel
+    )
+    let data = try #require(payload["d"] as? [String: Any])
+    let subscriptions = try #require(data["subscriptions"] as? [String: Any])
+    let guild = try #require(subscriptions["100"] as? [String: Any])
+    let payloadChannels = try #require(guild["channels"] as? [String: Any])
+
+    #expect(payloadChannels.count == DiscordMemberListRangePolicy.maximumSubscribedMemberLists)
+    #expect(payloadChannels[channels[0].description] == nil)
+    #expect(payloadChannels[channels[1].description] as? [[Int]] == [[0, 99]])
+    #expect(payloadChannels[channels[5].description] as? [[Int]] == [
+        [0, 99], [200, 299],
+    ])
+}
+
+@Test func `channels sharing a list id consume one request budget slot`() {
+    let general = ChannelID(rawValue: 1)
+    let anotherPublicChannel = ChannelID(rawValue: 2)
+    let initial = DiscordMemberListRangePolicy.subscriptionState(
+        selecting: "everyone",
+        channelID: general,
+        ranges: [0 ... 99],
+        currentSubscriptions: [:],
+        currentOrder: []
+    )
+    let samePermissionView = DiscordMemberListRangePolicy.subscriptionState(
+        selecting: "everyone",
+        channelID: anotherPublicChannel,
+        ranges: [0 ... 99],
+        currentSubscriptions: initial.subscriptionsByMemberListID,
+        currentOrder: initial.memberListOrder
+    )
+
+    #expect(samePermissionView.memberListOrder == ["everyone"])
+    #expect(samePermissionView.rangesByChannel.count == 1)
+    #expect(samePermissionView.rangesByChannel[anotherPublicChannel] == [0 ... 99])
+    #expect(!DiscordMemberListRangePolicy.requiresSubscriptionUpdate(
+        memberListID: "everyone",
+        ranges: [0 ... 99],
+        currentSubscriptions: initial.subscriptionsByMemberListID
+    ))
+}
+
+@Test func `member list identity follows server id and permission fallback`() throws {
+    let guildID = GuildID(rawValue: 100)
+    let roles = try JSONDecoder().decode(
+        [GuildRoleDTO].self,
+        from: Data(
+            #"[{"id":"100","name":"@everyone","position":0,"hoist":false,"permissions":"1024"}]"#.utf8
+        )
+    )
+    let publicChannel = Channel(
+        id: ChannelID(rawValue: 1), guildID: guildID, name: "general"
+    )
+    let restrictedA = Channel(
+        id: ChannelID(rawValue: 2), guildID: guildID, name: "og-members",
+        permissionOverwrites: [
+            ChannelPermissionOverwrite(id: "100", type: 0, deny: 1 << 10),
+            ChannelPermissionOverwrite(id: "200", type: 0, allow: 1 << 10),
+        ]
+    )
+    let restrictedB = Channel(
+        id: ChannelID(rawValue: 3), guildID: guildID, name: "staff-copy",
+        permissionOverwrites: restrictedA.permissionOverwrites
+    )
+    let serverIdentified = Channel(
+        id: ChannelID(rawValue: 4), guildID: guildID, name: "server-id",
+        memberListID: "provided-by-gateway"
+    )
+
+    #expect(DiscordMemberListIdentity.id(
+        for: publicChannel, guildID: guildID, roles: roles
+    ) == "everyone")
+    let restrictedID = DiscordMemberListIdentity.id(
+        for: restrictedA, guildID: guildID, roles: roles
+    )
+    #expect(restrictedID == "2500999677")
+    #expect(restrictedID == DiscordMemberListIdentity.id(
+        for: restrictedB, guildID: guildID, roles: roles
+    ))
+    #expect(DiscordMemberListIdentity.id(
+        for: serverIdentified, guildID: guildID, roles: roles
+    ) == "provided-by-gateway")
+
+    let decodedChannel = try JSONDecoder().decode(
+        ChannelDTO.self,
+        from: Data(
+            #"{"id":"5","guild_id":"100","name":"decoded","type":0,"member_list_id":"gateway-list"}"#.utf8
+        )
+    )
+    #expect(try decodedChannel.domain(guildID: guildID).memberListID == "gateway-list")
+}
+
+@Test func `guild member list update retains authoritative group counts and order`() throws {
+    let payloadText =
+        #"{"guild_id":"100","id":"everyone","ops":[],"member_count":500,"online_count":388,"groups":["# +
+        #"{"id":"20","count":1},{"id":"10","count":2},{"id":"online","count":388}]}"#
+    let payload = Data(payloadText.utf8)
+
+    let update = try JSONDecoder().decode(GuildMemberListUpdateDTO.self, from: payload)
+
+    #expect(update.id == "everyone")
+    #expect(update.memberCount == 500)
+    #expect(update.onlineCount == 388)
+    #expect(update.groups?.map(\.id) == ["20", "10", "online"])
+    #expect(update.groups?.map(\.count) == [1, 2, 388])
+}
+
+@Test func `indexed role catalog preserves complete member projection semantics`() throws {
+    let roles = try JSONDecoder().decode(
+        [GuildRoleDTO].self,
+        from: Data(#"""
+        [
+            {"id":"100","name":"Everyone","position":0,"hoist":false,"permissions":"1024"},
+            {"id":"300","name":"Three","position":5,"hoist":true,"color":16711680},
+            {"id":"200","name":"Two","position":5,"hoist":true,"unicode_emoji":"🌸"},
+            {"id":"400","name":"Four","position":2,"hoist":false,"permissions":"2048"}
+        ]
+        """#.utf8)
+    )
+    let member = try JSONDecoder().decode(
+        GuildMemberDTO.self,
+        from: Data(#"""
+        {
+            "user":{"id":"42","username":"member","global_name":"Global"},
+            "nick":"Guild Nick",
+            "roles":["400","200","300","200"],
+            "presence":{"status":"idle","activities":[]},
+            "pending":false
+        }
+        """#.utf8)
+    )
+    let fallback = try member.domain(
+        currentUserID: nil,
+        currentStatus: .online,
+        guildRoles: roles,
+        guildID: GuildID(rawValue: 100)
+    )
+    let indexed = try member.domain(
+        currentUserID: nil,
+        currentStatus: .online,
+        guildRoles: roles,
+        guildRoleCatalog: GuildMemberRoleCatalog(roles),
+        guildID: GuildID(rawValue: 100)
+    )
+
+    #expect(indexed == fallback)
+    #expect(indexed.roleName == "Three")
+    #expect(indexed.roles.map(\.id) == [
+        RoleID(rawValue: 300), RoleID(rawValue: 200), RoleID(rawValue: 400),
+    ])
+    #expect(indexed.roleIDs == [
+        RoleID(rawValue: 400), RoleID(rawValue: 200),
+        RoleID(rawValue: 300), RoleID(rawValue: 200),
+    ])
+}
+
+@Test func `voice state update uses gateway opcode four and explicit null to leave`() throws {
+    let join = DiscordGatewayPayloadFactory.voiceStateUpdate(
+        guildID: GuildID(rawValue: 100),
+        channelID: ChannelID(rawValue: 230),
+        selfMute: true,
+        selfDeaf: false
+    )
+    #expect(join["op"] as? Int == 4)
+    let joinData = try #require(join["d"] as? [String: Any])
+    #expect(joinData["guild_id"] as? String == "100")
+    #expect(joinData["channel_id"] as? String == "230")
+    #expect(joinData["self_mute"] as? Bool == true)
+    #expect(joinData["self_video"] as? Bool == false)
+    #expect(joinData["self_stream"] == nil)
+
+    let camera = DiscordGatewayPayloadFactory.voiceStateUpdate(
+        guildID: GuildID(rawValue: 100),
+        channelID: ChannelID(rawValue: 230),
+        selfMute: false,
+        selfDeaf: false,
+        selfVideo: true
+    )
+    let cameraData = try #require(camera["d"] as? [String: Any])
+    #expect(cameraData["self_video"] as? Bool == true)
+
+    let leave = DiscordGatewayPayloadFactory.voiceStateUpdate(
+        guildID: GuildID(rawValue: 100),
+        channelID: nil,
+        selfMute: false,
+        selfDeaf: false
+    )
+    let leaveData = try #require(leave["d"] as? [String: Any])
+    #expect(leaveData["channel_id"] is NSNull)
+}
+
+@Test func `soundboard catalog request uses current bounded gateway shape`() throws {
+    let first = GuildID(rawValue: 11)
+    let second = GuildID(rawValue: 12)
+    let payload = DiscordGatewayPayloadFactory.requestSoundboardSounds(
+        guildIDs: [first, second]
+    )
+
+    #expect(payload["op"] as? Int == 31)
+    let data = try #require(payload["d"] as? [String: Any])
+    #expect(data.keys.sorted() == ["guild_ids"])
+    #expect(data["guild_ids"] as? [String] == ["11", "12"])
+}
+
+@Test func `voice sound effect accepts numeric and string identifiers`() throws {
+    let numeric = try JSONDecoder().decode(
+        VoiceChannelEffectDTO.self,
+        from: Data(
+            #"{"channel_id":"11","guild_id":"12","user_id":"13","emoji":{"id":"14","name":"party","animated":true},"sound_id":1,"sound_volume":0.7}"#.utf8
+        )
+    ).domain
+    #expect(numeric?.channelID == ChannelID(rawValue: 11))
+    #expect(numeric?.guildID == GuildID(rawValue: 12))
+    #expect(numeric?.userID == UserID(rawValue: 13))
+    #expect(numeric?.emoji == EmojiReference(id: "14", name: "party", isAnimated: true))
+    #expect(numeric?.soundID == "1")
+    #expect(numeric?.soundVolume == 0.7)
+
+    let string = try JSONDecoder().decode(
+        VoiceChannelEffectDTO.self,
+        from: Data(
+            #"{"channel_id":21,"user_id":22,"emoji":{"id":null,"name":"🔊","animated":false},"sound_id":"900000000000000001"}"#.utf8
+        )
+    ).domain
+    #expect(string?.channelID == ChannelID(rawValue: 21))
+    #expect(string?.userID == UserID(rawValue: 22))
+    #expect(string?.emoji == EmojiReference(name: "🔊"))
+    #expect(string?.soundID == "900000000000000001")
+}

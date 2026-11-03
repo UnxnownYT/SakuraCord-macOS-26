@@ -1,0 +1,27 @@
+name: Sync Main Into Nightly
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: sync-main-into-nightly
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: nightly
+      - name: Merge main into nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./script/sync_main_into_nightly.sh
