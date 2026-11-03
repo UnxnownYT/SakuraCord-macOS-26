@@ -46,6 +46,7 @@ export SAKURACORD_ENABLE_UPDATES=1
 export SAKURACORD_RELEASE_TRACK="$TRACK"
 export SAKURACORD_RELEASE_TAG="$TAG"
 export SAKURACORD_VERSION="$(sakuracord_release_version_from_tag "$TAG")"
+export SAKURACORD_BUILD_NUMBER="${SAKURACORD_BUILD_NUMBER:-$(date -u +%Y%m%d%H%M)}"
 export SPARKLE_ED_PUBLIC_KEY="$PUBLIC_KEY"
 export SAKURACORD_CODE_SIGN_IDENTITY="${SAKURACORD_CODE_SIGN_IDENTITY:--}"
 export DMGBUILD="${DMGBUILD:-$(python3 -m site --user-base)/bin/dmgbuild}"
