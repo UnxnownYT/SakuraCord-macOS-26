@@ -51,7 +51,7 @@ export SAKURACORD_CODE_SIGN_IDENTITY="${SAKURACORD_CODE_SIGN_IDENTITY:--}"
 export DMGBUILD="${DMGBUILD:-$(python3 -m site --user-base)/bin/dmgbuild}"
 
 DMG_NAME="$(sakuracord_release_dmg_name_from_tag "$TAG")"
-DMG_URL_NAME="$(sakuracord_release_dmg_url_name "$DMG_NAME" 2>/dev/null || printf '%s' "$DMG_NAME")"
+DMG_URL_NAME="$DMG_NAME"
 echo "==> Building $DMG_NAME ($CHANNEL, $TAG). This takes a while."
 "$ROOT_DIR/script/package_dmg.sh"
 
@@ -72,8 +72,7 @@ read -r -p "Press Enter once the release is published (Ctrl+C to stop here)... "
 
 if ! curl -fsIL "$REPO_URL/releases/download/$TAG/$DMG_URL_NAME" >/dev/null; then
   echo "Can't find $REPO_URL/releases/download/$TAG/$DMG_URL_NAME yet." >&2
-  echo "Check the release, then publish the feed with:" >&2
-  echo "  $0 --publish-feed-only isn't available; rerun after uploading, or push dist/$FEED to the updates branch by hand." >&2
+  echo "Check the release, then run this script again." >&2
   exit 1
 fi
 
