@@ -254,10 +254,10 @@ if [[ "$UPDATES_ENABLED" == "1" ]]; then
       "$CONTENTS/Info.plist"
   fi
   /usr/libexec/PlistBuddy -c \
-    "Add :SUFeedURL string https://github.com/SakuraCordApp/SakuraCord/releases/latest/download/appcast.xml" \
+    "Add :SUFeedURL string https://raw.githubusercontent.com/UnxnownYT/SakuraCord-macOS-26/updates/stable.xml" \
     "$CONTENTS/Info.plist"
   /usr/libexec/PlistBuddy -c \
-    "Add :SakuraCordNightlyFeedURL string https://sakuracord.app/updates/appcast.xml" \
+    "Add :SakuraCordNightlyFeedURL string https://raw.githubusercontent.com/UnxnownYT/SakuraCord-macOS-26/updates/nightly.xml" \
     "$CONTENTS/Info.plist"
   /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $SPARKLE_ED_PUBLIC_KEY" "$CONTENTS/Info.plist"
   /usr/libexec/PlistBuddy -c "Add :SUEnableAutomaticChecks bool true" "$CONTENTS/Info.plist"

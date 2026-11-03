@@ -101,7 +101,7 @@ if [[ "$(basename "$DMG_PATH")" != "$EXPECTED_DMG_URL_NAME" ]]; then
   echo "Unexpected release archive name: $(basename "$DMG_PATH")" >&2
   exit 1
 fi
-EXPECTED_URL="https://github.com/SakuraCordApp/SakuraCord/releases/download/$EXPECTED_TAG/$EXPECTED_DMG_URL_NAME"
+EXPECTED_URL="https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/download/$EXPECTED_TAG/$EXPECTED_DMG_URL_NAME"
 if [[ "$ENCLOSURE_URL" != "$EXPECTED_URL" ]]; then
   echo "Unexpected appcast enclosure URL: $ENCLOSURE_URL" >&2
   exit 1
@@ -121,7 +121,7 @@ if [[ "$APPCAST_HAS_RELEASE_NOTES" != "true" ]]; then
   echo "The appcast does not contain embedded release notes." >&2
   exit 1
 fi
-EXPECTED_RELEASE_URL="https://github.com/SakuraCordApp/SakuraCord/releases/tag/$EXPECTED_TAG"
+EXPECTED_RELEASE_URL="https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/tag/$EXPECTED_TAG"
 if [[ "$APPCAST_FULL_RELEASE_NOTES_URL" != "$EXPECTED_RELEASE_URL" ]]; then
   echo "Unexpected full release notes URL: $APPCAST_FULL_RELEASE_NOTES_URL" >&2
   exit 1
@@ -191,9 +191,9 @@ elif plutil -extract "SUAllowsVersionDowngrades" raw -o - "$INFO_PLIST" \
   exit 1
 fi
 assert_plist_value "SUFeedURL" \
-  "https://github.com/SakuraCordApp/SakuraCord/releases/latest/download/appcast.xml"
+  "https://raw.githubusercontent.com/UnxnownYT/SakuraCord-macOS-26/updates/stable.xml"
 assert_plist_value "SakuraCordNightlyFeedURL" \
-  "https://sakuracord.app/updates/appcast.xml"
+  "https://raw.githubusercontent.com/UnxnownYT/SakuraCord-macOS-26/updates/nightly.xml"
 assert_plist_value "SUPublicEDKey" "$SPARKLE_ED_PUBLIC_KEY"
 assert_plist_value "SUEnableAutomaticChecks" "true"
 assert_plist_value "SUScheduledCheckInterval" "21600"

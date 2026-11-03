@@ -67,8 +67,8 @@ ditto "$DMG_PATH" "$STAGING_DIR/$DMG_NAME"
   cat "$RELEASE_NOTES_PATH"
 } >"$STAGING_DIR/${DMG_NAME%.dmg}.md"
 
-DOWNLOAD_URL_PREFIX="https://github.com/SakuraCordApp/SakuraCord/releases/download/$RELEASE_TAG/"
-RELEASE_URL="https://github.com/SakuraCordApp/SakuraCord/releases/tag/$RELEASE_TAG"
+DOWNLOAD_URL_PREFIX="https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/download/$RELEASE_TAG/"
+RELEASE_URL="https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/tag/$RELEASE_TAG"
 printf '%s\n' "$SPARKLE_ED_PRIVATE_KEY" | "$GENERATE_APPCAST" \
   --ed-key-file - \
   --download-url-prefix "$DOWNLOAD_URL_PREFIX" \

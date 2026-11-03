@@ -64,10 +64,10 @@ nonisolated struct AppUpdateConfiguration: Equatable, Sendable {
     static let releaseTrackInfoKey = "SakuraCordReleaseTrack"
     static let versionDowngradeInfoKey = "SUAllowsVersionDowngrades"
     static let expectedFeedURL = URL(
-        string: "https://github.com/SakuraCordApp/SakuraCord/releases/latest/download/appcast.xml"
+        string: "https://raw.githubusercontent.com/UnxnownYT/SakuraCord-macOS-26/updates/stable.xml"
     )!
     static let expectedNightlyFeedURL = URL(
-        string: "https://sakuracord.app/updates/appcast.xml"
+        string: "https://raw.githubusercontent.com/UnxnownYT/SakuraCord-macOS-26/updates/nightly.xml"
     )!
     static let scheduledCheckInterval = 6 * 60 * 60
 
