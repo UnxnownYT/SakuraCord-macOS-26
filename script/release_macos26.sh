@@ -53,8 +53,16 @@ export DMGBUILD="${DMGBUILD:-$(python3 -m site --user-base)/bin/dmgbuild}"
 
 DMG_NAME="$(sakuracord_release_dmg_name_from_tag "$TAG")"
 DMG_URL_NAME="$DMG_NAME"
-echo "==> Building $DMG_NAME ($CHANNEL, $TAG). This takes a while."
-"$ROOT_DIR/script/package_dmg.sh"
+if [[ "${SAKURACORD_SKIP_BUILD:-0}" == "1" && -f "dist/$DMG_NAME" ]]; then
+  echo "==> Reusing dist/$DMG_NAME"
+else
+  rm -f "dist/$DMG_NAME"
+  echo "==> Building $DMG_NAME ($CHANNEL, $TAG). This takes a while."
+  # package_dmg.sh can fail to remove its read-only scratch copy after the
+  # DMG is made; only a missing DMG counts as a failed build.
+  "$ROOT_DIR/script/package_dmg.sh" </dev/null || true
+  [[ -f "dist/$DMG_NAME" ]] || { echo "The DMG was not created; see the errors above." >&2; exit 1; }
+fi
 
 echo "==> Signing the $CHANNEL feed"
 SPARKLE_ED_PRIVATE_KEY="$(cat "$KEY_FILE")" \
