@@ -395,8 +395,12 @@ private struct GuildJoinApplicationFieldEditor: View {
         )
     }
 
+    // Swift 6.3's optimizer crashes on the original one-liner (CopyPropagation).
     private var showsCounter: Bool {
-        field.characterLimit.map { text.wrappedValue.utf16.count > $0 * 4 / 5 } ?? false
+        @_optimize(none) get {
+            guard let limit = field.characterLimit else { return false }
+            return text.wrappedValue.utf16.count > limit * 4 / 5
+        }
     }
 
     /// The remaining room as the answer nears Discord's limit, which input cannot pass.
