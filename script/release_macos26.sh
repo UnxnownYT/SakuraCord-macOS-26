@@ -78,7 +78,7 @@ cat <<MSG
     4. Publish the release.
 
 MSG
-read -r -p "Press Enter once the release is published (Ctrl+C to stop here)... "
+read -r -p "Press Enter once the release is published (Ctrl+C to stop here)... " </dev/tty
 
 if ! curl -fsIL "$REPO_URL/releases/download/$TAG/$DMG_URL_NAME" >/dev/null; then
   echo "Can't find $REPO_URL/releases/download/$TAG/$DMG_URL_NAME yet." >&2
