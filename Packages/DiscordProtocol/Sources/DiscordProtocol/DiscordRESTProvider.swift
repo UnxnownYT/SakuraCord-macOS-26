@@ -169,8 +169,6 @@ public actor DiscordRESTProvider: PendingCredentialChatProvider {
     var guildLayoutDataVersion: UInt32?
     var inboxSettingsFieldVersions: [Int: UInt32] = [:]
     var lastSentPresenceStatus: PresenceStatus?
-    var richPresenceActivity: RichPresenceActivity?
-    var lastSentRichPresenceActivity: RichPresenceActivity?
     var presenceSendWindowEnds: [Date] = []
     var deferredPresenceTask: Task<Void, Never>?
     var globalRateLimitDate: Date = .distantPast

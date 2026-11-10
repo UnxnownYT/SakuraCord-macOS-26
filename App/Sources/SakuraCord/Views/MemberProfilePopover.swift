@@ -338,10 +338,6 @@ struct MemberProfilePopover<Footer: View>: View {
                         CompactProfileWidgets(widgets: widgets, resources: profile.widgetResources, animates: animatesRemoteMedia, open: expandProfile)
                             .padding(.horizontal, InterfaceScale.metric(16))
                     }
-                    if isCurrentUser, editor == nil, let activity = RichPresenceState.shared.activity {
-                        ProfileRichPresenceSection(activity: activity)
-                            .padding(.horizontal, InterfaceScale.metric(16))
-                    }
                     ProfileMembershipSection(createdAt: profile.id.createdAt)
                     if showsRoles, !profile.roles.isEmpty {
                         ProfileRolesSection(roles: profile.roles, keepsExpanded: layout == .expanded)
