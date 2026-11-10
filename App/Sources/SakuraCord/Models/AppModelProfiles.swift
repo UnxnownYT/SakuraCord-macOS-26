@@ -89,9 +89,25 @@ extension AppModel {
     }
 
     func memberWithCurrentStatus(_ member: Member) -> Member {
-        guard member.id == currentUser?.id, member.status != currentStatus else { return member }
+        guard let currentUserID = currentUser?.id ?? snapshot?.currentUser.id,
+              member.id == currentUserID else { return member }
         var member = member
         member.status = currentStatus
+        if currentUserActivity != nil {
+            member.activityText = currentUserActivityDisplayText
+            member.isListeningToMusic = isCurrentUserListeningToMusic
+            member.richActivity = currentUserRichActivity
+        } else {
+            member.activityText = member.customStatus
+            member.isListeningToMusic = false
+            member.richActivity = nil
+        }
+        if member.id == profileCustomStatusUserID, let text = profileCustomStatus?.displayText {
+            member.customStatus = text
+            if currentUserActivity == nil {
+                member.activityText = text
+            }
+        }
         return member
     }
 
@@ -427,7 +443,7 @@ extension AppModel {
         presentation.member = profileMember(presentation.member.id, in: presentation.guildID) ?? presentation.member
         if presentation.member.id == currentUser?.id {
             // Member stores do not track our own presence; the account does.
-            presentation.member.status = currentStatus
+            presentation.member = memberWithCurrentStatus(presentation.member)
         }
         if presentation.member.id == profileCustomStatusUserID {
             // Account settings are authoritative for our own status, including clears.

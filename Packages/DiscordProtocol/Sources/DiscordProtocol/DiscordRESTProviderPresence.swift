@@ -6,6 +6,30 @@ public extension DiscordRESTProvider {
         presenceStatus
     }
 
+    func currentActivities() async -> [String: OutgoingActivityPayload] {
+        activeActivities
+    }
+
+    func updateActivity(_ activity: OutgoingActivityPayload?, sourceID: String) async throws {
+        presenceGeneration &+= 1
+        if let activity {
+            activeActivities[sourceID] = activity
+        } else {
+            activeActivities.removeValue(forKey: sourceID)
+        }
+        await sendPresenceIfChanged()
+    }
+
+    func clearActivities(sourceID: String? = nil) async throws {
+        presenceGeneration &+= 1
+        if let sourceID {
+            activeActivities.removeValue(forKey: sourceID)
+        } else {
+            activeActivities.removeAll()
+        }
+        await sendPresenceIfChanged()
+    }
+
     // Official stable622805 module827827 and module594061 `markDirty`.
     /// Applies a pick at once and saves it; only this first save reports a failure.
     func updateStatus(_ status: PresenceStatus) async throws {
@@ -62,8 +86,18 @@ extension DiscordRESTProvider {
 
     func setPresenceStatus(_ status: PresenceStatus) {
         guard presenceStatus != status else { return }
+        presenceGeneration &+= 1
         presenceStatus = status
         continuation?.yield(.currentUserStatusChanged(status))
+    }
+
+    func activeActivitiesList() -> [OutgoingActivityPayload] {
+        activeActivities.values.sorted { lhs, rhs in
+            if lhs.priorityRank != rhs.priorityRank {
+                return lhs.priorityRank < rhs.priorityRank
+            }
+            return lhs.name < rhs.name
+        }
     }
 
     // Official stable622805 PresenceUpdater.
@@ -71,7 +105,10 @@ extension DiscordRESTProvider {
     func sendPresenceIfChanged() async {
         deferredPresenceTask?.cancel()
         deferredPresenceTask = nil
-        guard gatewayReady, presenceStatus != lastSentPresenceStatus else { return }
+        let activities = activeActivitiesList()
+        let statusChanged = presenceStatus != lastSentPresenceStatus
+        let activitiesChanged = activities != lastSentActivities
+        guard gatewayReady, statusChanged || activitiesChanged else { return }
         let now = Date.now
         presenceSendWindowEnds.removeAll { $0 <= now }
         let budgetReopens = presenceSendWindowEnds.count >= 5 ? presenceSendWindowEnds.first ?? now : now
@@ -97,18 +134,111 @@ extension DiscordRESTProvider {
         await sendPresenceIfChanged()
     }
 
+    private struct ExternalAssetDTO: Decodable {
+        let url: String
+        let externalAssetPath: String
+
+        enum CodingKeys: String, CodingKey {
+            case url
+            case externalAssetPath = "external_asset_path"
+        }
+    }
+
+    private func resolveExternalAsset(url: String, applicationID: String) async -> String? {
+        if let cached = externalAssetCache[url] {
+            return cached
+        }
+        do {
+            let body: [String: JSONValue] = [
+                "urls": .array([.string(url)])
+            ]
+            let dtos: [ExternalAssetDTO] = try await request(
+                "/applications/\(applicationID)/external-assets",
+                method: "POST",
+                body: body
+            )
+            if let first = dtos.first {
+                if externalAssetCache[url] == nil {
+                    if externalAssetCacheKeys.count >= 128 {
+                        let oldest = externalAssetCacheKeys.removeFirst()
+                        externalAssetCache.removeValue(forKey: oldest)
+                    }
+                    externalAssetCacheKeys.append(url)
+                }
+                externalAssetCache[url] = first.externalAssetPath
+                return first.externalAssetPath
+            }
+        } catch {
+            gatewayLogger.debug("External asset resolution for \(url) failed: \(error.localizedDescription)")
+        }
+        return nil
+    }
+
+    private func buildGatewayActivityDictionaries(
+        activities: [OutgoingActivityPayload]
+    ) async -> [[String: Any]] {
+        var activityDictionaries: [[String: Any]] = []
+        for activity in activities {
+            var dict = activity.gatewayDictionary
+            if let assets = activity.assets,
+               let largeImage = assets.largeImage,
+               largeImage.hasPrefix("http://") || largeImage.hasPrefix("https://"),
+               !largeImage.hasPrefix("mp:external/"),
+               let appID = activity.applicationId,
+               !appID.isEmpty {
+                if let proxied = await resolveExternalAsset(url: largeImage, applicationID: appID) {
+                    var ast = dict["assets"] as? [String: Any] ?? [:]
+                    ast["large_image"] = proxied
+                    dict["assets"] = ast
+                }
+            }
+            activityDictionaries.append(dict)
+        }
+        return activityDictionaries
+    }
+
     func sendPresence() async throws {
+        let currentGeneration = presenceGeneration
         let status = presenceStatus
-        presenceSendWindowEnds.append(Date.now.addingTimeInterval(20))
+        let activities = activeActivitiesList()
+
+        let activityDictionaries = await buildGatewayActivityDictionaries(activities: activities)
+
+        guard currentGeneration == presenceGeneration else { return }
+        let statusChanged = status != lastSentPresenceStatus
+        let activitiesChanged = activities != lastSentActivities
+        guard statusChanged || activitiesChanged else { return }
+
+        let now = Date.now
+        presenceSendWindowEnds.removeAll { $0 <= now }
+        let budgetReopens = presenceSendWindowEnds.count >= 5 ? presenceSendWindowEnds.first ?? now : now
+        let reopens = max(budgetReopens, gatewayOpcodeRateLimitDates[3] ?? now)
+        if reopens > now {
+            deferredPresenceTask?.cancel()
+            deferredPresenceTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(reopens.timeIntervalSince(now)))
+                guard !Task.isCancelled else { return }
+                await self?.sendDeferredPresence()
+            }
+            return
+        }
+
+        presenceSendWindowEnds.append(now.addingTimeInterval(20))
         lastSentPresenceStatus = status
+        lastSentActivities = activities
         do {
             try await sendGateway([
                 "op": 3,
-                "d": ["since": 0, "activities": [], "status": status.rawValue, "afk": false]
-                    as [String: Any],
+                "d": [
+                    "since": 0,
+                    "activities": activityDictionaries,
+                    "status": status.rawValue,
+                    "afk": false,
+                ] as [String: Any],
             ])
         } catch {
             if lastSentPresenceStatus == status { lastSentPresenceStatus = nil }
+            if lastSentActivities == activities { lastSentActivities = nil }
             throw error
         }
     }

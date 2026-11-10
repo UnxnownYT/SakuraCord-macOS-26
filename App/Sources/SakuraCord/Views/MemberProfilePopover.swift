@@ -1,4 +1,5 @@
 import AppKit
+import DiscordProtocol
 import SakuraCordModels
 import SwiftUI
 
@@ -180,8 +181,24 @@ struct MemberProfilePopover<Footer: View>: View {
     @Environment(\.displayScale) private var displayScale
     @Environment(\.profileAnimationsPaused) private var animationsPaused
     @Environment(\.windowModalContext) private var editorModal
+    @Environment(\.serverTagCardModel) private var model
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
     @State private var contentHeight: CGFloat = 320
     @State private var theme = ProfileThemeState()
+
+    private var effectiveRichActivity: MemberRichActivity? {
+        if isCurrentUser {
+            return model?.currentUserRichActivity
+        }
+        return member.richActivity
+    }
+
+    private var hasActiveActivity: Bool {
+        if isCurrentUser {
+            return effectiveRichActivity != nil
+        }
+        return effectiveRichActivity != nil || member.isListeningToMusic || (member.activityText != nil && !member.activityText!.isEmpty)
+    }
 
     var body: some View {
         Group {
@@ -194,6 +211,10 @@ struct MemberProfilePopover<Footer: View>: View {
                             contentHeight + surfaceInset * 2,
                             maximumPopoverHeight
                         )
+                    )
+                    .animation(
+                        !systemReduceMotion && AppMotionPolicy.animates(.overlays) ? .spring(response: 0.35, dampingFraction: 0.8) : nil,
+                        value: contentHeight
                     )
                     .background { popoverBackground }
             case .expanded:
@@ -224,7 +245,9 @@ struct MemberProfilePopover<Footer: View>: View {
             guard editor == nil, newHeight.isFinite, newHeight > 0 else { return }
             let measuredHeight = max(InterfaceScale.metric(250), newHeight)
             guard contentHeight != measuredHeight else { return }
-            contentHeight = measuredHeight
+            withAnimation(!systemReduceMotion && AppMotionPolicy.animates(.overlays) ? .spring(response: 0.35, dampingFraction: 0.82) : nil) {
+                contentHeight = measuredHeight
+            }
             popoverPresentationContext?.contentSizeDidChange?()
         }
         .task(id: cosmeticPolicy.disables(.gradient, for: member.id) ? nil : theme.source(for: profile, scale: displayScale, allowsTheme: editor?.isNitro)) {
@@ -232,6 +255,7 @@ struct MemberProfilePopover<Footer: View>: View {
                 await theme.load(theme.source(for: profile, scale: displayScale, allowsTheme: editor?.isNitro))
             }
         }
+
     }
 
     private var profileContent: some View {
@@ -314,44 +338,16 @@ struct MemberProfilePopover<Footer: View>: View {
                 }
 
                 if let profile, showsDetails {
-                    if editor == nil, !isCurrentUser {
-                        ProfileMutualSummary(
-                            guilds: profile.mutualGuilds,
-                            friends: profile.mutualFriends,
-                            mutualFriendCount: profile.mutualFriendsCount,
-                            layout: layout
-                        )
-                    }
-                    if profile.isPrivate == true {
-                        privateProfileNotice(profile)
-                    }
-                    if let editor, editor.scope == .main || editor.isNitro {
-                        ProfileInlineBioEditor(value: Binding(get: { editor.bio }, set: { editor.bio = $0 }), displayValue: profile.bio, model: editor.model)
-                        .id(editor.draftGeneration)
-                        .settingsControlAnchor(.profileBio)
-                        .padding(.horizontal, InterfaceScale.metric(16))
-                    } else if let bio = profile.bio, !bio.isEmpty {
-                        ProfileAboutSection(bio: bio)
-                            .padding(.horizontal, InterfaceScale.metric(16))
-                    }
-                    if openProfile != nil, let widgets = profile.widgets, !widgets.isEmpty {
-                        CompactProfileWidgets(widgets: widgets, resources: profile.widgetResources, animates: animatesRemoteMedia, open: expandProfile)
-                            .padding(.horizontal, InterfaceScale.metric(16))
-                    }
-                    ProfileMembershipSection(createdAt: profile.id.createdAt)
-                    if showsRoles, !profile.roles.isEmpty {
-                        ProfileRolesSection(roles: profile.roles, keepsExpanded: layout == .expanded)
-                            .id(profile.id)
-                    }
-                    if !profile.connectedAccounts.isEmpty {
-                        ProfileConnectionsSection(accounts: profile.connectedAccounts, wraps: layout == .expanded)
-                    }
-
+                    profileDetailsSections(profile)
                 }
 
                 if layout == .popover { Spacer(minLength: 0) }
                 footer
             }
+            .animation(
+                !systemReduceMotion && AppMotionPolicy.animates(.overlays) ? .spring(response: 0.35, dampingFraction: 0.8) : nil,
+                value: hasActiveActivity
+            )
             .frame(width: contentWidth, alignment: .leading)
             // Use the card's minimum, not its previous viewport height, so a
             // loading or expanded card can shrink when its content changes.
@@ -364,6 +360,47 @@ struct MemberProfilePopover<Footer: View>: View {
             }
         }
         .scrollIndicators(editorModal == nil && (editor != nil || contentHeight > maximumPopoverHeight) ? .visible : .hidden)
+    }
+
+    @ViewBuilder
+    private func profileDetailsSections(_ profile: UserProfile) -> some View {
+        if editor == nil, !isCurrentUser {
+            ProfileMutualSummary(
+                guilds: profile.mutualGuilds,
+                friends: profile.mutualFriends,
+                mutualFriendCount: profile.mutualFriendsCount,
+                layout: layout
+            )
+        }
+        if profile.isPrivate == true {
+            privateProfileNotice(profile)
+        }
+        if hasActiveActivity, editor == nil {
+            ProfileActivitySection(member: member, richActivity: effectiveRichActivity, isCurrentUser: isCurrentUser)
+                .padding(.horizontal, InterfaceScale.metric(16))
+                .transition(.opacity.combined(with: .offset(y: -4)))
+        }
+        if let editor, editor.scope == .main || editor.isNitro {
+            ProfileInlineBioEditor(value: Binding(get: { editor.bio }, set: { editor.bio = $0 }), displayValue: profile.bio, model: editor.model)
+                .id(editor.draftGeneration)
+                .settingsControlAnchor(.profileBio)
+                .padding(.horizontal, InterfaceScale.metric(16))
+        } else if let bio = profile.bio, !bio.isEmpty {
+            ProfileAboutSection(bio: bio)
+                .padding(.horizontal, InterfaceScale.metric(16))
+        }
+        if openProfile != nil, let widgets = profile.widgets, !widgets.isEmpty {
+            CompactProfileWidgets(widgets: widgets, resources: profile.widgetResources, animates: animatesRemoteMedia, open: expandProfile)
+                .padding(.horizontal, InterfaceScale.metric(16))
+        }
+        ProfileMembershipSection(createdAt: profile.id.createdAt)
+        if showsRoles, !profile.roles.isEmpty {
+            ProfileRolesSection(roles: profile.roles, keepsExpanded: layout == .expanded)
+                .id(profile.id)
+        }
+        if !profile.connectedAccounts.isEmpty {
+            ProfileConnectionsSection(accounts: profile.connectedAccounts, wraps: layout == .expanded)
+        }
     }
 
     @ViewBuilder

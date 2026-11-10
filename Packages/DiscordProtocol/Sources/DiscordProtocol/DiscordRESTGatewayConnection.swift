@@ -370,6 +370,7 @@ extension DiscordRESTProvider {
                             )
                         }
                         lastSentPresenceStatus = nil
+                        lastSentActivities = nil
                         await sendPresenceIfChanged()
                         try await gatewaySession?.announceDesktopSession()
                     } catch {
