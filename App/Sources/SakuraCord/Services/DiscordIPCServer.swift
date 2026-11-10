@@ -418,7 +418,7 @@ public nonisolated final class DiscordIPCServer: @unchecked Sendable {
         var paths: [String] = []
         let tempDirs = [
             ProcessInfo.processInfo.environment["XDG_RUNTIME_DIR"],
-            ProcessInfo.processInfo.environment["TMPDIR"],
+            sakuraRealUserTemporaryDirectory(), ProcessInfo.processInfo.environment["TMPDIR"],
             ProcessInfo.processInfo.environment["TMP"],
             ProcessInfo.processInfo.environment["TEMP"],
             "/tmp",
