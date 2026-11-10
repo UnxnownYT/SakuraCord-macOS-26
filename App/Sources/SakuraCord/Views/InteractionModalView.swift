@@ -221,14 +221,18 @@ private struct InteractionModalFieldGroup<Content: View>: View {
 }
 
 /// Shared input surface: a soft rounded field like the rest of SakuraCord's forms.
-private struct InteractionModalFieldBackground: ViewModifier {
+struct InteractionModalFieldBackground: ViewModifier {
     var isFocused = false
     var hasError = false
     var cornerRadius: CGFloat = InterfaceScale.metric(14)
+    /// Focuses the field from a click anywhere in its surface, padding
+    /// included, rather than only on the field's own text.
+    var focus: (() -> Void)?
 
     func body(content: Content) -> some View {
-        content
-            .background(.quaternary.opacity(isFocused ? 0.8 : 0.5), in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        let surface = content
+            .background(.quaternary.opacity(isFocused ? 0.8 : 0.5), in: shape)
             .overlay {
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                     .strokeBorder(
@@ -237,6 +241,11 @@ private struct InteractionModalFieldBackground: ViewModifier {
                         lineWidth: 1.5
                     )
             }
+        if let focus {
+            surface.contentShape(shape).onTapGesture(perform: focus)
+        } else {
+            surface
+        }
     }
 }
 
@@ -270,7 +279,8 @@ private struct InteractionModalTextField: View {
             .padding(.vertical, InterfaceScale.metric(9))
             .modifier(InteractionModalFieldBackground(
                 isFocused: focus.wrappedValue == control.customID,
-                hasError: form.errors[control.customID] != nil
+                hasError: form.errors[control.customID] != nil,
+                focus: control.isDisabled ? nil : { focus.wrappedValue = control.customID }
             ))
             if let maximum, count > maximum * 3 / 4 || style == .paragraph {
                 Text("\(count)/\(maximum)")
@@ -450,10 +460,20 @@ private struct InteractionModalCheckboxGroup: View {
     }
 }
 
-private struct InteractionModalChoiceRow: View {
+struct InteractionModalChoiceRow: View {
     let option: ComponentSelectOption
     let symbol: String
     let isSelected: Bool
+
+    init(option: ComponentSelectOption, symbol: String, isSelected: Bool) {
+        self.option = option
+        self.symbol = symbol
+        self.isSelected = isSelected
+    }
+
+    init(label: String, symbol: String, isSelected: Bool) {
+        self.init(option: .init(label: label, value: label), symbol: symbol, isSelected: isSelected)
+    }
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: InterfaceScale.metric(10)) {

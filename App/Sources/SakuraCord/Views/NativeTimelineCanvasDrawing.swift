@@ -10,6 +10,8 @@ import SwiftUI
 
 extension NativeTimelineCanvasView {
     static let bitmapTileHeight: CGFloat = 128
+    /// Taller rows are rasterized in tiles, only where exposed.
+    static let wholeRowBitmapMaximumHeight: CGFloat = 256
 
     func apply(
         storage: NativeTimelineCanvasStorage,
@@ -78,8 +80,9 @@ extension NativeTimelineCanvasView {
                 textSelectionGesture = nil
             }
         }
-        // Rows laid out at another width no longer match the chips' frames.
-        if !reactionTransitions.isEmpty || !reactionRowMotions.isEmpty,
+        // Rows laid out at another width no longer match the chips' frames
+        // or the fading pictures.
+        if !reactionTransitions.isEmpty || !reactionRowMotions.isEmpty || !departedRuns.isEmpty,
            abs(reactionTransitionWidth - max(1, viewportWidth)) >= 0.5 {
             finishReactionTransitions()
         }
@@ -128,11 +131,7 @@ extension NativeTimelineCanvasView {
             contentOriginMoved: contentOriginMoved,
             isEnabled: redrawsMovedShortContentSynchronously
         )
-        if !suppressesHoverPresentation {
-            synchronizeHoverWithCurrentPointer()
-        }
-        reconcileHoverTooltips()
-        reconcileActionCapsule()
+        refreshHoverPresentation()
     }
 
     func updateHistorySkeleton(
@@ -225,6 +224,12 @@ extension NativeTimelineCanvasView {
                 abs(oldOriginY - contentOriginY) >= 0.5,
             isEnabled: true
         )
+        refreshHoverPresentation()
+    }
+
+    /// The row under the pointer shows its hover again after content moves
+    /// beneath it.
+    func refreshHoverPresentation() {
         if !suppressesHoverPresentation {
             synchronizeHoverWithCurrentPointer()
         }
@@ -821,6 +826,7 @@ extension NativeTimelineCanvasView {
             drawTimelineRow(at: index, rowFrame: rowFrame, dirtyRect: dirtyRect, visibleMediaKeys: visibleMediaKeys)
             context.restoreGState()
         }
+        drawDepartedRows(in: dirtyRect)
     }
 
     /// Blocked and ignored areas span several rows, so they are drawn beneath
@@ -840,6 +846,11 @@ extension NativeTimelineCanvasView {
         }
     }
 
+    /// The scale the timeline draws row pictures at.
+    var rowBitmapScale: CGFloat {
+        window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+    }
+
     func drawTimelineRow(
         at index: Int,
         rowFrame: CGRect,
@@ -855,7 +866,10 @@ extension NativeTimelineCanvasView {
         // one still changing height stays within the height it has so far.
         let reactionBandTop = reactionBandTop(for: item, rowFrame: rowFrame)
         if let reactionBandTop, dirtyRect.maxY > reactionBandTop { drawReactionBand(at: index, rowFrame: rowFrame) }
-        let clipMaxY = reactionBandTop ?? (reactionMotionRemainingHeight(at: index) == 0 ? nil : rowFrame.maxY)
+        // A deleted run fading below the row keeps its own part of the gap.
+        let motionClipMaxY = reactionMotionRemainingHeight(at: index) == 0
+            ? nil : rowFrame.maxY - departedGapHeight(below: item.identifier)
+        let clipMaxY = [reactionBandTop, motionClipMaxY].compactMap(\.self).min()
         if let clipMaxY {
             guard dirtyRect.minY < clipMaxY, let context = NSGraphicsContext.current?.cgContext else { return }
             context.saveGState()
@@ -870,9 +884,43 @@ extension NativeTimelineCanvasView {
         let paintFrame = clipMaxY == nil ? rowFrame : CGRect(
             x: rowFrame.minX, y: rowFrame.minY, width: rowFrame.width, height: layouts[index].height
         )
-        // A shrinking row is taller on screen than its pictures.
-        guard paintFrame.intersects(dirtyRect) else { return }
-        if reactionBandTop != nil,
+        // An edited row's gliding text reaches past its final height.
+        let band = editedTextBands[item.identifier]
+        guard band != nil || paintFrame.intersects(dirtyRect) else { return }
+        let drawPicture = { (frame: CGRect) in
+            self.drawRowPicture(
+                item, at: index, rowFrame: rowFrame, paintFrame: frame, dirtyRect: dirtyRect,
+                preparedMediaKeys: preparedMediaKeys, revealState: revealState
+            )
+        }
+        if let band {
+            drawEditedRow(band, at: index, paintFrame: paintFrame, drawPicture: drawPicture)
+        } else {
+            drawPicture(paintFrame)
+        }
+        if item.messageID == editingMessageID, let editingRowScrollSnapshot {
+            editingRowScrollSnapshot.draw(
+                in: editingOverlayFrame(at: index), from: .zero, operation: .sourceOver,
+                fraction: 1, respectFlipped: true, hints: nil
+            )
+        }
+        clearSendTransitionBubble(for: item, layout: layouts[index], rowFrame: rowFrame)
+        if !unreadDividerFades.isEmpty {
+            clearHeldUnreadDivider(for: item, layout: layouts[index], rowFrame: rowFrame)
+        }
+    }
+
+    /// Draws a row from its bitmap or directly, whichever its state needs.
+    private func drawRowPicture(
+        _ item: NativeMessageTimelineItem,
+        at index: Int,
+        rowFrame: CGRect,
+        paintFrame: CGRect,
+        dirtyRect: CGRect,
+        preparedMediaKeys: Set<NativeTimelineMediaKey>,
+        revealState: NativeTimelineTextSpoilerRevealState
+    ) {
+        if reactionTransitions[item.identifier] != nil,
            !timelineRowRequiresDirectPresentation(item: item, index: index, revealState: revealState),
            let image = reactionTransitionBitmap(for: item, width: rowFrame.width)
         {
@@ -881,12 +929,6 @@ extension NativeTimelineCanvasView {
                 in: CGRect(origin: rowFrame.origin, size: image.size), from: .zero, operation: .sourceOver,
                 fraction: 1, respectFlipped: true, hints: nil
             )
-        } else if let editingMessageID, item.messageID == editingMessageID {
-            drawEditingTimelineRow(
-                item, at: index, rowFrame: rowFrame, dirtyRect: dirtyRect,
-                preparedMediaKeys: preparedMediaKeys
-            )
-            return
         } else if timelineRowRequiresDirectPresentation(
             item: item, index: index, revealState: revealState
         ) {
@@ -900,30 +942,6 @@ extension NativeTimelineCanvasView {
                 preparedMediaKeys: preparedMediaKeys, revealState: revealState
             )
         }
-        clearSendTransitionBubble(for: item, layout: layouts[index], rowFrame: rowFrame)
-        if !unreadDividerFades.isEmpty {
-            clearHeldUnreadDivider(for: item, layout: layouts[index], rowFrame: rowFrame)
-        }
-    }
-
-    private func drawEditingTimelineRow(
-        _ item: NativeMessageTimelineItem,
-        at index: Int,
-        rowFrame: CGRect,
-        dirtyRect: CGRect,
-        preparedMediaKeys: Set<NativeTimelineMediaKey>
-    ) {
-        NSGraphicsContext.current?.cgContext.clear(rowFrame.intersection(dirtyRect))
-        enqueueVisibleMediaRequests(identifier: item.identifier, keys: preparedMediaKeys)
-        NativeTimelineRowPainter.draw(
-            item: item, layout: layouts[index], in: rowFrame, model: model,
-            isHovered: false, drawsBubbleBackground: false, hidesMessageContent: true,
-            spoilerRevealStore: spoilerRevealStore
-        )
-        editingRowScrollSnapshot?.draw(
-            in: editingOverlayFrame(at: index), from: .zero, operation: .sourceOver,
-            fraction: 1, respectFlipped: true, hints: nil
-        )
     }
 
     private func timelineRowRequiresDirectPresentation(
@@ -932,6 +950,7 @@ extension NativeTimelineCanvasView {
         revealState: NativeTimelineTextSpoilerRevealState
     ) -> Bool {
         isPreviewingWidth
+            || item.messageID == editingMessageID
             || layouts[index].pollLayout != nil
             || hoveredPollTarget?.messageID == item.messageID
             || hoveredRow == index
@@ -1018,8 +1037,9 @@ extension NativeTimelineCanvasView {
         enqueueVisibleMediaRequests(identifier: item.identifier, keys: preparedMediaKeys)
         // Only rasterize the exposed slices of tall messages. A one-pixel
         // reveal must not synchronously draw an entire attachment gallery.
-        if rowFrame.height > 256 {
+        if rowFrame.height > Self.wholeRowBitmapMaximumHeight {
             let exposed = rowFrame.intersection(dirtyRect)
+            guard !exposed.isEmpty else { return }
             let firstTile = max(0, Int(floor((exposed.minY - rowFrame.minY) / Self.bitmapTileHeight)))
             let lastTile = max(firstTile, Int(ceil((exposed.maxY - rowFrame.minY) / Self.bitmapTileHeight)) - 1)
             for tileIndex in firstTile ... lastTile {
@@ -1047,7 +1067,7 @@ extension NativeTimelineCanvasView {
             estimatedBitmapCost: Self.estimatedBitmapCost(
                 width: rowFrame.width,
                 height: layouts[index].height,
-                scale: window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+                scale: rowBitmapScale
             ),
             cacheCostLimit: Self.bitmapCostLimit
         )
@@ -1099,7 +1119,7 @@ extension NativeTimelineCanvasView {
         guard spoilerRevealStore.hasRevealedText,
               items.indices.contains(rowIndex),
                layouts.indices.contains(rowIndex),
-           let messageID = items[rowIndex].messageID
+           let messageID = items[rowIndex].textOwnerID
         else { return result }
         for selectable in selectableTextRegions(
             for: items[rowIndex],
@@ -1148,7 +1168,7 @@ extension NativeTimelineCanvasView {
             $0.identifier == itemIdentifier
         }),
            layouts.indices.contains(rowIndex),
-           let messageID = items[rowIndex].messageID,
+           let messageID = items[rowIndex].textOwnerID,
            let selectable = selectableTextRegions(
                for: items[rowIndex],
                layout: layouts[rowIndex]
@@ -1171,8 +1191,10 @@ extension NativeTimelineCanvasView {
         layout: NativeTimelineRowLayout
     ) -> String? {
         switch region {
-        case .beginningTitle, .beginningDescription:
+        case .beginningTitle:
             return nil
+        case .beginningDescription:
+            return NativeTimelineTextSpoilerRevealKey.beginningDescriptionContentID
         case .content:
             return NativeTimelineTextSpoilerRevealKey.messageContentID
         case let .translation(id):
@@ -1344,12 +1366,7 @@ extension NativeTimelineCanvasView {
             width: width,
             height: tileIndex < 0 ? layout.height : min(Self.bitmapTileHeight, layout.height - tileOrigin)
         )
-        let scale = max(
-            1,
-            window?.backingScaleFactor
-                ?? NSScreen.main?.backingScaleFactor
-                ?? 2
-        )
+        let scale = max(1, rowBitmapScale)
         let pixelWidth = max(1, Int(ceil(width * scale)))
         let pixelHeight = max(1, Int(ceil(size.height * scale)))
         guard let representation = NSBitmapImageRep(

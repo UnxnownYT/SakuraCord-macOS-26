@@ -229,6 +229,7 @@ func `spoiler cover centers its pill and owns pointer keyboard and accessibility
         cornerRadius: 8
     ) {
         activationCount += 1
+        return true
     }
     let window = NSWindow(
         contentRect: bounds,
@@ -373,6 +374,7 @@ func `spoiler cover centers its pill and owns pointer keyboard and accessibility
         cornerRadius: 8
     ) {
         keyboardActivations += 1
+        return true
     }
     keyboardOverlay.keyDown(
         with: try keyEvent(characters: " ", keyCode: 49)
@@ -385,6 +387,7 @@ func `spoiler cover centers its pill and owns pointer keyboard and accessibility
         cornerRadius: 8
     ) {
         accessibilityActivations += 1
+        return true
     }
     #expect(accessibilityOverlay.accessibilityPerformPress())
     #expect(accessibilityActivations == 1)
@@ -517,7 +520,7 @@ func `concealed spoiler covers survive repeated far offscreen recycling and pagi
         openReply: { _ in },
         reply: nil,
         retry: { _ in },
-        edit: { _, _ in },
+        edit: { _, _ in nil },
         markUnread: { _ in },
         delete: { _ in },
         react: { _, _ in },
@@ -713,7 +716,7 @@ func `animated attachment and component spoilers start only after their own reve
             openReply: { _ in },
             reply: nil,
             retry: { _ in },
-            edit: { _, _ in },
+            edit: { _, _ in nil },
             markUnread: { _ in },
             delete: { _ in },
             react: { _, _ in },
@@ -814,7 +817,7 @@ func `switching channels resets spoiler reveal across shared timeline canvases`(
         openReply: { _ in },
         reply: nil,
         retry: { _ in },
-        edit: { _, _ in },
+        edit: { _, _ in nil },
         markUnread: { _ in },
         delete: { _ in },
         react: { _, _ in },
@@ -1319,7 +1322,8 @@ func `benchmark run finalization does not require coordinator lifetime`() {
             performBookkeeping: { _ in bookkeepingCount += 1 }
         )
 
-        #expect(elapsed == 2)
+        // `(uptime + 2) - uptime` rounds when the sum crosses a power of two.
+        #expect(elapsed.map { abs($0 - 2) < 1e-6 } == true)
         #expect(state.didFinish)
         #expect(state.ticker.tick == nil)
         #expect(activityEndCount == 1)
@@ -1362,7 +1366,7 @@ func `benchmark run finalization does not require coordinator lifetime`() {
         openReply: { _ in },
         reply: nil,
         retry: { _ in },
-        edit: { _, _ in },
+        edit: { _, _ in nil },
         markUnread: { _ in },
         delete: { _ in },
         react: { _, _ in },
@@ -1435,7 +1439,7 @@ func `benchmark run finalization does not require coordinator lifetime`() {
             openReply: { _ in },
             reply: nil,
             retry: { _ in },
-            edit: { _, _ in },
+            edit: { _, _ in nil },
             markUnread: { _ in },
             delete: { _ in },
             react: { _, _ in },

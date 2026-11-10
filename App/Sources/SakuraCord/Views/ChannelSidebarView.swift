@@ -124,7 +124,6 @@ struct ChannelSidebarView: View {
     let guild: Guild?
     let channels: [Channel]
     let channelGroups: [ChannelGroup]
-    let unreadCategoryIDs: Set<ChannelID>
     @Binding var selection: ChannelID?
     let currentUser: User?
     let connectionState: ConnectionState
@@ -142,7 +141,10 @@ struct ChannelSidebarView: View {
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            if guild == nil {
+            if let guildID = voiceModel.presentedGuildJoinRequestID {
+                // A pending server has no channels; its sidebar describes it instead.
+                GuildJoinRequestSidebar(model: voiceModel, guildID: guildID, bottomContentInset: accountControlHeight)
+            } else if guild == nil {
                 DirectMessageInboxView(
                     model: voiceModel,
                     channels: channels,
@@ -179,7 +181,9 @@ struct ChannelSidebarView: View {
                             activeVoiceChannelID: activeVoiceChannelID,
                             hiddenChannelIDs: hiddenChannelIDs,
                             checkingChannelIDs: checkingChannelIDs,
-                            unreadCategoryIDs: unreadCategoryIDs,
+                            // Read here so another server's unread categories
+                            // do not invalidate the workspace around the sidebar.
+                            unreadCategoryIDs: guild.map { voiceModel.unreadCategoryIDsByGuild[$0.id] ?? [] } ?? [],
                             sidebarSelection: guildSelection,
                             threadsByParentID: threads.threadsByParentID,
                             bottomContentInset: accountControlHeight
@@ -888,6 +892,9 @@ private struct AccountControlView: View {
     var body: some View {
         GlassEffectContainer(spacing: SidebarAccountControlMetrics.surfaceSpacing) {
             VStack(spacing: SidebarAccountControlMetrics.surfaceSpacing) {
+                if let session = voiceModel.embeddedActivities.dockedSession {
+                    EmbeddedActivitySidebarPanel(model: voiceModel, session: session)
+                }
                 if voiceModel.activeVoiceChannel != nil {
                     VoiceSidebarControlPanel(model: voiceModel) {
                         guard let channelID = voiceModel.activeVoiceChannel?.id else {
@@ -1404,6 +1411,12 @@ private struct ChannelRow: View {
                 .foregroundStyle(channelNameForegroundStyle)
                 .lineLimit(1)
             Spacer()
+            if let activity = runningActivity.application {
+                // A running Activity shows its icon on the row, as in Discord.
+                ActivityIcon(url: activity.iconURL, size: 16)
+                    .help(activity.name)
+                    .accessibilityLabel("\(activity.name) running")
+            }
             if hasActiveScreenShare {
                 Image(systemName: "display")
                     .font(.interface(.caption))
@@ -1421,13 +1434,12 @@ private struct ChannelRow: View {
                     .foregroundStyle(Color(hex: 0x5865F2))
             }
             if !isChecking, channel.mentionCount > 0 {
-                Text(channel.mentionCount, format: .number)
-                    .font(.interface(.caption2).bold())
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, InterfaceScale.metric(6))
-                    .padding(.vertical, InterfaceScale.metric(2))
-                    .background(Color(hex: 0xF23F43), in: Capsule())
+                SidebarMentionBadge(count: channel.mentionCount)
             }
+        }
+        .mentionBadgeMotion(channel.mentionCount)
+        .task(id: runningActivity.needsShelf) {
+            if runningActivity.needsShelf { await model.loadActivityCardShelf(guildID: channel.guildID) }
         }
         .interfaceFontOverride(.interfaceSystem(size: InterfaceTypographyMetrics.interfaceTextSize))
         .anchorPreference(key: SidebarUnreadRowAnchors.self, value: .bounds) {
@@ -1478,6 +1490,14 @@ private struct ChannelRow: View {
                 }
             )
         }
+    }
+
+    /// The Activity running here, and whether the shelf must load to name it.
+    private var runningActivity: (application: EmbeddedActivityApplication?, needsShelf: Bool) {
+        let store = model.embeddedActivities
+        let instances = store.instances(in: channel.id)
+        let application = instances.lazy.compactMap { store.application($0.applicationID) }.first
+        return (application, application == nil && !instances.isEmpty)
     }
 
     private var hasActiveScreenShare: Bool {
@@ -1571,14 +1591,10 @@ private struct ThreadRow: View {
                 .lineLimit(1)
             Spacer()
             if row.mentionCount > 0 {
-                Text(row.mentionCount, format: .number)
-                    .font(.interface(.caption2).bold())
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, InterfaceScale.metric(6))
-                    .padding(.vertical, InterfaceScale.metric(2))
-                    .background(Color(hex: 0xF23F43), in: Capsule())
+                SidebarMentionBadge(count: row.mentionCount)
             }
         }
+        .mentionBadgeMotion(row.mentionCount)
         .frame(minHeight: ChannelSidebarLayoutMetrics.minimumRowHeight)
         .interfaceFontOverride(.interfaceSystem(size: InterfaceTypographyMetrics.interfaceTextSize))
         .anchorPreference(key: SidebarUnreadRowAnchors.self, value: .bounds) {

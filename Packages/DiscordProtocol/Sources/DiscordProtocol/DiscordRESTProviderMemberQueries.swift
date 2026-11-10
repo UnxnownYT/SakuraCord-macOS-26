@@ -50,15 +50,17 @@ public extension DiscordRESTProvider {
         if let task = guildRoleTasks[guildID] {
             return try await task.value
         }
+        // The task caches and returns stamped roles, so every caller sharing
+        // it gets the same role-style gates.
         let task = Task { [self] in
             let roles: [GuildRoleDTO] = try await request("/guilds/\(guildID)/roles")
-            return roles
+            cacheGuildRoles(roles, in: guildID)
+            return cachedGuildRoles[guildID] ?? []
         }
         guildRoleTasks[guildID] = task
         do {
             let roles = try await task.value
             guildRoleTasks[guildID] = nil
-            cachedGuildRoles[guildID] = roles
             return roles
         } catch {
             guildRoleTasks[guildID] = nil
@@ -182,6 +184,11 @@ public extension DiscordRESTProvider {
             cachedByID = cachedMemberIndex(guildID: guildID)
         }
         return requested.compactMap { cachedByID[$0] }
+    }
+
+    func knownMembers(in guildID: GuildID, userIDs: [UserID]) async -> [Member] {
+        let cachedByID = cachedMemberIndex(guildID: guildID)
+        return userIDs.compactMap { cachedByID[$0] }
     }
 
     internal func cachedMemberIndex(guildID: GuildID) -> [UserID: Member] {

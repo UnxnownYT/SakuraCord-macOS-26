@@ -238,11 +238,12 @@ extension NativeTimelineCanvasView {
             }
             let identifier = items[index].identifier
             let layout = layouts[index]
-            guard animatedMediaRows[identifier] != nil else {
+            // While an edit's lines glide, its row draws its media still:
+            // live views would sit at their final places.
+            guard animatedMediaRows[identifier] != nil, editedTextBands[identifier] == nil else {
                 index += 1
                 continue
             }
-
             appendAnimatedAvatarOverlays(
                 row: row,
                 identifier: identifier,
@@ -465,7 +466,8 @@ extension NativeTimelineCanvasView {
                     media: .media(mediaURL),
                     frame: mediaFrame,
                     cornerRadius: InterfaceScale.metric(8),
-                    isLooping: true
+                    isLooping: true,
+                    fillsFrame: embed.mediaFillsFrame
                 )
             }
             for (textIndex, textRegion) in embed.textRegions.enumerated() {
@@ -677,6 +679,7 @@ extension NativeTimelineCanvasView {
         }
 
         var didCreateOverlay = false
+        let hoveredGroup = hoveredGroupIdentifiers()
         for item in desired {
             let rowOrigin: CGFloat
             guard let rowIndex = items.firstIndex(where: {
@@ -718,9 +721,11 @@ extension NativeTimelineCanvasView {
                 didCreateOverlay = true
             }
             overlay.frame = hostFrame
-            overlay.setHoverPlaybackEnabled(
-                !item.key.role.playsOnHover || hoveredRow == rowIndex
-            )
+            let isHoverActive = switch item.key.role {
+            case .authorAvatar, .authorAvatarDecoration: hoveredGroup.contains(item.key.row)
+            default: hoveredRow == rowIndex
+            }
+            overlay.setHoverPlaybackEnabled(!item.key.role.playsOnHover || isHoverActive)
             overlay.setPlaybackSuppressed(suppressesHoverPresentation)
             overlay.display(
                 item.image,
@@ -763,12 +768,42 @@ extension NativeTimelineCanvasView {
 
     }
 
+    /// The rows of the hovered message group. Its avatar sits on the first
+    /// row, or the last in bubble layout, and plays while any row is hovered.
+    func hoveredGroupIdentifiers() -> Set<NativeMessageTimelineItem.Identifier> {
+        guard let index = hoveredRow ?? hoveredAuthorMessageID.flatMap({ targetID in
+            items.firstIndex(where: { $0.messageID == targetID })
+        }), items.indices.contains(index) else { return [] }
+        guard case let .message(row, _, _) = items[index] else { return [items[index].identifier] }
+        var identifiers: Set<NativeMessageTimelineItem.Identifier> = [items[index].identifier]
+        var lower = index
+        var current = row
+        while !current.startsGroup, lower > 0, case let .message(previous, _, _) = items[lower - 1] {
+            lower -= 1
+            current = previous
+            identifiers.insert(items[lower].identifier)
+        }
+        var upper = index
+        current = row
+        while !current.endsGroup, upper + 1 < items.count, case let .message(next, _, _) = items[upper + 1] {
+            upper += 1
+            current = next
+            identifiers.insert(items[upper].identifier)
+        }
+        return identifiers
+    }
+
     func updateAvatarPlayback() {
+        let hoveredGroup = hoveredGroupIdentifiers()
         let hoveredIdentifier = hoveredRow.flatMap {
             items.indices.contains($0) ? items[$0].identifier : nil
         }
         for (key, overlay) in animatedMediaOverlays where key.role.playsOnHover {
-            overlay.setHoverPlaybackEnabled(key.row == hoveredIdentifier && !suppressesHoverPresentation)
+            let isHoverActive = switch key.role {
+            case .authorAvatar, .authorAvatarDecoration: hoveredGroup.contains(key.row)
+            default: hoveredIdentifier != nil && key.row == hoveredIdentifier
+            }
+            overlay.setHoverPlaybackEnabled(isHoverActive && !suppressesHoverPresentation)
         }
     }
 
@@ -1140,12 +1175,15 @@ extension NativeTimelineCanvasView {
             let concealedEmbeds = NativeTimelineSpoilerConcealmentPolicy.concealedEmbeds(
                 in: message, store: spoilerRevealStore
             )
+            var coveredKeys = Set<NativeTimelineComponentRevealKey>()
+            // A multi-image post's card region spans its grid, so its one
+            // overlay covers every image.
             for region in layouts[index].embedRegions {
-                guard let key = concealedEmbeds[region.embedID] else { continue }
+                guard let key = concealedEmbeds[region.embedID], coveredKeys.insert(key).inserted else { continue }
                 appendDesiredSpoilerOverlay(
                     key,
                     frame: region.frame,
-                    cornerRadius: DiscordRichMessageMetrics.cardCornerRadius,
+                    cornerRadius: region.cornerRadius,
                     rowOrigin: rowOrigin,
                     into: &desired
                 )
@@ -1342,7 +1380,9 @@ extension NativeTimelineCanvasView {
                     frame: item.frame,
                     cornerRadius: item.presentation.cornerRadius
                 ) { [weak self] in
-                    self?.reveal(item.key)
+                    guard let self, !glideBlocksPointer else { return false }
+                    reveal(item.key)
+                    return true
                 }
                 addSubview(
                     overlay,

@@ -164,8 +164,12 @@ final class AppModel {
 
     @ObservationIgnored let serverRailPresentation =
         ServerRailPresentationStore()
+    @ObservationIgnored let serverRailVoicePreviewStore =
+        ServerRailVoicePreviewStore()
     @ObservationIgnored let onboarding = GuildOnboardingStore()
     @ObservationIgnored let serverInvites = ServerInvitePresentationStore()
+    @ObservationIgnored let guildJoinRequests = GuildJoinRequestStore()
+    @ObservationIgnored let embeddedActivities = EmbeddedActivityStore()
     @ObservationIgnored let captcha = HumanCaptchaStore()
     @ObservationIgnored let friends = FriendsState()
     @ObservationIgnored let ignoredUsers = IgnoredUsersState()
@@ -178,8 +182,25 @@ final class AppModel {
     @ObservationIgnored let threadActions = ThreadActionStore()
     @ObservationIgnored let voiceSidebarPresentation =
         VoiceSidebarPresentationStore()
-    var serverRailGuildsByID: [GuildID: Guild] = [:] {
-        didSet { updateServerRailMembership(replacing: oldValue) }
+    @ObservationIgnored private var serverRailGuildStorage: [GuildID: Guild] = [:]
+    /// The rail's guilds with their unread and mention counts. Counts change
+    /// with almost every message and reach the rail through its own store, so
+    /// a change of counts alone does not invalidate the many views reading
+    /// guild permissions, features and membership here.
+    var serverRailGuildsByID: [GuildID: Guild] {
+        get {
+            access(keyPath: \.serverRailGuildsByID)
+            return serverRailGuildStorage
+        }
+        set {
+            let previous = serverRailGuildStorage
+            if Self.differOnlyInReadState(previous, newValue) {
+                serverRailGuildStorage = newValue
+            } else {
+                withMutation(keyPath: \.serverRailGuildsByID) { serverRailGuildStorage = newValue }
+            }
+            updateServerRailMembership(replacing: previous)
+        }
     }
     var serverRailItems: [GuildRailItem] = [] {
         didSet {
@@ -399,6 +420,9 @@ final class AppModel {
     var forumActionError: String?
     var forumPaginationError: String?
     var forumCreateProgress: MessageSendProgress?
+    /// Unposted forum posts by forum, kept for the session so closing the
+    /// composer doesn't lose them.
+    var forumPostDrafts: [ChannelID: ForumPostComposerDraft] = [:]
     var forwardingMessage: Message?
     var forwardingErrorMessage: String?
     var isForwardingMessages = false
@@ -411,7 +435,7 @@ final class AppModel {
     var forumSortOrder: ForumSortOrder = .latestActivity
     var forumLayout: ForumLayout = .list
     var forumTagMatch: ForumTagMatch = .matchSome
-    @ObservationIgnored lazy var forumViewMemory = ForumViewMemory(defaults: launchMode == .normal ? PRBuildProfile.defaults : nil)
+    @ObservationIgnored lazy var forumViewMemory = ForumViewMemory(defaults: launchMode == .normal ? UserDefaults.standard : nil)
     var interactionModalForm: InteractionModalFormState?
     /// The open side chats: the single source of truth for threads, voice
     /// chat, Guide resources and channel previews beside the primary
@@ -619,6 +643,7 @@ final class AppModel {
     var selectedGuildID: GuildID? {
         didSet {
             if oldValue != selectedGuildID { switchMessageSearchScope(from: oldValue) }
+            if selectedGuildID != nil { leaveGuildJoinRequestPage() }
             refreshServerRailSelection()
             refreshSelectedGuildPresentation()
         }
@@ -755,6 +780,7 @@ final class AppModel {
             let keepsGuildPage = selectionChangeKeepsGuildPage
             if !keepsGuildPage {
                 onboarding.presentedGuildID = nil
+                if selectedChannelID != nil { leaveGuildJoinRequestPage() }
             }
             refreshServerRailSelection()
             if !keepsGuildPage { recordConversationNavigation() }
@@ -843,7 +869,7 @@ final class AppModel {
     var oversizedAttachmentPrompt: OversizedAttachmentPrompt?
     var attachmentCompactionPresentation: OversizedAttachmentPrompt?
     var externalAttachmentUploadPresentation: ExternalAttachmentUploadPresentation?
-    var showInspector = true
+    var inspectorVisibility = InspectorVisibility()
     var errorMessage: String?
 
     @ObservationIgnored var provider: any ChatProvider
@@ -1217,6 +1243,15 @@ extension AppModel {
             let previous = snapshotStorage
             withMutation(keyPath: \.snapshot) { snapshotStorage = newValue }
             refreshSnapshotPresentation(replacing: previous)
+        }
+    }
+
+    private static func differOnlyInReadState(_ old: [GuildID: Guild], _ new: [GuildID: Guild]) -> Bool {
+        old.count == new.count && new.allSatisfy { id, guild in
+            guard var previous = old[id] else { return false }
+            previous.unreadCount = guild.unreadCount
+            previous.mentionCount = guild.mentionCount
+            return previous == guild
         }
     }
 

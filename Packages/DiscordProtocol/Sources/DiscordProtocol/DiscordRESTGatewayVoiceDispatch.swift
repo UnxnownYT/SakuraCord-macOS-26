@@ -25,6 +25,10 @@ extension DiscordRESTProvider {
             await handleVoiceChannelStatusUpdateDispatch(name: name, body: body)
         case "VOICE_STATE_UPDATE":
             await handleVoiceStateUpdateDispatch(name: name, body: body)
+        case "EMBEDDED_ACTIVITY_UPDATE_V2":
+            if let instance = (try? JSONValueDecoder().decode(GatewayActivityInstanceDTO.self, from: body))?.domain() {
+                continuation?.yield(.embeddedActivityChanged(instance))
+            }
         default:
             return false
         }
@@ -185,6 +189,12 @@ extension DiscordRESTProvider {
         guard let state = try? JSONValueDecoder().decode(VoiceStateUpdateDTO.self, from: body),
               let participant = state.domain()
         else { return }
+        if participant.channelID != nil, let guildID = participant.guildID,
+           cachedMemberIndex(guildID: guildID)[participant.userID] == nil,
+           let payload = try? JSONValueDecoder().decode(VoiceStateMemberDTO.self, from: body)
+        {
+            cacheVoiceStateMember(payload.member, guildID: guildID)
+        }
         continuation?.yield(.voiceStateChanged(participant))
         reconcilePrivateCallVoiceState(participant)
         if participant.userID == currentUser?.id {
@@ -200,5 +210,19 @@ extension DiscordRESTProvider {
             pendingVoiceNegotiation?.sessionID = participant.sessionID
             finishVoiceNegotiationIfReady()
         }
+    }
+
+    /// Admits a voice participant's member that is not cached yet, so voice
+    /// presentations outside the selected guild can show who joined. The
+    /// caller checks it is absent: this never replaces a cached member or
+    /// publishes a member-list change.
+    private func cacheVoiceStateMember(_ dto: GuildMemberDTO, guildID: GuildID) {
+        guard let member = try? dto.domain(
+            currentUserID: currentUser?.id,
+            currentStatus: presenceStatus,
+            guildRoles: cachedGuildRoles[guildID] ?? [],
+            guildID: guildID
+        ) else { return }
+        cachedMembers[guildID, default: []].append(member)
     }
 }

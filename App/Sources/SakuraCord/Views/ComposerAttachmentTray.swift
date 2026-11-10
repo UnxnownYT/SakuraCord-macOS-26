@@ -9,7 +9,7 @@ struct ComposerAttachmentTray: View {
     /// timeline's size as it flies into the message.
     static let ringScale: CGFloat = 0.75
 
-    @AppStorage(PrivacySafetySettingsStore.anonymiseFileNamesKey, store: PRBuildProfile.defaults) private var anonymisesFileNames = false
+    @AppStorage(PrivacySafetySettingsStore.anonymiseFileNamesKey) private var anonymisesFileNames = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let attachments: [ForumPostAttachment]
     /// Files still being checked; they show at once but cannot be sent yet.
@@ -73,9 +73,9 @@ struct ComposerAttachmentTray: View {
                 update(attachment)
             }
         }
-        .sheet(item: $editingTarget) { target in
+        .windowModal(item: $editingTarget, cornerRadius: InterfaceScale.metric(32), cornerStyle: .circular) { target in
             if let attachment = attachments.first(where: { $0.id == target.id }) {
-                ForumAttachmentEditor(
+                AttachmentEditor(
                     attachment: attachment,
                     cancel: { editingTarget = nil },
                     save: {

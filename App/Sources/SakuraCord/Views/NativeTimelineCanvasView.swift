@@ -183,7 +183,13 @@ final class NativeTimelineCanvasView: NSView, WindowModalInputParticipant, NSVie
     var isPreviewingWidth = false
     var storage = NativeTimelineCanvasStorage()
     var baseContentOriginY: CGFloat = 0
-    var contentOriginY: CGFloat = 0
+    /// Moving the content, as a growing composer does to a short
+    /// conversation, carries the inline editor with its row.
+    var contentOriginY: CGFloat = 0 {
+        didSet {
+            if contentOriginY != oldValue { positionEditingRow() }
+        }
+    }
     var historySkeleton:
         TimelineHistorySkeletonPresentation?
     let historySkeletonShimmer = SkeletonShimmer()
@@ -198,6 +204,7 @@ final class NativeTimelineCanvasView: NSView, WindowModalInputParticipant, NSVie
     var unreadDividerFades: [NativeMessageTimelineItem.Identifier: NativeTimelineUnreadDividerFade] = [:]
     var unreadDividerGap: NativeTimelineUnreadDividerGap?
     let unreadDividerGapTicker = NativeTimelineDisplayLinkTicker()
+    let authorHoverTicker = NativeTimelineDisplayLinkTicker()
     var minimumHeight: CGFloat = 1
     var bottomSpacerHeight: CGFloat = 0
     var maximumDrawDuration = 0.0
@@ -235,7 +242,7 @@ final class NativeTimelineCanvasView: NSView, WindowModalInputParticipant, NSVie
             [NativeTimelineCodeBlockPointerTarget]] = [:]
 
     var items: [NativeMessageTimelineItem] { storage.items }
-    var layouts: [NativeTimelineRowLayout] { storage.layouts }
+    var layouts: NativeTimelineCanvasLayouts { .init(storage: storage, editing: editing) }
     var rowOrigins: [CGFloat] { storage.rowOrigins }
     var contentHeight: CGFloat { storage.contentHeight }
 
@@ -263,6 +270,8 @@ final class NativeTimelineCanvasView: NSView, WindowModalInputParticipant, NSVie
     var messageInteractionContext: NativeTimelineMessageInteractionContext = .conversation
     var actions: NativeTimelineRowActions?
     var onWidthChange: ((CGFloat) -> Void)?
+    /// Lays a row out around an inline editor of the given text height.
+    var makeEditingLayout: ((NativeMessageTimelineItem, CGFloat) -> NativeTimelineRowLayout)?
     var usesViewportSizedBacking = false
     var onDocumentSizeChange: ((NSSize) -> Void)?
 
@@ -307,9 +316,34 @@ final class NativeTimelineCanvasView: NSView, WindowModalInputParticipant, NSVie
     var reactionMotionShift: CGFloat = 0
     var reactionMotionSteps: [(index: Int, cumulative: CGFloat)] = []
     var reactionMotionRemainingHeights: [Int: CGFloat] = [:]
+    /// The part of each row's remaining height that its edited text's band still has to glide.
+    var reactionMotionTextRemainingHeights: [Int: CGFloat] = [:]
+    var editedTextBands: [NativeMessageTimelineItem.Identifier: NativeTimelineEditedTextBand] = [:] {
+        didSet {
+            guard oldValue.isEmpty != editedTextBands.isEmpty else { return }
+            if editedTextBands.isEmpty { restorePointerInteractions() } else { suppressPointerInteractions() }
+        }
+    }
+    var departedRuns: [NativeMessageTimelineItem.Identifier: NativeTimelineDepartedRun] = [:]
+    /// What a row deleted by the update landing now was still showing:
+    /// the run closing below it and the part of its own height change
+    /// still to come, both now the row before it's.
+    struct HandOver {
+        let anchor: NativeMessageTimelineItem.Identifier
+        var run: NativeTimelineDepartedRun?
+        var residualHeight: CGFloat = 0
+    }
+
+    /// By deleted row, for the update that deleted it to place.
+    var handOvers: [NativeMessageTimelineItem.Identifier: HandOver] = [:]
+    var nextReactionMotionID = 1
     let reactionTicker = NativeTimelineDisplayLinkTicker()
+    /// When the reaction ticker last stepped, to tell a late frame.
+    var reactionStepUptime: TimeInterval?
     var reactionPictures: [ReactionPictureKey: CGImage] = [:]
     var reactionBandViews: [NativeMessageTimelineItem.Identifier: NativeTimelineReactionBandView] = [:]
+    /// The display scale and colour space reaction pictures are drawn for.
+    var reactionBacking: (scale: CGFloat, colorSpace: NSColorSpace?) = (0, nil)
     /// The width the running reaction motions were laid out at.
     var reactionTransitionWidth: CGFloat = 0
     let timestampHoverCoordinator =
@@ -449,6 +483,11 @@ final class NativeTimelineCanvasView: NSView, WindowModalInputParticipant, NSVie
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
+        // AppKit also calls this as the window is resized or moved with
+        // neither changed, which would snap a motion mid-update.
+        let backing = (scale: window?.backingScaleFactor ?? 0, colorSpace: window?.colorSpace)
+        guard backing != reactionBacking else { return }
+        reactionBacking = backing
         // Moving chips were drawn for the previous display's scale and colours.
         finishReactionTransitions()
     }
@@ -467,6 +506,7 @@ final class NativeTimelineCanvasView: NSView, WindowModalInputParticipant, NSVie
             messageJumpHighlightTask?.cancel()
             transcriptGlideFinishTask?.cancel()
             unreadDividerGapTicker.stop()
+            authorHoverTicker.stop()
             reactionTicker.stop()
             for fade in unreadDividerFades.values {
                 fade.finishTask?.cancel()
@@ -504,14 +544,16 @@ enum NativeTimelineRowPainter {
     static func selectionOverlayImage(
         _ box: NativeTimelineAttributedTextBox,
         size: CGSize,
-        selectionRange: NSRange
+        selectionRange: NSRange,
+        revealedSpoilerLocations: Set<Int> = []
     ) -> NSImage {
         NSImage(size: size, flipped: true) { frame in
             attributedText(
                 box,
                 in: frame,
                 model: nil,
-                selectionRange: selectionRange
+                selectionRange: selectionRange,
+                revealedSpoilerLocations: revealedSpoilerLocations
             )
             return true
         }
@@ -546,7 +588,6 @@ enum NativeTimelineRowPainter {
         isTranslationActionHovered: Bool = false,
         hoveredDeliveryAction: NativeTimelineFooterActionTarget.Kind? = nil,
         isSuppressedToggleHovered: Bool = false,
-        hidesMessageContent: Bool = false,
         hoveredReactionID: String? = nil,
         isAddReactionHovered: Bool = false,
         textSelection: NativeTimelineTextSelection? = nil,
@@ -597,7 +638,9 @@ enum NativeTimelineRowPainter {
             drawBeginning(
                 beginning,
                 layout: layout,
-                textSelection: textSelection
+                textSelection: textSelection,
+                revealedTextSpoilerState: revealedTextSpoilerState,
+                model: model
             )
         case let .loader(isLoading, kind):
             drawLoader(
@@ -630,7 +673,6 @@ enum NativeTimelineRowPainter {
                 isEphemeralDismissHovered: isEphemeralDismissHovered,
                 isTranslationActionHovered: isTranslationActionHovered,
                 hoveredDeliveryAction: hoveredDeliveryAction,
-                hidesMessageContent: hidesMessageContent,
                 hoveredReactionID: hoveredReactionID,
                 isAddReactionHovered: isAddReactionHovered,
                 textSelection: textSelection,
@@ -731,7 +773,9 @@ enum NativeTimelineRowPainter {
     static func drawBeginning(
         _ beginning: NativeTimelineBeginning,
         layout rowLayout: NativeTimelineRowLayout,
-        textSelection: NativeTimelineTextSelection?
+        textSelection: NativeTimelineTextSelection?,
+        revealedTextSpoilerState: NativeTimelineTextSpoilerRevealState = .init(),
+        model: AppModel? = nil
     ) {
         guard let layout = rowLayout.beginningLayout else { return }
         NSColor.secondaryLabelColor.withAlphaComponent(0.10).setFill()
@@ -789,24 +833,13 @@ enum NativeTimelineRowPainter {
                 lineBreakMode: .byWordWrapping
             )
         }
-        if selectedRegion == .beginningDescription,
-           let selectionRange = textSelection?.range
-        {
-            attributedText(
-                NativeTimelineBeginningText.description(beginning),
-                in: layout.descriptionFrame,
-                model: nil,
-                selectionRange: selectionRange
-            )
-        } else {
-            text(
-                beginning.description,
-                in: layout.descriptionFrame,
-                font: .interfacePreferredFont(forTextStyle: .body),
-                color: .secondaryLabelColor,
-                lineBreakMode: .byWordWrapping
-            )
-        }
+        attributedText(
+            layout.descriptionBox,
+            in: layout.descriptionFrame,
+            model: model,
+            selectionRange: selectedRegion == .beginningDescription ? textSelection?.range : nil,
+            revealedSpoilerLocations: revealedTextSpoilerState.locations(in: .beginningDescription)
+        )
         if let date = beginning.startedAt,
            let frame = layout.dateSeparatorFrame
         {

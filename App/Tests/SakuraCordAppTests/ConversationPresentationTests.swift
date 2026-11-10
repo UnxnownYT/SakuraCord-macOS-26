@@ -467,8 +467,9 @@ func `permission resolver ignores noncanonical numeric member ids`(_ overwriteID
 }
 
 @Test func `newest button shows once the reader is away from the newest message`() {
-    func shows(established: Bool = true, nearBottom: Bool, count: Int = 2) -> Bool {
+    func shows(enabled: Bool = true, established: Bool = true, nearBottom: Bool, count: Int = 2) -> Bool {
         TimelineNewestButtonPolicy.isShown(
+            isEnabled: enabled,
             hasEstablishedInitialPosition: established,
             isNearBottom: nearBottom,
             messageCount: count
@@ -479,6 +480,7 @@ func `permission resolver ignores noncanonical numeric member ids`(_ overwriteID
     // A timeline still settling its first position, or an empty one, has none.
     #expect(!shows(established: false, nearBottom: false))
     #expect(!shows(nearBottom: false, count: 0))
+    #expect(!shows(enabled: false, nearBottom: false))
 }
 
 @Test func `wheel input toward newest is downward and vertical`() {
@@ -696,4 +698,37 @@ func `server verification blocks sends without exposing hidden channels`(state: 
     context = .init(ownerID: user.id, isOwner: true, permissions: 0, roleIDs: [], roles: [],
                     currentMember: context.currentMember)
     #expect(can(context))
+}
+
+@Test func `message author presentation top role with icon selects highest position role`() {
+    let roleNoIcon = GuildRole(id: RoleID(rawValue: 10), name: "No Icon High", position: 100)
+    let roleIconLow = GuildRole(
+        id: RoleID(rawValue: 20),
+        name: "Icon Low",
+        position: 10,
+        unicodeEmoji: "⭐"
+    )
+    let roleIconHigh = GuildRole(
+        id: RoleID(rawValue: 30),
+        name: "Icon High",
+        position: 50,
+        iconURL: URL(string: "https://cdn.discordapp.com/role-icons/30/icon.png")
+    )
+    let roleIconTie = GuildRole(
+        id: RoleID(rawValue: 40),
+        name: "Icon Tie",
+        position: 50,
+        unicodeEmoji: "🔥"
+    )
+
+    let roles = [roleNoIcon, roleIconLow, roleIconHigh, roleIconTie]
+    let topRole = MessageAuthorPresentation.topRoleWithIcon(in: roles)
+    // At an equal position Discord ranks the older role (smaller ID) higher, so roleIconHigh (id 30) beats roleIconTie (id 40).
+    #expect(topRole?.id == RoleID(rawValue: 30))
+
+    let topRoleNoTie = MessageAuthorPresentation.topRoleWithIcon(in: [roleNoIcon, roleIconLow, roleIconHigh])
+    #expect(topRoleNoTie?.id == RoleID(rawValue: 30))
+
+    let none = MessageAuthorPresentation.topRoleWithIcon(in: [roleNoIcon])
+    #expect(none == nil)
 }

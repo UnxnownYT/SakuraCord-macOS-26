@@ -294,6 +294,7 @@ extension AppModel {
         hasLoadedDiscordEmojiSettings = false
         didAttemptDiscordEmojiSettings = false
         voiceStates = [:]
+        serverRailVoicePreviewStore.clear()
         privateCallsByChannel = [:]
         reconcilePrivateCallSounds()
         visibleChannels = []
@@ -326,6 +327,7 @@ extension AppModel {
         profileCustomStatus = nil
         profileCustomStatusUserID = nil
         presentedProfileGame = nil
+        forumPostDrafts = [:]
         memberListsByGuildID = [:]
         threadMembersByID = [:]
         memberListGroupsByGuildID = [:]

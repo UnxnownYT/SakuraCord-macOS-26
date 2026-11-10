@@ -3,6 +3,7 @@ import MessageRendering
 import Observation
 import SakuraCordModels
 import SwiftUI
+import WebKit
 
 extension NSAttributedString.Key {
     nonisolated static let discordEmojiToken = NSAttributedString.Key(
@@ -110,10 +111,11 @@ enum ComposerEmojiAttributedText {
 
     static func make(
         _ source: String,
-        font: NSFont = .interfaceSystemFont(ofSize: 15),
+        style: ComposerTextStyle = .composer,
         mentionPresentations: [String: MentionPresentation] = [:],
         imageProvider: (String) -> NSImage? = { ComposerEmojiImageStore.shared.cachedImage(for: $0) }
     ) -> NSAttributedString {
+        let font = style.font
         let result = NSMutableAttributedString()
         var cursor = 0
         for match in attachmentMatches(in: source) {
@@ -123,7 +125,7 @@ enum ComposerEmojiAttributedText {
                         string: (source as NSString).substring(
                             with: NSRange(location: cursor, length: match.range.location - cursor)
                         ),
-                        attributes: textAttributes(font)
+                        attributes: style.attributes
                     )
                 )
             }
@@ -151,7 +153,7 @@ enum ComposerEmojiAttributedText {
                 height: font.pointSize * 1.15
             )
             let attributedAttachment = NSMutableAttributedString(attachment: attachment)
-            var attachmentAttributes = textAttributes(font)
+            var attachmentAttributes = style.attributes
             attachmentAttributes[.discordEmojiToken] = token
             attributedAttachment.addAttributes(
                 attachmentAttributes,
@@ -163,11 +165,11 @@ enum ComposerEmojiAttributedText {
         if cursor < (source as NSString).length {
             result.append(
                 NSAttributedString(
-                    string: (source as NSString).substring(from: cursor), attributes: textAttributes(font)
+                    string: (source as NSString).substring(from: cursor), attributes: style.attributes
                 )
             )
         }
-        ComposerMarkdownPresentation.apply(to: result, font: font)
+        ComposerMarkdownPresentation.apply(to: result, style: style)
         return result
     }
 
@@ -285,16 +287,39 @@ enum ComposerEmojiAttributedText {
         return max(0, offset - reduction)
     }
 
-    static func textAttributes(_ font: NSFont) -> [NSAttributedString.Key: Any] {
+}
+
+/// How a draft's plain text looks: the composer's own style, or the style
+/// of the text an inline edit replaces, so the editor matches it.
+struct ComposerTextStyle {
+    let font: NSFont
+    let attributes: [NSAttributedString.Key: Any]
+    /// Sets Markdown blocks in Discord's message line heights, as the
+    /// timeline does, rather than in the text's natural lines.
+    var usesMessageLineHeight = false
+
+    static var composer: Self { composer(.interfaceSystemFont(ofSize: 15)) }
+
+    static func composer(_ font: NSFont) -> Self {
         let paragraphStyle = NSMutableParagraphStyle()
         paragraphStyle.minimumLineHeight = NSLayoutManager().defaultLineHeight(for: font)
-        return [
+        return Self(font: font, attributes: [
             .font: font,
             .foregroundColor: NSColor.labelColor,
             .paragraphStyle: paragraphStyle
-        ]
+        ])
     }
 
+    /// The height of a line with no text.
+    var emptyLineHeight: CGFloat {
+        max(
+            NSLayoutManager().defaultLineHeight(for: font),
+            (attributes[.paragraphStyle] as? NSParagraphStyle)?.minimumLineHeight ?? 0
+        )
+    }
+}
+
+extension ComposerEmojiAttributedText {
     nonisolated static func attachmentOriginY(
         font: NSFont,
         size: CGFloat
@@ -311,6 +336,20 @@ enum ComposerEmojiAttributedText {
         ) ?? NSImage(size: NSSize(width: size, height: size))
         image.isTemplate = true
         return image
+    }
+}
+
+/// The composer's scroll view, which an editor that never scrolls leaves
+/// the wheel to its enclosing scroll view.
+final class ComposerScrollView: NSScrollView {
+    var scrolls = true
+
+    override func scrollWheel(with event: NSEvent) {
+        if scrolls {
+            super.scrollWheel(with: event)
+        } else {
+            (superview?.enclosingScrollView ?? nextResponder)?.scrollWheel(with: event)
+        }
     }
 }
 
@@ -336,11 +375,18 @@ struct ComposerTextView: NSViewRepresentable {
     var capturesUnfocusedTyping = false
     var verticalContentInset: CGFloat = 0
     var maximumHeight: CGFloat = InterfaceScale.metric(150)
+    /// Overrides the accent caret, for text set on an accent fill.
+    var insertionPointColor: NSColor?
     var sendTransitionAnchor: ComposerSendTransitionAnchor?
+    var textStyle: ComposerTextStyle = .composer
+    /// False for an editor exactly as tall as its text, as inline edits
+    /// are: it never scrolls, and the wheel scrolls whatever holds it.
+    var scrolls = true
+    var accessibilityHint: String?
     @Binding var selection: NSRange?
     @Binding var isFocused: Bool
 
-    private let font = NSFont.interfaceSystemFont(ofSize: 15)
+    private var font: NSFont { textStyle.font }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -348,7 +394,7 @@ struct ComposerTextView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSScrollView {
         let textStorage = NSTextStorage()
-        let layoutManager = NSLayoutManager()
+        let layoutManager = ComposerLayoutManager()
         textStorage.addLayoutManager(layoutManager)
 
         let textContainer = NSTextContainer()
@@ -389,9 +435,10 @@ struct ComposerTextView: NSViewRepresentable {
         )
         textView.autoresizingMask = [.width]
         textView.font = font
-        textView.textColor = .labelColor
+        textView.textColor = textStyle.attributes[.foregroundColor] as? NSColor ?? .labelColor
         textView.applySakuraCordTextSelectionAppearance()
-        textView.plainTypingAttributes = textAttributes
+        if let insertionPointColor { textView.insertionPointColor = insertionPointColor }
+        textView.plainTextStyle = textStyle
         textView.restorePlainTypingAttributes()
         textView.setAccessibilityLabel(placeholder)
         textView.onReturn = { [weak coordinator = context.coordinator] event in
@@ -417,7 +464,12 @@ struct ComposerTextView: NSViewRepresentable {
         textView.capturesUnfocusedTyping = capturesUnfocusedTyping && context.environment.acceptsComposerInput
         ComposerTextCheckingConfiguration.apply(generalInputSettings, to: textView)
 
-        let scrollView = NSScrollView()
+        let scrollView = ComposerScrollView()
+        scrollView.scrolls = scrolls
+        // The text view alone is the control; a fixed container is no scroll area.
+        scrollView.setAccessibilityElement(scrolls)
+        if !scrolls { scrollView.verticalScrollElasticity = .none }
+        textView.setAccessibilityHelp(accessibilityHint)
         scrollView.documentView = textView
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
@@ -434,12 +486,12 @@ struct ComposerTextView: NSViewRepresentable {
     private func restyleDraft(in textView: ComposerNSTextView) {
         let selectedRange = textView.selectedRange()
         textView.font = font
-        textView.plainTypingAttributes = textAttributes
+        textView.plainTextStyle = textStyle
         textView.typingAttributes = textAttributes
         textView.textStorage?.setAttributedString(
             ComposerEmojiAttributedText.make(
                 text,
-                font: font,
+                style: textStyle,
                 mentionPresentations: mentionPresentations
             )
         )
@@ -500,6 +552,7 @@ struct ComposerTextView: NSViewRepresentable {
         }
 
         textView.applySakuraCordTextSelectionAppearance()
+        if let insertionPointColor { textView.insertionPointColor = insertionPointColor }
         textView.textContainerInset = NSSize(width: 0, height: verticalContentInset)
         ComposerTextCheckingConfiguration.apply(generalInputSettings, to: textView)
         textView.setAccessibilityLabel(placeholder)
@@ -515,7 +568,7 @@ struct ComposerTextView: NSViewRepresentable {
             )
         {
             let replacement = ComposerEmojiAttributedText.make(
-                text, font: font, mentionPresentations: mentionPresentations
+                text, style: textStyle, mentionPresentations: mentionPresentations
             )
             if isTranslationEdit {
                 textView.breakUndoCoalescing()
@@ -546,7 +599,7 @@ struct ComposerTextView: NSViewRepresentable {
                 textView.setSelectedRange(displayed)
             }
         }
-        textView.plainTypingAttributes = textAttributes
+        textView.plainTextStyle = textStyle
         textView.restorePlainTypingAttributes()
 
         context.coordinator.applyFocus(to: textView)
@@ -569,19 +622,18 @@ struct ComposerTextView: NSViewRepresentable {
 
         layoutManager.ensureLayout(for: textContainer)
 
-        let lineHeight = layoutManager.defaultLineHeight(for: font)
-        let contentHeight = ceil(
-            max(lineHeight, layoutManager.usedRect(for: textContainer).height)
-                + textView.textContainerInset.height * 2
-        )
+        // A draft's lines, such as a smaller subtext line, set its height;
+        // an empty draft keeps a line of the plain text.
+        let textHeight = textView.string.isEmpty
+            ? textStyle.emptyLineHeight
+            : layoutManager.usedRect(for: textContainer).maxY
+        let contentHeight = ceil(textHeight + textView.textContainerInset.height * 2)
 
-        scrollView.hasVerticalScroller = contentHeight > maximumHeight
+        scrollView.hasVerticalScroller = scrolls && contentHeight > maximumHeight
         return CGSize(width: proposedWidth, height: min(contentHeight, maximumHeight))
     }
 
-    private var textAttributes: [NSAttributedString.Key: Any] {
-        ComposerEmojiAttributedText.textAttributes(font)
-    }
+    private var textAttributes: [NSAttributedString.Key: Any] { textStyle.attributes }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: ComposerTextView
@@ -629,6 +681,7 @@ struct ComposerTextView: NSViewRepresentable {
                 )
                 let normalized = ComposerEmojiAttributedText.make(
                     raw,
+                    style: parent.textStyle,
                     mentionPresentations: parent.mentionPresentations
                 )
                 if normalized.string != textView.attributedString().string
@@ -842,7 +895,7 @@ final class ComposerEmojiImageStore {
     }
 }
 
-final class ComposerNSTextView: ComposerFocusReportingTextView {
+final class ComposerNSTextView: ComposerFocusReportingTextView, WindowModalEscapeConsumer {
     var onReturn: ((NSEvent) -> Bool)?
     var onEscape: (() -> Void)?
     var onEditLatestMessage: (() -> Bool)?
@@ -851,7 +904,8 @@ final class ComposerNSTextView: ComposerFocusReportingTextView {
     var onDropTargetChanged: ((_ isTargeted: Bool, _ isInstant: Bool) -> Void)?
     var onReceiveAttachments: ((_ attachments: ComposerIncomingAttachments, _ isInstant: Bool) -> Bool)?
     var canReceiveAttachments: (() -> Bool)?
-    var plainTypingAttributes: [NSAttributedString.Key: Any] = [:]
+    var plainTextStyle: ComposerTextStyle = .composer
+    var plainTypingAttributes: [NSAttributedString.Key: Any] { plainTextStyle.attributes }
     var capturesUnfocusedTyping = false {
         didSet {
             unfocusedTypingMonitor.synchronize(
@@ -901,6 +955,15 @@ final class ComposerNSTextView: ComposerFocusReportingTextView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         true
+    }
+
+    // As first responder the text view hears every mouse move and shows its
+    // I-beam; a view drawn over it, such as the inline editor's controls,
+    // keeps its own cursor.
+    override func mouseMoved(with event: NSEvent) {
+        guard let hit = window?.contentView?.hitTest(event.locationInWindow), hit !== self, !hit.isDescendant(of: self) else {
+            return super.mouseMoved(with: event)
+        }
     }
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
@@ -978,8 +1041,7 @@ final class ComposerNSTextView: ComposerFocusReportingTextView {
         restorePlainTypingAttributes()
         if let attributed = insertString as? NSAttributedString {
             let normalized = NSMutableAttributedString(attributedString: attributed)
-            let baseFont = plainTypingAttributes[.font] as? NSFont ?? .interfaceSystemFont(ofSize: 15)
-            ComposerMarkdownPresentation.apply(to: normalized, font: baseFont)
+            ComposerMarkdownPresentation.apply(to: normalized, style: plainTextStyle)
             super.insertText(normalized, replacementRange: replacementRange)
         } else {
             super.insertText(insertString, replacementRange: replacementRange)
@@ -1023,6 +1085,11 @@ final class ComposerNSTextView: ComposerFocusReportingTextView {
             return
         }
         super.keyDown(with: event)
+    }
+
+    /// Escape closes an open suggestion menu before the modal around it.
+    func consumeModalEscape() -> Bool {
+        isEditable && !hasMarkedText() && onAutocompleteCommand?(.dismiss) == true
     }
 
     private func autocompleteCommand(for event: NSEvent) -> ComposerAutocompleteCommand? {
@@ -1278,7 +1345,7 @@ final class ComposerUnfocusedTypingMonitor {
                   event.window === window,
                   window.isKeyWindow,
                   window.firstResponder !== textView,
-                  !Self.isEditingText(window.firstResponder)
+                  !Self.handlesOwnTyping(window.firstResponder)
             else { return event }
 
             if let timeline = window.firstResponder as? NativeTimelineCanvasView,
@@ -1337,9 +1404,14 @@ final class ComposerUnfocusedTypingMonitor {
         self.eventMonitor = nil
     }
 
-    private static func isEditingText(_ responder: NSResponder?) -> Bool {
-        guard let textView = responder as? NSTextView else { return false }
-        return textView.isEditable || textView.isFieldEditor
+    /// Text editors and web content, such as a running Activity, take their
+    /// own keys, Return and Escape included, as page content does in Discord.
+    private static func handlesOwnTyping(_ responder: NSResponder?) -> Bool {
+        if let textView = responder as? NSTextView {
+            return textView.isEditable || textView.isFieldEditor
+        }
+        guard let view = responder as? NSView else { return false }
+        return sequence(first: view, next: \.superview).contains { $0 is WKWebView }
     }
 
     nonisolated static func shouldRedirect(

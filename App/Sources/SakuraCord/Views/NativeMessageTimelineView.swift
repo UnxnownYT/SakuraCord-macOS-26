@@ -415,6 +415,14 @@ extension NativeMessageTimelineCoordinator {
             canvas.onDocumentSizeChange = { [weak self] size in
                 self?.updateDocumentSize(size)
             }
+            canvas.makeEditingLayout = { [weak self] item, editingTextHeight in
+                NativeTimelineRowLayout.make(
+                    item: item,
+                    width: self?.layoutWidth ?? 0,
+                    source: self?.parent.model,
+                    editingTextHeight: editingTextHeight
+                )
+            }
             let documentView = NativeTimelineDocumentView(frame: .zero)
             documentView.addSubview(canvas)
 
@@ -957,6 +965,10 @@ extension NativeMessageTimelineCoordinator {
                       let restoreAnchor = preparation.restoreAnchor {
                 restore(restoreAnchor)
             }
+            // Send copies follow their rows before row motion starts, so a copy
+            // its confirmed row outgrew, as with a cached link preview, no
+            // longer holds that row's growth back.
+            canvas.reconcileSendTransitions()
             // Reaction changes move rows from where the scroll position just settled.
             canvas.beginReactionTransitions()
         }
