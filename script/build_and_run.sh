@@ -198,6 +198,22 @@ xcrun actool \
   "$ROOT_DIR/App/Packaging/Appearance.xcassets"
 rm -f "$ICON_PARTIAL_PLIST"
 
+# Port: Swift 6.3's SwiftPM copies the app's Assets.xcassets into its resource
+# bundle uncompiled, so custom symbols (GIF, Discord, GitHub, thread) and images
+# never load. Compile it in place the way the Swift 6.4 toolchain does.
+MODULE_BUNDLE="$RESOURCES/SakuraCordApp_SakuraCord.bundle"
+if [[ -d "$MODULE_BUNDLE/Assets.xcassets" ]]; then
+  xcrun actool \
+    --compile "$MODULE_BUNDLE" \
+    --platform macosx \
+    --minimum-deployment-target 26.4 \
+    --warnings --errors \
+    "$MODULE_BUNDLE/Assets.xcassets" >/dev/null
+  rm -rf "$MODULE_BUNDLE/Assets.xcassets"
+else
+  echo "note: no uncompiled Assets.xcassets in $MODULE_BUNDLE"
+fi
+
 cat >"$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
