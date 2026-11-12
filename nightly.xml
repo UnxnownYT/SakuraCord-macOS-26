@@ -4,35 +4,39 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>SakuraCord Nightly</title>
         <item>
-            <title>0.1.7 Beta 8</title>
-            <pubDate>Tue, 10 Nov 2026 20:42:17 +0800</pubDate>
-            <link>https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/tag/v0.1.7-Beta-8</link>
-            <sparkle:fullReleaseNotesLink>https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/tag/v0.1.7-Beta-8</sparkle:fullReleaseNotesLink>
-            <sparkle:version>202611101226</sparkle:version>
-            <sparkle:shortVersionString>0.1.7 Beta 8</sparkle:shortVersionString>
+            <title>0.1.7 Beta 8.5</title>
+            <pubDate>Thu, 12 Nov 2026 09:32:29 +0800</pubDate>
+            <link>https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/tag/v0.1.7-Beta-8.5</link>
+            <sparkle:fullReleaseNotesLink>https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/tag/v0.1.7-Beta-8.5</sparkle:fullReleaseNotesLink>
+            <sparkle:version>202611120122</sparkle:version>
+            <sparkle:shortVersionString>0.1.7 Beta 8.5</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.4</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description sparkle:format="markdown"><![CDATA[# SakuraCord v0.1.7-Beta-8
+            <description sparkle:format="markdown"><![CDATA[# SakuraCord v0.1.7-Beta-8.5
 
-## SakuraCord v0.1.7 Beta 8 (macOS 26 port)
+## SakuraCord v0.1.7 Beta 8.5 (macOS 26 port)
 
-Unofficial build of SakuraCord's nightly for macOS 26.5 / Xcode 26.6.
+Unofficial macOS 26.5 build of SakuraCord nightly, put together by UnxnownYT.
 
-### From upstream (Beta 7 + Beta 8)
-- All upstream changes from SakuraCord nightly Beta 7 and Beta 8, including server join applications and smoother edited-message animations in the timeline.
+### New
+- Rich activity, from upstream PR #528 by DinanathDash:
+  - Spotify and Apple Music "Listening to" status, read straight from the apps (no account connection needed), with album art and progress.
+  - Local Discord RPC: games and apps that support Discord Rich Presence show on your status.
+  - Other people's activity (games, music) on their profile cards.
+  - Privacy controls in Settings → Privacy & Safety (off by default).
 
-### Port-specific
-- Fixes so Beta 7/8 compile with Swift 6.3.
-- Discord Rich Presence: games and apps that use Discord RPC show on your status and your own profile card (toggle in Settings → Features).
-- In-app updates: this nightly build checks the nightly feed. Use Check for Updates… to get the next nightly.
+### Fixed (port)
+- The GIF button, the Discord/GitHub/thread icons, the About logo and the profile badges were missing on macOS 26.
+- Local RPC now works inside the macOS sandbox.
 
 ### Notes
 - Ad-hoc signed. On first launch, right-click → Open (or allow it in System Settings → Privacy & Security).
+- Updates: this build checks the nightly feed. Use Check for Updates… for the next nightly.
 ]]></description>
-            <enclosure url="https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/download/v0.1.7-Beta-8/SakuraCord-v0.1.7-Beta-8.dmg" length="44580958" type="application/octet-stream" sparkle:edSignature="N+o4gNbSYdrt+cHmFrSqjteBtRiZHXTzOpW3JsMJxWcQH1Q5mGL69+t4uwvHNoHRBqoA6u0Ljuf4hnYw2DZcBA=="></enclosure>
+            <enclosure url="https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/download/v0.1.7-Beta-8.5/SakuraCord-v0.1.7-Beta-8.5.dmg" length="44957215" type="application/octet-stream" sparkle:edSignature="B6JpTxDAiCLViFVkBONAHOKJhr9WvgVAu6K5XL+W0cObrdBMHrb42oDoHquFeXv9BpZdl5pp8efdY/RyMxMTBA=="></enclosure>
         </item>
     </channel>
 </rss><!-- sparkle-signatures:
-edSignature: GGJDJnsuyiT6d76lZO1hpBguxp5aac8mkAwxyVfIhyZItFWrm3PgubRUwIyKZvVw99j02p8nA7ZYXhZh3lHSBA==
-length: 2290
+edSignature: nHz/nFFCssxb6GH4sHCYbuaif4wlapKr8iNZmPs2XNE2dBq3cd6burGbL8cbwFdBjtvnWMPqkbqNvlD2A1DnDg==
+length: 2516
 -->
