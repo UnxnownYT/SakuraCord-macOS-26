@@ -17,7 +17,7 @@ REPO_URL="https://github.com/UnxnownYT/SakuraCord-macOS-26"
 
 usage() { echo "Usage: $0 stable|nightly vX.Y.Z[-Beta-N] release-notes.md" >&2; exit 2; }
 [[ -n "$CHANNEL" && -n "$TAG" && -n "$NOTES" ]] || usage
-sakuracord_is_release_tag "$TAG" || { echo "Tag must look like v0.1.7 or v0.1.7-Beta-6." >&2; exit 2; }
+sakuracord_is_release_tag "$TAG" || { echo "Tag must look like v0.1.7 or v0.1.7-Beta-6 or v0.1.7-Beta-8.5." >&2; exit 2; }
 case "$CHANNEL" in
   stable)
     TRACK=regular; FEED=stable.xml; BRANCH=macos26-port

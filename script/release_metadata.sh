@@ -162,3 +162,11 @@ sakuracord_release_dmg_name_from_tag() {
     printf 'SakuraCord.v%s.dmg\n' "$asset_version"
   fi
 }
+
+# Port: also allow point releases such as v0.1.7-Beta-8.5.
+sakuracord_is_release_tag() {
+  [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-Beta-[0-9]+(\.[0-9]+)?)?$ ]]
+}
+sakuracord_is_nightly_release_tag() {
+  [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-Beta-[0-9]+(\.[0-9]+)?$ ]]
+}
