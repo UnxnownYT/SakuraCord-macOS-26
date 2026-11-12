@@ -3,7 +3,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
-const nightlyTagPattern = /^v(\d+\.\d+\.\d+)-Beta-(\d+)$/;
+const nightlyTagPattern = /^v(\d+\.\d+\.\d+)-Beta-(\d+(?:\.\d+)?)$/;
 
 export function updateAppcastDisplayVersion(source, tagName) {
   const match = nightlyTagPattern.exec(tagName);
