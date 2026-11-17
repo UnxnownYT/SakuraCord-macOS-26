@@ -101,11 +101,8 @@ extension DiscordRESTProvider {
         let userRevisions = cachedUserRevisions
         let rows: [GatewayRelationshipDTO]
         do {
-            let (data, response) = try await perform("/users/@me/relationships", method: "GET", query: [], body: nil)
-            guard (200 ..< 300).contains(response.statusCode) else {
-                throw unexplainedFailure(data, response)
-            }
-            rows = try JSONDecoder().decode(LossyList<GatewayRelationshipDTO>.self, from: data).elements
+            let list: LossyList<GatewayRelationshipDTO> = try await request("/users/@me/relationships")
+            rows = list.elements
         } catch {
             // A later explicit selection may read again on this connection.
             if relationshipLoadGeneration == generation { relationshipLoadGeneration = nil }
@@ -223,28 +220,20 @@ extension DiscordRESTProvider {
             headers["X-Context-Properties"] = context.base64EncodedString()
         }
         let ((data, response), challengeDismissed) = try await performAnsweringChallenge(
-            path, method: method, query: [], body: body, headers: headers, maximumAttempts: 1
+            path, method: method, query: [], body: body, headers: headers
         )
-        guard !(200 ..< 300).contains(response.statusCode) else { return }
         // Another session already removed it; Gateway reconciles the list.
         if response.statusCode == 404, method == "DELETE" { return }
-        if response.statusCode == 401 {
-            authorizationValue = nil
-            throw apiDiagnostics.coalescing(ChatProviderError.unauthenticated, with: response)
-        }
-        if method == "POST", path == "/users/@me/relationships",
-           let fields = try? JSONDecoder().decode([String: JSONValue].self, from: data), fields["note"] != nil {
-            throw RelationshipActionError.failed(FriendRequestNote.validationMessage)
-        }
-        if quietWhenChallengeClosed, challengeDismissed { throw CancellationError() }
-        let code = Self.discordErrorCode(from: data)
-        if explainsEveryFailure || [400, 403, 429].contains(response.statusCode) {
-            guard let message = failure(code, response.statusCode) else {
-                throw RelationshipActionError.strangerConfirmationRequired
+        try validateEmptyResponse(data, response) { status, code in
+            if status == 401 { return nil }
+            if method == "POST", path == "/users/@me/relationships",
+               let fields = try? JSONDecoder().decode([String: JSONValue].self, from: data), fields["note"] != nil {
+                return RelationshipActionError.failed(FriendRequestNote.validationMessage)
             }
-            throw RelationshipActionError.failed(message)
+            if quietWhenChallengeClosed, challengeDismissed { return CancellationError() }
+            guard explainsEveryFailure || [400, 403, 429].contains(status) else { return nil }
+            return failure(code, status).map(RelationshipActionError.failed) ?? RelationshipActionError.strangerConfirmationRequired
         }
-        throw unexplainedFailure(data, response)
     }
 
     // Official stable633029 module395422 `vU` and module717398 HTTP 429 copy.
@@ -288,17 +277,10 @@ extension DiscordRESTProvider {
         let generation = profileEditingGeneration
         let path = "/users/@me/relationships/\(userID)"
         let (data, response) = try await perform(
-            path, method: "PATCH", query: [], body: ["nickname": value.map(JSONValue.string) ?? .null]
+            path, method: "PATCH", body: ["nickname": value.map(JSONValue.string) ?? .null]
         )
-        guard (200 ..< 300).contains(response.statusCode) else {
-            if response.statusCode == 400,
-               let error = Self.profileValidationError(data: data, method: "PATCH", path: path)
-            { throw apiDiagnostics.coalescing(error, with: response) }
-            if response.statusCode == 401 {
-                authorizationValue = nil
-                throw apiDiagnostics.coalescing(ChatProviderError.unauthenticated, with: response)
-            }
-            throw unexplainedFailure(data, response)
+        try validateEmptyResponse(data, response) { _, _ in
+            profileValidationFailure(data: data, response: response, method: "PATCH", path: path)
         }
         // Only this friend's events supersede the save; the generation also
         // guards READY and disconnect, which clear the per-user revisions.
@@ -345,6 +327,11 @@ extension DiscordRESTProvider {
     func adoptReadyRelationships(_ records: [UserID: RelationshipRecord]) {
         relationshipGeneration &+= 1
         relationshipLoadGeneration = nil
+        storeRelationships(records)
+    }
+
+    /// Stores the records with the friend and nickname indexes derived from them.
+    private func storeRelationships(_ records: [UserID: RelationshipRecord]) {
         cachedRelationships = records
         cachedFriendUserIDs = Set(records.lazy.filter { $0.value.type == .friend }.map(\.key))
         cachedRelationshipNicknamesByUserID = records.compactMapValues(\.nickname)
@@ -367,11 +354,9 @@ extension DiscordRESTProvider {
         let blocked = Set(records.lazy.filter { $0.value.type == .blocked || $0.value.isUserIgnored }.map(\.key))
         let blockedChanged = blocked != cachedBlockedOrIgnoredUserIDs
         cachedBlockedOrIgnoredUserIDs = blocked
-        let nicknames = records.compactMapValues(\.nickname)
-        let nicknamesChanged = nicknames != cachedRelationshipNicknamesByUserID
-        cachedRelationships = records
-        cachedFriendUserIDs = Set(records.lazy.filter { $0.value.type == .friend }.map(\.key))
-        cachedRelationshipNicknamesByUserID = nicknames
+        let previousNicknames = cachedRelationshipNicknamesByUserID
+        storeRelationships(records)
+        let nicknamesChanged = cachedRelationshipNicknamesByUserID != previousNicknames
         continuation?.yield(.relationshipsChanged(publishedRelationships()))
         publishRelationshipPresences(complete: true)
         if blockedChanged { continuation?.yield(.knownUsersChanged(currentKnownUsers())) }
@@ -408,19 +393,26 @@ extension DiscordRESTProvider {
     /// Account-wide presence from the private presence cache. Other users'
     /// Invisible is never disclosed, so it reads as offline like an absent one.
     func relationshipPresence(for userID: UserID) -> UserPresence {
-        guard let member = cachedPrivateMembersByID[userID], member.status.isVisibleOnline else {
+        let member = cachedPrivateMembersByID[userID]
+            ?? cachedMembers.values.lazy.flatMap { $0 }.first { $0.id == userID && $0.status.isVisibleOnline }
+        guard let member, member.status.isVisibleOnline else {
             return UserPresence(status: .offline)
         }
         return UserPresence(
             status: member.status, customStatus: member.customStatus, activityText: member.activityText,
-            isListeningToMusic: member.isListeningToMusic, isMobileOnly: member.isMobileOnly
+            isListeningToMusic: member.isListeningToMusic, isMobileOnly: member.isMobileOnly,
+            richActivity: member.richActivity
         )
     }
 
     func publishRelationshipPresences(complete: Bool, userIDs: [UserID]? = nil) {
         let ids = userIDs ?? Array(cachedRelationships.keys)
         let presences = Dictionary(uniqueKeysWithValues: ids.lazy
-            .filter { self.cachedRelationships[$0] != nil }
+            .filter { id in
+                self.cachedRelationships[id] != nil
+                    || self.cachedPrivateMembersByID[id] != nil
+                    || self.cachedMembers.values.contains { members in members.contains { $0.id == id } }
+            }
             .map { ($0, self.relationshipPresence(for: $0)) })
         guard complete || !presences.isEmpty else { return }
         continuation?.yield(.relationshipPresencesChanged(presences, isComplete: complete))

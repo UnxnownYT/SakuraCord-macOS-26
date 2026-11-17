@@ -9,77 +9,45 @@ nonisolated extension SettingsCatalog {
 
     static let privacySafetyControls: [SettingsControlMetadata] = [
         control(.blockedAccounts, page: .privacySafety, section: .privacyRelationships, label: "Blocked Accounts",
-                help: "Manage accounts you have blocked on Discord.", keywords: ["block", "unblock", "people", "relationships"],
-                owner: .appModel, scope: .discordSynchronized, persistence: .discordManaged, reset: .notApplicable),
+                help: "Manage accounts you have blocked on Discord.", keywords: ["block", "unblock", "people", "relationships"]),
         control(.ignoredAccounts, page: .privacySafety, section: .privacyRelationships, label: "Ignored Accounts",
-                help: "Manage accounts you have ignored on Discord.", keywords: ["ignore", "unignore", "people", "relationships"],
-                owner: .appModel, scope: .discordSynchronized, persistence: .discordManaged, reset: .notApplicable),
-        control(
-            .activitySharing, page: .privacySafety,
-            section: .privacyDiscordActivity, label: "Share Activity Status",
-            help: "Broadcast your current activity and presence to Discord.",
-            keywords: ["activity", "presence", "rich presence", "status"],
-            scope: .appWideLocal, persistence: .appPreferences, reset: .registeredLocalValue
-        ),
-        control(
-            .appleMusicPresence, page: .privacySafety,
-            section: .privacyDiscordActivity, label: "Share Apple Music Playback",
-            help: "Display the song currently playing in macOS Apple Music as your listening activity.",
-            keywords: ["apple music", "music", "song", "listening", "presence"],
-            scope: .appWideLocal, persistence: .appPreferences, reset: .registeredLocalValue
-        ),
-        control(
-            .localDiscordRPC, page: .privacySafety,
-            section: .privacyDiscordActivity, label: "Allow Local Discord RPC",
-            help: "Allow local apps and games on your Mac to connect via Discord IPC socket and set rich presence.",
-            keywords: ["rpc", "ipc", "socket", "games", "rich presence"],
-            scope: .appWideLocal, persistence: .appPreferences, reset: .registeredLocalValue
-        ),
+                help: "Manage accounts you have ignored on Discord.", keywords: ["ignore", "unignore", "people", "relationships"]),
         control(
             .removeMediaMetadata, page: .privacySafety,
             section: .privacyDiscordActivity, label: "Remove metadata from images and videos",
             help: "Remove location, camera and other personal metadata before Discord or external uploads, preserving media quality.",
-            keywords: ["GPS", "EXIF", "location", "photos", "metadata", "attachments", "uploads"],
-            scope: .appWideLocal, persistence: .appPreferences, reset: .registeredLocalValue
+            keywords: ["GPS", "EXIF", "location", "photos", "metadata", "attachments", "uploads"]
         ),
         control(
             .anonymiseFileNames, page: .privacySafety,
             section: .privacyDiscordActivity, label: "Anonymise file names",
             help: "Replace uploaded file names with random names, keeping file extensions and spoiler markers.",
-            keywords: ["anonymous", "anonymize", "randomise", "randomize", "filename", "attachments", "uploads"],
-            scope: .appWideLocal, persistence: .appPreferences, reset: .registeredLocalValue
+            keywords: ["anonymous", "anonymize", "randomise", "randomize", "filename", "attachments", "uploads"]
         ),
         control(
             .privacyTypingIndicators, page: .privacySafety,
             section: .privacyDiscordActivity, label: "Send Typing Indicators",
             help: "Send Discord typing events while composing.",
-            keywords: ["typing status", "Discord", "composer"],
-            scope: .appWideLocal, persistence: .appPreferences, reset: .registeredLocalValue
+            keywords: ["typing status", "Discord", "composer"]
         ),
         control(
             .externalLinkProtection, page: .privacySafety,
             section: .privacyLinksServices,
             label: "Ask Permission When Opening External Links",
             help: "Choose whether SakuraCord asks before opening untrusted domains, all external links, or no external links.",
-            keywords: ["URL", "domain", "phishing", "warning", "browser", "confirm"],
-            scope: .appWideLocal, persistence: .appPreferences,
-            reset: .registeredLocalValue
+            keywords: ["URL", "domain", "phishing", "warning", "browser", "confirm"]
         ),
         control(
             .trustedDomains, page: .privacySafety,
             section: .privacyLinksServices, label: "Manage Trusted Domains",
             help: "Search, add, or remove exact domains that can open without confirmation under the default policy.",
-            keywords: ["URL", "domain", "allow list", "trusted", "browser"],
-            scope: .appWideLocal, persistence: .appPreferences,
-            reset: .registeredLocalValue
+            keywords: ["URL", "domain", "allow list", "trusted", "browser"]
         ),
         control(
             .clearLocalActivity, page: .privacySafety,
             section: .privacyLocalData, label: "Clear Local Activity",
             help: "Clear the current account's recent Quick Switch and forwarding destinations plus app-wide local emoji recents and learned usage.",
-            keywords: ["history", "frecency", "forward", "quick switch", "recent emoji", "learning"],
-            owner: .appModel, scope: .accountAndAppWideLocal,
-            persistence: .notApplicable, reset: .categoryAction
+            keywords: ["history", "frecency", "forward", "quick switch", "recent emoji", "learning"]
         ),
     ]
 }

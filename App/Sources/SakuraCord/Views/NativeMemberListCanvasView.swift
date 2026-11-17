@@ -82,6 +82,7 @@ final class NativeMemberListCanvasView: NSView, WindowModalInputParticipant {
         let activityTruncationToken: CTLine?
         let activityWidth: CGFloat
         let serverTag: NativeServerTagPresentation?
+        let activityIconType: MemberActivityIconType?
 
         init(
             nameFont: NSFont,
@@ -92,7 +93,8 @@ final class NativeMemberListCanvasView: NSView, WindowModalInputParticipant {
             activity: CTLine?,
             activityTruncationToken: CTLine?,
             activityWidth: CGFloat,
-            serverTag: NativeServerTagPresentation?
+            serverTag: NativeServerTagPresentation?,
+            activityIconType: MemberActivityIconType? = nil
         ) {
             self.nameFont = nameFont
             self.name = name
@@ -103,6 +105,7 @@ final class NativeMemberListCanvasView: NSView, WindowModalInputParticipant {
             self.activityTruncationToken = activityTruncationToken
             self.activityWidth = activityWidth
             self.serverTag = serverTag
+            self.activityIconType = activityIconType
         }
     }
 
@@ -151,12 +154,6 @@ final class NativeMemberListCanvasView: NSView, WindowModalInputParticipant {
         let opacity: CGFloat
     }
 
-    struct AvatarOverlayPresentation {
-        let id: ItemID
-        let member: Member
-        let index: Int
-    }
-
     struct AvatarOverlayConfiguration: Equatable {
         let member: Member
         let isHovered: Bool
@@ -164,9 +161,9 @@ final class NativeMemberListCanvasView: NSView, WindowModalInputParticipant {
         let opacity: CGFloat
     }
 
-    struct ActivityEmojiOverlayPresentation {
-        let id: ActivityEmojiOverlayID
-        let configuration: ActivityEmojiOverlayConfiguration
+    struct OverlayHostPresentation<ID: Hashable, Configuration: Equatable> {
+        let id: ID
+        let configuration: Configuration
         let frame: CGRect
     }
 
@@ -174,7 +171,7 @@ final class NativeMemberListCanvasView: NSView, WindowModalInputParticipant {
         let avatarURL = member.guildAvatarURL ?? member.user.avatarURL
         return member.user.avatarDecorationURL != nil
             || avatarURL.map(
-                NativeTimelineAvatarPresentation.shouldDecodeAnimation
+                UserAvatarPresentation.shouldDecodeAnimation
             ) == true
     }
 
@@ -242,7 +239,7 @@ final class NativeMemberListCanvasView: NSView, WindowModalInputParticipant {
     var rowOverlay: NSHostingView<AnyView>?
     var rowForegroundOverlay: NativeMemberForegroundOverlayView?
     var rowOverlayIndex: Int?
-    let memberHoverTicker = NativeTimelineDisplayLinkTicker()
+    let memberHoverTicker = DisplayLinkTicker()
     var profileAnchorIndex: Int?
     let profilePopoverCoordinator =
         StableAnchoredPopoverPresenter<AnyView>.Coordinator()

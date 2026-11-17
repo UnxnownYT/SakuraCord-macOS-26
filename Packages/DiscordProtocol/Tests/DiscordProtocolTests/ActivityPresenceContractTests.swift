@@ -84,6 +84,44 @@ extension DirectMessageProviderContractTests {
         #expect(activities[1]["type"] as? Int == 2)
     }
 
+    @Test func `customizing activity category order reprioritizes gateway presence activities`() async throws {
+        DirectMessageURLProtocol.reset()
+        let session = try await readyStatusPickProvider(settings: statusSettingsFixture("online", dataVersion: 1))
+        defer { DiscordRESTProvider.removePendingStatusEdit(accountID: session.accountID) }
+
+        let provider = session.provider
+        let socket = session.socket
+
+        let musicActivity = OutgoingActivityPayload(
+            name: "Apple Music",
+            type: .listening,
+            details: "Song Title"
+        )
+        try await provider.updateActivity(musicActivity, sourceID: "apple_music")
+
+        let gameActivity = OutgoingActivityPayload(
+            name: "Minecraft",
+            type: .playing,
+            details: "Mining Diamonds"
+        )
+        try await provider.updateActivity(gameActivity, sourceID: "rpc:game")
+
+        // Prioritize music over games
+        try await provider.updateActivityCategoryOrder([.music, .games, .streaming, .other])
+
+        let presenceData = try #require(await socket.sentPayload(opcode: 3))
+        let presenceJson = try #require(JSONSerialization.jsonObject(with: presenceData) as? [String: Any])
+        let payloadDict = try #require(presenceJson["d"] as? [String: Any])
+        let activities = try #require(payloadDict["activities"] as? [[String: Any]])
+
+        #expect(activities.count == 2)
+        // With music prioritized, Listening must precede Playing
+        #expect(activities[0]["name"] as? String == "Apple Music")
+        #expect(activities[0]["type"] as? Int == 2)
+        #expect(activities[1]["name"] as? String == "Minecraft")
+        #expect(activities[1]["type"] as? Int == 0)
+    }
+
     @Test func `clearing activity removes it from gateway presence payload`() async throws {
         DirectMessageURLProtocol.reset()
         let session = try await readyStatusPickProvider(settings: statusSettingsFixture("online", dataVersion: 1))
@@ -136,5 +174,36 @@ extension DirectMessageProviderContractTests {
         let payloadDict = try #require(json["d"] as? [String: Any])
         let activities = try #require(payloadDict["activities"] as? [[String: Any]])
         #expect(activities.isEmpty)
+    }
+
+    @Test func `activity buttons serialize to string array and metadata button urls for gateway op 3`() async throws {
+        DirectMessageURLProtocol.reset()
+        let session = try await readyStatusPickProvider(settings: statusSettingsFixture("online", dataVersion: 1))
+        defer { DiscordRESTProvider.removePendingStatusEdit(accountID: session.accountID) }
+
+        let provider = session.provider
+        let socket = session.socket
+
+        let activity = OutgoingActivityPayload(
+            name: "Modrinth",
+            type: .playing,
+            details: "Exploring Mods",
+            buttons: [
+                ActivityButton(label: "Modrinth Page", url: "https://modrinth.com"),
+                ActivityButton(label: "Source", url: "https://github.com"),
+            ]
+        )
+
+        try await provider.updateActivity(activity, sourceID: "rpc:modrinth")
+
+        let presenceData = try #require(await socket.sentPayload(opcode: 3))
+        let presenceJson = try #require(JSONSerialization.jsonObject(with: presenceData) as? [String: Any])
+        let payloadDict = try #require(presenceJson["d"] as? [String: Any])
+        let activities = try #require(payloadDict["activities"] as? [[String: Any]])
+        #expect(activities.count == 1)
+        let first = activities[0]
+        #expect(first["buttons"] as? [String] == ["Modrinth Page", "Source"])
+        let metadata = try #require(first["metadata"] as? [String: Any])
+        #expect(metadata["button_urls"] as? [String] == ["https://modrinth.com", "https://github.com"])
     }
 }

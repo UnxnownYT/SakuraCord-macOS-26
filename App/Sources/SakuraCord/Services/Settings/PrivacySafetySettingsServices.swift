@@ -1,3 +1,4 @@
+import DiscordProtocol
 import AppKit
 import Foundation
 
@@ -56,23 +57,32 @@ nonisolated enum ExternalLinkConfirmationPolicy: String, CaseIterable, Identifia
 }
 
 nonisolated struct PrivacySafetySettingsSnapshot: Equatable, Sendable {
-    static let defaults = Self(
-        sendsTypingIndicators: true,
-        externalLinkConfirmationPolicy: .untrustedDomains,
-        trustedDomains: ExternalLinkTrustedDomain.defaults,
-        sharesActivity: false,
-        sharesAppleMusicActivity: false,
-        allowsLocalRPC: false
-    )
+    static let defaults = Self(reading: SettingsPreferenceRegistry.foundation.defaultValue(for:))
 
-    var removesMediaMetadata = true
-    var anonymisesFileNames = false
+    var removesMediaMetadata: Bool
+    var anonymisesFileNames: Bool
     var sendsTypingIndicators: Bool
     var externalLinkConfirmationPolicy: ExternalLinkConfirmationPolicy
     var trustedDomains: [String]
     var sharesActivity: Bool = false
     var sharesAppleMusicActivity: Bool = false
     var allowsLocalRPC: Bool = false
+    var activityStackOrder: [ActivityCategory] = ActivityCategory.defaultOrder
+}
+
+nonisolated extension PrivacySafetySettingsSnapshot {
+    init(reading value: (SettingsControlID) -> SettingsPreferenceValue) {
+        removesMediaMetadata = value(.removeMediaMetadata).boolValue
+        anonymisesFileNames = value(.anonymiseFileNames).boolValue
+        sendsTypingIndicators = value(.privacyTypingIndicators).boolValue
+        externalLinkConfirmationPolicy = value(.externalLinkProtection).rawValue()
+        trustedDomains = ExternalLinkTrustedDomain.normalizedList(value(.trustedDomains).stringsValue)
+        sharesActivity = value(.activitySharing).boolValue
+        sharesAppleMusicActivity = value(.appleMusicPresence).boolValue
+        allowsLocalRPC = value(.localDiscordRPC).boolValue
+        let categories = value(.activityStackOrder).stringsValue.compactMap(ActivityCategory.init(rawValue:))
+        activityStackOrder = ActivityCategory.normalizedOrder(categories)
+    }
 }
 
 @MainActor
@@ -87,40 +97,17 @@ final class PrivacySafetySettingsStore {
     }
 
     func load() -> PrivacySafetySettingsSnapshot {
-        var value = PrivacySafetySettingsSnapshot.defaults
-        if case let .bool(saved) = preferences.value(for: .activitySharing) {
-            value.sharesActivity = saved
-        }
-        if case let .bool(saved) = preferences.value(for: .appleMusicPresence) {
-            value.sharesAppleMusicActivity = saved
-        }
-        if case let .bool(saved) = preferences.value(for: .localDiscordRPC) {
-            value.allowsLocalRPC = saved
-        }
-        if case let .bool(saved) = preferences.value(for: .removeMediaMetadata) {
-            value.removesMediaMetadata = saved
-        }
-        if case let .bool(saved) = preferences.value(for: .anonymiseFileNames) {
-            value.anonymisesFileNames = saved
-        }
-        if case let .bool(saved) = preferences.value(for: .privacyTypingIndicators) {
-            value.sendsTypingIndicators = saved
-        }
-        if case let .string(rawValue) = preferences.value(for: .externalLinkProtection),
-           let policy = ExternalLinkConfirmationPolicy(rawValue: rawValue)
-        {
-            value.externalLinkConfirmationPolicy = policy
-        }
-        if case let .strings(domains) = preferences.value(for: .trustedDomains) {
-            value.trustedDomains = ExternalLinkTrustedDomain.normalizedList(domains)
-        }
-        return value
+        PrivacySafetySettingsSnapshot { preferences.value(for: $0) }
     }
 
     func save(_ value: PrivacySafetySettingsSnapshot) {
         preferences.set(.bool(value.sharesActivity), for: .activitySharing)
         preferences.set(.bool(value.sharesAppleMusicActivity), for: .appleMusicPresence)
         preferences.set(.bool(value.allowsLocalRPC), for: .localDiscordRPC)
+        preferences.set(
+            .strings(value.activityStackOrder.map(\.rawValue)),
+            for: .activityStackOrder
+        )
         preferences.set(.bool(value.removesMediaMetadata), for: .removeMediaMetadata)
         preferences.set(.bool(value.anonymisesFileNames), for: .anonymiseFileNames)
         preferences.set(.bool(value.sendsTypingIndicators), for: .privacyTypingIndicators)
@@ -382,7 +369,8 @@ extension AppModel {
                 ActivityCoordinatorPreferences(
                     isActivitySharingEnabled: value.sharesActivity,
                     isAppleMusicPresenceEnabled: value.sharesAppleMusicActivity,
-                    isLocalRPCEnabled: value.allowsLocalRPC
+                    isLocalRPCEnabled: value.allowsLocalRPC,
+                    activityCategoryOrder: value.activityStackOrder
                 )
             )
             if launchMode == .normal {

@@ -109,4 +109,76 @@ struct ActivityCoordinatorTests {
         await coordinator.setProvider(newProvider)
         #expect(await newProvider.currentActivities()["apple_music"] == music)
     }
+
+    @Test func `disabling source while update is pending ensures source is cleared and not restored`() async throws {
+        let mockProvider = MockChatProvider()
+        let coordinator = ActivityCoordinator(provider: mockProvider, preferences: .enabledAll)
+
+        let music = OutgoingActivityPayload(name: "Apple Music", type: .listening)
+        let game = OutgoingActivityPayload(name: "Roblox", type: .playing)
+        let gameSource = ActivitySource.localRPC(sourceID: "roblox", clientID: "111", processID: 100)
+
+        await coordinator.setActivity(music, for: .appleMusic)
+        await coordinator.setActivity(game, for: gameSource)
+
+        #expect(await mockProvider.currentActivities().count == 2)
+
+        // Disable Apple Music
+        var prefs = await coordinator.currentPreferences()
+        prefs.isAppleMusicPresenceEnabled = false
+        await coordinator.updatePreferences(prefs)
+
+        let activities = await mockProvider.currentActivities()
+        #expect(activities["apple_music"] == nil)
+        #expect(activities[gameSource.sourceID] == game)
+    }
+
+    @Test func `stale generation updates are ignored by coordinator`() async throws {
+        let mockProvider = MockChatProvider()
+        let coordinator = ActivityCoordinator(provider: mockProvider, preferences: .enabledAll)
+
+        let initialMusic = OutgoingActivityPayload(name: "Apple Music", type: .listening, details: "Track 1")
+        await coordinator.setActivity(initialMusic, for: .appleMusic, generation: 5)
+        #expect(await mockProvider.currentActivities()["apple_music"] == initialMusic)
+
+        // Stale update with gen 4 is ignored
+        let staleMusic = OutgoingActivityPayload(name: "Apple Music", type: .listening, details: "Stale Track")
+        await coordinator.setActivity(staleMusic, for: .appleMusic, generation: 4)
+        #expect(await mockProvider.currentActivities()["apple_music"] == initialMusic)
+
+        // Clear with generation 6 clears it
+        await coordinator.clearActivity(for: .appleMusic, generation: 6)
+        #expect(await mockProvider.currentActivities()["apple_music"] == nil)
+
+        // Stale set with gen 5 after clear with gen 6 cannot restore it
+        await coordinator.setActivity(staleMusic, for: .appleMusic, generation: 5)
+        #expect(await mockProvider.currentActivities()["apple_music"] == nil)
+    }
+
+    @Test func `custom activity category order reprioritizes primary activity`() async throws {
+        let mockProvider = MockChatProvider()
+        var prefs = ActivityCoordinatorPreferences.enabledAll
+        prefs.activityCategoryOrder = [.music, .games, .streaming, .other]
+        let coordinator = ActivityCoordinator(provider: mockProvider, preferences: prefs)
+
+        let music = OutgoingActivityPayload(name: "Apple Music", type: .listening)
+        let game = OutgoingActivityPayload(name: "Minecraft", type: .playing)
+        let gameSource = ActivitySource.localRPC(sourceID: "game", clientID: "111", processID: nil)
+
+        await coordinator.setActivity(game, for: gameSource)
+        await coordinator.setActivity(music, for: .appleMusic)
+
+        // Music should be primary because it is ordered first
+        let primary = await coordinator.currentPrimaryActivity()
+        #expect(primary?.name == "Apple Music")
+        #expect(primary?.type == .listening)
+
+        // Swap order back to games first
+        prefs.activityCategoryOrder = [.games, .music, .streaming, .other]
+        await coordinator.updatePreferences(prefs)
+
+        let reprioritizedPrimary = await coordinator.currentPrimaryActivity()
+        #expect(reprioritizedPrimary?.name == "Minecraft")
+        #expect(reprioritizedPrimary?.type == .playing)
+    }
 }

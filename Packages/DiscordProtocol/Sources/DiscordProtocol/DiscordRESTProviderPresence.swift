@@ -30,6 +30,14 @@ public extension DiscordRESTProvider {
         await sendPresenceIfChanged()
     }
 
+    func updateActivityCategoryOrder(_ order: [ActivityCategory]) async throws {
+        let normalized = ActivityCategory.normalizedOrder(order)
+        guard activityCategoryOrder != normalized else { return }
+        presenceGeneration &+= 1
+        activityCategoryOrder = normalized
+        await sendPresenceIfChanged()
+    }
+
     // Official stable622805 module827827 and module594061 `markDirty`.
     /// Applies a pick at once and saves it; only this first save reports a failure.
     func updateStatus(_ status: PresenceStatus) async throws {
@@ -76,7 +84,7 @@ extension DiscordRESTProvider {
     func publishMembers(guildID: GuildID, members: [Member], groups: [GuildMemberListGroup]) {
         publishThreadMembers(guildID: guildID)
         discardInaccessibleMemberLists(guildID: guildID)
-        if let selected = selectedMemberListID[guildID],
+        if let selected = memberListState.selectedIDs[guildID],
            !isMemberListAccessible(guildID: guildID, memberListID: selected) {
             continuation?.yield(.membersChanged(guildID: guildID, members: [], groups: []))
             return
@@ -93,8 +101,10 @@ extension DiscordRESTProvider {
 
     func activeActivitiesList() -> [OutgoingActivityPayload] {
         activeActivities.values.sorted { lhs, rhs in
-            if lhs.priorityRank != rhs.priorityRank {
-                return lhs.priorityRank < rhs.priorityRank
+            let lRank = lhs.priorityRank(using: activityCategoryOrder)
+            let rRank = rhs.priorityRank(using: activityCategoryOrder)
+            if lRank != rRank {
+                return lRank < rRank
             }
             return lhs.name < rhs.name
         }
@@ -145,19 +155,34 @@ extension DiscordRESTProvider {
     }
 
     private func resolveExternalAsset(url: String, applicationID: String) async -> String? {
+        if url.hasPrefix("https://i.scdn.co/image/") {
+            let hash = String(url.dropFirst("https://i.scdn.co/image/".count))
+            return "spotify:\(hash)"
+        }
         if let cached = externalAssetCache[url] {
             return cached
         }
+        let targetAppID = applicationID.allSatisfy(\.isNumber) && !applicationID.isEmpty
+            ? applicationID
+            : "1247654840780460125"
         do {
             let body: [String: JSONValue] = [
                 "urls": .array([.string(url)])
             ]
             let dtos: [ExternalAssetDTO] = try await request(
-                "/applications/\(applicationID)/external-assets",
+                "/applications/\(targetAppID)/external-assets",
                 method: "POST",
                 body: body
             )
             if let first = dtos.first {
+                let rawPath = first.externalAssetPath
+                let path: String = if rawPath.hasPrefix("mp:") {
+                    rawPath
+                } else if rawPath.hasPrefix("/") {
+                    "mp:\(rawPath.dropFirst())"
+                } else {
+                    "mp:\(rawPath)"
+                }
                 if externalAssetCache[url] == nil {
                     if externalAssetCacheKeys.count >= 128 {
                         let oldest = externalAssetCacheKeys.removeFirst()
@@ -165,13 +190,39 @@ extension DiscordRESTProvider {
                     }
                     externalAssetCacheKeys.append(url)
                 }
-                externalAssetCache[url] = first.externalAssetPath
-                return first.externalAssetPath
+                externalAssetCache[url] = path
+                return path
             }
         } catch {
             gatewayLogger.debug("External asset resolution for \(url) failed: \(error.localizedDescription)")
         }
         return nil
+    }
+
+    private struct ApplicationAssetDTO: Decodable {
+        let id: String
+        let name: String
+    }
+
+    private func resolveApplicationAssetID(applicationID: String, assetName: String) async -> String? {
+        guard !applicationID.isEmpty, applicationID.allSatisfy(\.isNumber) else { return nil }
+        let now = Date()
+        if let cached = applicationAssetCatalogs[applicationID], cached.expiresAt > now {
+            return cached.assets[assetName]
+        }
+        do {
+            let assets: [ApplicationAssetDTO] = try await request("/oauth2/applications/\(applicationID)/assets")
+            var assetMap: [String: String] = [:]
+            for asset in assets {
+                assetMap[asset.name] = asset.id
+            }
+            applicationAssetCatalogs[applicationID] = (assets: assetMap, expiresAt: now.addingTimeInterval(3600))
+            return assetMap[assetName]
+        } catch {
+            gatewayLogger.debug("Asset resolution for \(assetName) in application \(applicationID) failed: \(error.localizedDescription)")
+            applicationAssetCatalogs[applicationID] = (assets: [:], expiresAt: now.addingTimeInterval(60))
+            return nil
+        }
     }
 
     private func buildGatewayActivityDictionaries(
@@ -180,17 +231,31 @@ extension DiscordRESTProvider {
         var activityDictionaries: [[String: Any]] = []
         for activity in activities {
             var dict = activity.gatewayDictionary
-            if let assets = activity.assets,
-               let largeImage = assets.largeImage,
-               largeImage.hasPrefix("http://") || largeImage.hasPrefix("https://"),
-               !largeImage.hasPrefix("mp:external/"),
-               let appID = activity.applicationId,
-               !appID.isEmpty {
-                if let proxied = await resolveExternalAsset(url: largeImage, applicationID: appID) {
-                    var ast = dict["assets"] as? [String: Any] ?? [:]
-                    ast["large_image"] = proxied
-                    dict["assets"] = ast
+            let appID = activity.applicationId ?? ""
+            if var ast = dict["assets"] as? [String: Any] {
+                if let largeImage = ast["large_image"] as? String {
+                    if largeImage.hasPrefix("http://") || largeImage.hasPrefix("https://") {
+                        if let proxied = await resolveExternalAsset(url: largeImage, applicationID: appID) {
+                            ast["large_image"] = proxied
+                        }
+                    } else if !largeImage.allSatisfy(\.isNumber), !largeImage.hasPrefix("spotify:"), !largeImage.hasPrefix("mp:"), !appID.isEmpty {
+                        if let assetID = await resolveApplicationAssetID(applicationID: appID, assetName: largeImage) {
+                            ast["large_image"] = assetID
+                        }
+                    }
                 }
+                if let smallImage = ast["small_image"] as? String {
+                    if smallImage.hasPrefix("http://") || smallImage.hasPrefix("https://") {
+                        if let proxied = await resolveExternalAsset(url: smallImage, applicationID: appID) {
+                            ast["small_image"] = proxied
+                        }
+                    } else if !smallImage.allSatisfy(\.isNumber), !smallImage.hasPrefix("spotify:"), !smallImage.hasPrefix("mp:"), !appID.isEmpty {
+                        if let assetID = await resolveApplicationAssetID(applicationID: appID, assetName: smallImage) {
+                            ast["small_image"] = assetID
+                        }
+                    }
+                }
+                dict["assets"] = ast
             }
             activityDictionaries.append(dict)
         }

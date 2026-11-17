@@ -1,3 +1,4 @@
+import DiscordProtocol
 import SwiftUI
 
 struct PrivacySafetySettingsPage: View {
@@ -10,7 +11,7 @@ struct PrivacySafetySettingsPage: View {
     var body: some View {
         NavigationStack(path: $navigationPath) {
             SettingsPageForm(page: .privacySafety, state: state) {
-                PrivacyDiscordActivitySection(
+                PrivacyMediaMetadataSection(
                     value: $value,
                     state: state
                 )
@@ -33,10 +34,7 @@ struct PrivacySafetySettingsPage: View {
         .onChange(of: value) { _, newValue in
             model.applyPrivacySafetySettings(newValue)
         }
-        .onChange(of: state.revealRequest?.id) {
-            guard state.revealRequest?.destination.page == .privacySafety else { return }
-            navigationPath.removeAll()
-        }
+        .settingsNavigationPathResetOnReveal($navigationPath, page: .privacySafety, state: state)
     }
 }
 
@@ -313,34 +311,20 @@ private struct TrustedDomainRow: View {
     }
 }
 
-private struct PrivacyDiscordActivitySection: View {
+private struct PrivacyMediaMetadataSection: View {
     @Binding var value: PrivacySafetySettingsSnapshot
     let state: SettingsViewState
 
     var body: some View {
         Section {
-            Toggle("Share activity status", isOn: $value.sharesActivity)
-                .tint(SakuraCordAccentColor.color)
-                .settingsControlAnchor(.activitySharing, state: state)
-            Toggle("Display Apple Music as activity", isOn: $value.sharesAppleMusicActivity)
-                .tint(SakuraCordAccentColor.color)
-                .disabled(!value.sharesActivity)
-                .settingsControlAnchor(.appleMusicPresence, state: state)
-            Toggle("Allow local apps to connect (Discord RPC)", isOn: $value.allowsLocalRPC)
-                .tint(SakuraCordAccentColor.color)
-                .disabled(!value.sharesActivity)
-                .settingsControlAnchor(.localDiscordRPC, state: state)
             Toggle("Remove metadata from images and videos", isOn: $value.removesMediaMetadata)
-                .tint(SakuraCordAccentColor.color)
                 .settingsControlAnchor(.removeMediaMetadata, state: state)
             Toggle("Anonymise file names", isOn: $value.anonymisesFileNames)
-                .tint(SakuraCordAccentColor.color)
                 .settingsControlAnchor(.anonymiseFileNames, state: state)
             Toggle("Send typing indicators", isOn: $value.sendsTypingIndicators)
-                .tint(SakuraCordAccentColor.color)
                 .settingsControlAnchor(.privacyTypingIndicators, state: state)
         } header: {
-            Text("Discord Activity & Presence", bundle: #bundle)
+            Text("Media & Privacy", bundle: #bundle)
         }
     }
 }

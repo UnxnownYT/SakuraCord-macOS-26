@@ -94,7 +94,9 @@ extension AppModel {
         captcha.cancel()
         serverInvites.reset()
         guildJoinRequests.reset()
+        favorites.reset()
         serverRailPresentation.showsGuildJoinRequest = false
+        serverRailPresentation.showsFavorites = false
         embeddedActivities.reset()
         friends.reset()
         lastDirectMessageSelection = nil
@@ -104,7 +106,7 @@ extension AppModel {
         issueReports.reset()
         nicknameEditor.reset()
         groupDirectMessageEditor.reset()
-        groupDirectMessageLeave.reset()
+        directMessageExit.reset()
         threadActions.reset()
         onboarding.reset()
     }
@@ -168,25 +170,20 @@ extension AppModel {
         )
     }
 
-    func isCurrentVoiceOperation(
-        _ account: AppModelAccountSession,
-        identity: AppModelVoiceOperationIdentity
-    ) -> Bool {
-        guard isCurrentAccountSession(account),
-              voiceMigrationGeneration == identity.generation,
-              activeVoiceChannel?.id == identity.channelID
-        else { return false }
-        if let expectedSession = identity.session {
-            return voiceSession === expectedSession
+    /// Subscribes to call state for the selected DM or group DM.
+    func observeSelectedPrivateCall() {
+        guard let channel = selectedChannel, channel.kind.isDirectMessage else { return }
+        let account = accountSession()
+        startAccountChildTask(account: account) { model, account in
+            await model.observePrivateCall(in: channel, account: account)
         }
-        return voiceSession == nil
     }
 
     func observePrivateCall(
         in channel: Channel,
         account: AppModelAccountSession
     ) async {
-        guard channel.kind == .directMessage || channel.kind == .groupDirectMessage else {
+        guard channel.kind.isDirectMessage else {
             return
         }
         guard !Task.isCancelled, isCurrentAccountSession(account) else { return }
@@ -201,10 +198,7 @@ extension AppModel {
 
     func resetAppSounds() {
         resetPrivateCallActions()
-        for task in outgoingPrivateCallRingTimeoutTasks.values {
-            task.cancel()
-        }
-        outgoingPrivateCallRingTimeoutTasks = [:]
+        outgoingPrivateCallRingTimeoutTasks.cancelAll()
         locallyStartedOutgoingPrivateCallRings = []
         soundPlayer.stopAll()
     }
@@ -387,16 +381,6 @@ enum ProfilePresentationDestination {
     case inspector
     case contextual
     case expanded
-}
-
-nonisolated enum UnreadPresentationPublicationPolicy {
-    static func shouldPublish(
-        snapshot: BootstrapSnapshot,
-        channels: [Channel],
-        guilds: [Guild]
-    ) -> Bool {
-        snapshot.channels != channels || snapshot.guilds != guilds
-    }
 }
 
 nonisolated struct ForumPostPresentation: Sendable {
@@ -816,6 +800,25 @@ final class MessageRowsUpdateJournal {
         }
     }
 
+    /// Replaces `rows` with `newRows`, records the change as the revision
+    /// after `revision`, and advances `revision` to it.
+    @discardableResult
+    func publish(
+        _ newRows: [MessageRowPresentation],
+        into rows: inout [MessageRowPresentation],
+        revision: inout UInt64
+    ) -> MessageRowsUpdateRecord {
+        let record = MessageRowsUpdateRecordBuilder.make(
+            oldRows: rows,
+            newRows: newRows,
+            revision: revision &+ 1
+        )
+        rows = newRows
+        append(record)
+        revision = record.revision
+        return record
+    }
+
     func records(
         after oldRevision: UInt64,
         through newRevision: UInt64
@@ -1155,27 +1158,32 @@ extension AppModel {
         let initialActivityPreferences = ActivityCoordinatorPreferences(
             isActivitySharingEnabled: loadedPrivacy.sharesActivity,
             isAppleMusicPresenceEnabled: loadedPrivacy.sharesAppleMusicActivity,
-            isLocalRPCEnabled: loadedPrivacy.allowsLocalRPC
+            isLocalRPCEnabled: loadedPrivacy.allowsLocalRPC,
+            activityCategoryOrder: loadedPrivacy.activityStackOrder
         )
         let resolvedCoordinator = coordinator ?? ActivityCoordinator(provider: provider, preferences: initialActivityPreferences)
         let resolvedIPCServer = ipcServer ?? DiscordIPCServer(coordinator: resolvedCoordinator)
-        if launchMode == .normal, loadedPrivacy.sharesActivity, loadedPrivacy.allowsLocalRPC {
-            try? resolvedIPCServer.start()
-        }
         let resolvedAppleMusicMonitor = appleMusicMonitor ?? AppleMusicPresenceMonitor(coordinator: resolvedCoordinator)
-        if launchMode == .normal, loadedPrivacy.sharesActivity, loadedPrivacy.sharesAppleMusicActivity {
-            resolvedAppleMusicMonitor.start()
-        }
         let resolvedGameMonitor = GamePresenceMonitor(coordinator: resolvedCoordinator)
-        if launchMode == .normal, loadedPrivacy.sharesActivity, loadedPrivacy.allowsLocalRPC {
-            resolvedGameMonitor.start()
-        }
         return ActivityServices(
             coordinator: resolvedCoordinator,
             ipcServer: resolvedIPCServer,
             monitor: resolvedAppleMusicMonitor,
             gameMonitor: resolvedGameMonitor
         )
+    }
+
+    func startActivityServicesIfNeeded() {
+        guard launchMode == .normal else { return }
+        let loadedPrivacy = privacySafetySettingsStore.load()
+        guard loadedPrivacy.sharesActivity else { return }
+        if loadedPrivacy.allowsLocalRPC {
+            try? ipcServer.start()
+            gameMonitor.start()
+        }
+        if loadedPrivacy.sharesAppleMusicActivity {
+            appleMusicMonitor.start()
+        }
     }
 
     func postInitSetup(coordinator: ActivityCoordinator) {
@@ -1186,9 +1194,9 @@ extension AppModel {
         readState.reset(accountID: launchMode == .offlineTesting ? "offline" : nil)
         configureAttachmentMedia()
         Task { [weak self] in
-            await coordinator.setOnActivityChanged { [weak self] payload in
+            await coordinator.setOnActivityChanged { [weak self] payload, count in
                 Task { @MainActor [weak self] in
-                    self?.applyCurrentUserActivity(payload)
+                    self?.applyCurrentUserActivity(payload, count: count)
                 }
             }
         }

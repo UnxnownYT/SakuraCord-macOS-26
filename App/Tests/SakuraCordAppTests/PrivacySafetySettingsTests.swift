@@ -75,6 +75,7 @@ import Testing
     value.sharesActivity = true
     value.sharesAppleMusicActivity = true
     value.allowsLocalRPC = true
+    value.activityStackOrder = [.music, .games, .streaming, .other]
     store.save(value)
     let reloaded = store.load()
     #expect(!reloaded.removesMediaMetadata)
@@ -84,22 +85,24 @@ import Testing
     #expect(reloaded.sharesActivity)
     #expect(reloaded.sharesAppleMusicActivity)
     #expect(reloaded.allowsLocalRPC)
+    #expect(reloaded.activityStackOrder == [.music, .games, .streaming, .other])
 
-    let export = preferences.export(scope: .appWide, page: .privacySafety)
-    #expect(export.values == [
-        SettingsControlID.activitySharing.rawValue: .bool(true),
-        SettingsControlID.appleMusicPresence.rawValue: .bool(true),
-        SettingsControlID.localDiscordRPC.rawValue: .bool(true),
+    let export = preferences.export(page: .privacySafety)
+    #expect(export == [
         SettingsControlID.removeMediaMetadata.rawValue: .bool(false),
         SettingsControlID.anonymiseFileNames.rawValue: .bool(true),
         SettingsControlID.privacyTypingIndicators.rawValue: .bool(true),
         SettingsControlID.externalLinkProtection.rawValue: .string("allLinks"),
     ])
-    let encoded = try export.encodedData()
-    let text = try #require(String(data: encoded, encoding: .utf8))
-    #expect(!text.contains("credential-secret"))
+    let featuresExport = preferences.export(page: .features)
+    #expect(featuresExport[SettingsControlID.activitySharing.rawValue] == .bool(true))
+    #expect(featuresExport[SettingsControlID.appleMusicPresence.rawValue] == .bool(true))
+    #expect(featuresExport[SettingsControlID.localDiscordRPC.rawValue] == .bool(true))
+    #expect(featuresExport[SettingsControlID.activityStackOrder.rawValue] == .strings(["music", "games", "streaming", "other"]))
+    #expect(!String(describing: export).contains("credential-secret"))
 
-    preferences.reset(scope: .appWide, page: .privacySafety)
+    preferences.reset(page: .privacySafety)
+    preferences.reset(page: .features)
     #expect(store.load() == .defaults)
     #expect(defaults.string(forKey: "unregistered.credential") == "credential-secret")
 }
@@ -243,7 +246,7 @@ import Testing
 
     model.messageSearch.queryText = "private query"
     model.messageSearch.isPresented = true
-    model.forwardDestinationHistory = [channelID]
+    model.conversationDestinationHistory = [channelID]
     model.recordMessageEmojiUsage("👋")
     let pending = model.emojiFrecency.pendingUsages
     model.discordFavoriteEmojiKeys = ["wave"]
@@ -252,7 +255,7 @@ import Testing
 
     #expect(model.messageSearch.queryText == "private query")
     #expect(model.messageSearch.isPresented)
-    #expect(model.forwardDestinationHistory.isEmpty)
+    #expect(model.conversationDestinationHistory.isEmpty)
     #expect(model.emojiFrecency.pendingUsages == pending)
     #expect(model.discordFavoriteEmojiKeys == ["wave"])
 }
@@ -263,7 +266,6 @@ import Testing
         .privacyTypingIndicators, .anonymiseFileNames, .removeMediaMetadata,
         .externalLinkProtection, .trustedDomains,
         .clearLocalActivity, .ignoredAccounts, .blockedAccounts,
-        .activitySharing, .appleMusicPresence, .localDiscordRPC,
     ]
     let controls = SettingsCatalog.foundation.controls.filter {
         $0.destination.page == .privacySafety
@@ -306,7 +308,7 @@ import Testing
 @MainActor
 @Test func `Attachment confirmations preserve complete masked host warnings`() async throws {
     let url = try #require(URL(string: "https://cdn.discordapp.com/attachments/1/2/example.com?ex=ffffffff"))
-    let masked = DiscordMarkdown.appKitAttributed("[https://dis**cord**.com](\(url.absoluteString))")
+    let masked = DiscordMarkdown.appKitAttributed(DiscordMarkdown.appKitPlan("[https://dis**cord**.com](\(url.absoluteString))"))
     let label = MessageLinkActivator.safetyDisplayedText(in: masked, at: 12)
     #expect(label == "https://discord.com")
     let model = AppModel(launchMode: .offlineTesting)

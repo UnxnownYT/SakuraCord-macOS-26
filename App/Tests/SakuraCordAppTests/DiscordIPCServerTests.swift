@@ -1,3 +1,4 @@
+import AppKit
 import Darwin
 @testable import DiscordProtocol
 import Foundation
@@ -515,5 +516,223 @@ struct DiscordIPCServerTests {
         #expect(primary?.name == "Roblox")
         #expect(primary?.details == "Playing Murder Mystery 2")
         #expect(primary?.state == "In Game")
+    }
+
+    @Test func `sonora rich presence resolves to Sonora and listening music type`() async throws {
+        let socketPath = makeTestSocketPath()
+        let mockProvider = MockChatProvider()
+        let coordinator = ActivityCoordinator(provider: mockProvider, preferences: .enabledAll)
+        let server = DiscordIPCServer(coordinator: coordinator, socketPath: socketPath)
+        try server.start()
+        defer { server.stop() }
+
+        let clientFD = try #require(connectClient(to: socketPath))
+        defer { close(clientFD) }
+
+        // Handshake with Sonora client ID
+        sendClientFrame(fd: clientFD, opcode: 0, jsonObject: ["v": 1, "client_id": "1236053360212873216"])
+        _ = try #require(readClientFrame(fd: clientFD))
+
+        // Sonora sends SET_ACTIVITY with details (track) and state (artist), omitting type (or type 0) and name
+        sendClientFrame(fd: clientFD, opcode: 1, jsonObject: [
+            "cmd": "SET_ACTIVITY",
+            "args": [
+                "pid": 4321,
+                "activity": [
+                    "details": "Starboy",
+                    "state": "The Weeknd",
+                    "assets": [
+                        "large_image": "https://i.scdn.co/image/ab67616d0000b2734718e2b124f79258be7bc452",
+                        "large_text": "Starboy"
+                    ]
+                ]
+            ],
+            "nonce": "sonora-nonce-1"
+        ])
+
+        let response = try #require(readClientFrame(fd: clientFD))
+        #expect(response.json["cmd"] as? String == "SET_ACTIVITY")
+        let data = try #require(response.json["data"] as? [String: Any])
+        #expect(data["name"] as? String == "Sonora")
+        #expect(data["type"] as? Int == 2)
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let primary = await coordinator.currentPrimaryActivity()
+        #expect(primary?.name == "Sonora")
+        #expect(primary?.type == .listening)
+        #expect(primary?.details == "Starboy")
+        #expect(primary?.state == "The Weeknd")
+    }
+
+    @Test func `modrinth app rich presence resolves name cleanly and responds with augmented activity`() async throws {
+        let socketPath = makeTestSocketPath()
+        let mockProvider = MockChatProvider()
+        let coordinator = ActivityCoordinator(provider: mockProvider, preferences: .enabledAll)
+        let server = DiscordIPCServer(coordinator: coordinator, socketPath: socketPath)
+        try server.start()
+        defer { server.stop() }
+
+        let clientFD = try #require(connectClient(to: socketPath))
+        defer { close(clientFD) }
+
+        // Handshake with Modrinth client ID
+        sendClientFrame(fd: clientFD, opcode: 0, jsonObject: ["v": 1, "client_id": "1123683254248148992"])
+        _ = try #require(readClientFrame(fd: clientFD))
+
+        // Modrinth payload: omits name, has large_text "Modrinth Logo"
+        sendClientFrame(fd: clientFD, opcode: 1, jsonObject: [
+            "cmd": "SET_ACTIVITY",
+            "args": [
+                "pid": 8888,
+                "activity": [
+                    "details": "In Menus",
+                    "state": "Modrinth App v0.9.0",
+                    "assets": [
+                        "large_image": "modrinth_simple",
+                        "large_text": "Modrinth Logo"
+                    ]
+                ]
+            ],
+            "nonce": "modrinth-nonce-1"
+        ])
+
+        let setResponse = try #require(readClientFrame(fd: clientFD))
+        #expect(setResponse.opcode == 1)
+        #expect(setResponse.json["cmd"] as? String == "SET_ACTIVITY")
+        let data = try #require(setResponse.json["data"] as? [String: Any])
+        #expect(data["name"] as? String == "Modrinth")
+        #expect(data["application_id"] as? String == "1123683254248148992")
+        #expect(data["type"] as? Int == 0)
+
+        let updated = await eventually {
+            (await mockProvider.currentActivities()).count == 1
+        }
+        #expect(updated)
+        let activities = await mockProvider.currentActivities()
+        let published = try #require(activities.values.first)
+        #expect(published.name == "Modrinth")
+        #expect(published.applicationId == "1123683254248148992")
+    }
+
+    @Test func `activity coordinator permits app prefix under local rpc preferences`() async throws {
+        let mockProvider = MockChatProvider()
+        let coordinator = ActivityCoordinator(
+            provider: mockProvider,
+            preferences: ActivityCoordinatorPreferences(
+                isActivitySharingEnabled: true,
+                isAppleMusicPresenceEnabled: false,
+                isLocalRPCEnabled: true
+            )
+        )
+        #expect(await coordinator.isSourcePermitted(.custom(sourceID: "app:athas")))
+        #expect(await coordinator.isSourcePermitted(.custom(sourceID: "game:roblox")))
+
+        await coordinator.updatePreferences(
+            ActivityCoordinatorPreferences(
+                isActivitySharingEnabled: true,
+                isAppleMusicPresenceEnabled: false,
+                isLocalRPCEnabled: false
+            )
+        )
+        #expect(!(await coordinator.isSourcePermitted(.custom(sourceID: "app:athas"))))
+        #expect(!(await coordinator.isSourcePermitted(.custom(sourceID: "game:roblox"))))
+    }
+
+    @Test func `game presence monitor checks athas app when present`() async throws {
+        let mockProvider = MockChatProvider()
+        let coordinator = ActivityCoordinator(provider: mockProvider, preferences: .enabledAll)
+        let monitor = GamePresenceMonitor(coordinator: coordinator)
+
+        let running = NSWorkspace.shared.runningApplications
+        if let athas = running.first(where: { !$0.isTerminated && GamePresenceMonitor.isAthasApp($0) }) {
+            #expect(athas.bundleIdentifier?.lowercased() == "com.code.athas" || athas.localizedName?.lowercased() == "athas" || athas.bundleURL?.lastPathComponent.lowercased() == "athas.app")
+            monitor.checkRunningGames()
+            let published = await eventually {
+                let acts = await mockProvider.currentActivities()
+                return acts["custom:app:athas"] != nil
+            }
+            #expect(published)
+            let acts = await mockProvider.currentActivities()
+            #expect(acts["custom:app:athas"]?.name == "Athas")
+            #expect(GamePresenceMonitor.currentAthasIconData != nil)
+        }
+    }
+
+    @Test func `rapid set activity followed immediately by disconnect clears presence without race`() async throws {
+        let socketPath = makeTestSocketPath()
+        let mockProvider = MockChatProvider()
+        let coordinator = ActivityCoordinator(provider: mockProvider, preferences: .enabledAll)
+        let server = DiscordIPCServer(coordinator: coordinator, socketPath: socketPath)
+        try server.start()
+        defer { server.stop() }
+
+        let clientFD = try #require(connectClient(to: socketPath))
+
+        sendClientFrame(fd: clientFD, opcode: 0, jsonObject: ["v": 1, "client_id": "fast_close_app"])
+        _ = try #require(readClientFrame(fd: clientFD))
+
+        sendClientFrame(fd: clientFD, opcode: 1, jsonObject: [
+            "cmd": "SET_ACTIVITY",
+            "args": [
+                "activity": ["name": "Fast Game", "details": "Speedrun"],
+            ],
+            "nonce": "n-fast",
+        ])
+        close(clientFD)
+
+        let cleared = await eventually {
+            let providerEmpty = await mockProvider.currentActivities().isEmpty
+            let coordinatorEmpty = await coordinator.currentActivities().isEmpty
+            return providerEmpty && coordinatorEmpty
+        }
+        #expect(cleared)
+    }
+
+    @Test func `buffered set activity following close frame is discarded without leaking activity`() async throws {
+        let socketPath = makeTestSocketPath()
+        let mockProvider = MockChatProvider()
+        let coordinator = ActivityCoordinator(provider: mockProvider, preferences: .enabledAll)
+        let server = DiscordIPCServer(coordinator: coordinator, socketPath: socketPath)
+        try server.start()
+        defer { server.stop() }
+
+        let clientFD = try #require(connectClient(to: socketPath))
+        defer { close(clientFD) }
+
+        sendClientFrame(fd: clientFD, opcode: 0, jsonObject: ["v": 1, "client_id": "pipelined_close_app"])
+        _ = try #require(readClientFrame(fd: clientFD))
+
+        // Pipeline opcode 2 (CLOSE) and opcode 1 (SET_ACTIVITY) in one combined buffer
+        let closePayload = "{}".data(using: .utf8)!
+        var closeOp = UInt32(2).littleEndian
+        var closeLen = UInt32(closePayload.count).littleEndian
+
+        let setActivityJSON: [String: Any] = [
+            "cmd": "SET_ACTIVITY",
+            "args": ["activity": ["name": "Zombie Activity"]],
+            "nonce": "zombie-nonce"
+        ]
+        let setPayload = try JSONSerialization.data(withJSONObject: setActivityJSON)
+        var setOp = UInt32(1).littleEndian
+        var setLen = UInt32(setPayload.count).littleEndian
+
+        var combinedData = Data()
+        withUnsafeBytes(of: &closeOp) { combinedData.append(contentsOf: $0) }
+        withUnsafeBytes(of: &closeLen) { combinedData.append(contentsOf: $0) }
+        combinedData.append(closePayload)
+        withUnsafeBytes(of: &setOp) { combinedData.append(contentsOf: $0) }
+        withUnsafeBytes(of: &setLen) { combinedData.append(contentsOf: $0) }
+        combinedData.append(setPayload)
+
+        _ = combinedData.withUnsafeBytes { ptr in
+            Darwin.write(clientFD, ptr.baseAddress!, combinedData.count)
+        }
+
+        // Wait to confirm that zombie activity is never registered on the coordinator or provider
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let acts = await coordinator.currentActivities()
+        #expect(acts.isEmpty)
+        let providerActs = await mockProvider.currentActivities()
+        #expect(providerActs.isEmpty)
     }
 }

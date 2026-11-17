@@ -47,7 +47,7 @@ extension DiscordRESTProvider {
             update.ops, guildID: guildID, memberListID: update.id
         )
         if let groups = update.groups {
-            cachedMemberListGroups[guildID, default: [:]][update.id] = groups.map {
+            memberListState.cachedGroups[guildID, default: [:]][update.id] = groups.map {
                 GuildMemberListGroup(id: $0.id, count: $0.count)
             }
         }
@@ -61,14 +61,15 @@ extension DiscordRESTProvider {
         cachedMembers[guildID] = DiscordMemberStoreOrdering.merging(
             existing: cachedMembers[guildID] ?? [], updates: members
         )
+        cachedMembersByID.removeValue(forKey: guildID)
         publishUserSearchAliases()
         if guildID == pendingMemberGuildID,
-           update.id == selectedMemberListID[guildID]
+           update.id == memberListState.selectedIDs[guildID]
         {
             publishMembers(
                 guildID: guildID,
                 members: orderedMemberListMembers(guildID: guildID) ?? members,
-                groups: cachedMemberListGroups[guildID]?[update.id] ?? []
+                groups: memberListState.cachedGroups[guildID]?[update.id] ?? []
             )
         } else {
             publishCurrentMemberTimeoutChange(previousMembers: previousMembers, guildID: guildID)
@@ -100,7 +101,7 @@ extension DiscordRESTProvider {
         guard invalidatedOverlapsSubscription else { return }
         markMemberListForRefresh(guildID: guildID, memberListID: update.id)
         guard guildID == pendingMemberGuildID,
-              update.id == selectedMemberListID[guildID]
+              update.id == memberListState.selectedIDs[guildID]
         else { return }
         do {
             // The serialized send satisfies only the refresh generation it
@@ -127,15 +128,38 @@ extension DiscordRESTProvider {
         let guildRoles = cachedGuildRoles[guildID] ?? []
         let guildRoleCatalog = GuildMemberRoleCatalog(guildRoles)
         let previousMembers = cachedMemberIndex(guildID: guildID)
+        let presencesByUserID: [String: GuildPresenceDTO] = Dictionary(
+            (chunk.presences ?? []).map {
+                ($0.user.id, GuildPresenceDTO(status: $0.status, activities: $0.activities, clientStatus: $0.clientStatus))
+            },
+            uniquingKeysWith: { _, newer in newer }
+        )
         let decodedMembers = chunk.members.compactMap {
             try? $0.domain(
                 currentUserID: currentUser?.id,
                 currentStatus: presenceStatus,
+                presence: presencesByUserID[$0.user.id],
                 guildRoles: guildRoles,
                 guildRoleCatalog: guildRoleCatalog,
                 guildID: guildID,
                 previousCommunicationDisabledUntil: UserID($0.user.id).flatMap { previousMembers[$0]?.communicationDisabledUntil }
             )
+        }
+        for member in chunk.members {
+            cacheGatewayUser(member.user, messageSearchEligible: false)
+        }
+        var updatedPresenceUserIDs: [UserID] = []
+        for presence in chunk.presences ?? [] {
+            if let userID = UserID(presence.user.id) {
+                var privateUpdate = presence
+                privateUpdate.guildID = nil
+                cachePrivatePresence(privateUpdate)
+                updatedPresenceUserIDs.append(userID)
+            }
+        }
+        if !updatedPresenceUserIDs.isEmpty {
+            continuation?.yield(.privateMembersChanged(privateMembersInChannelOrder()))
+            publishRelationshipPresences(complete: false, userIDs: updatedPresenceUserIDs)
         }
         let responseUserIDs = Set(decodedMembers.map(\.id)).union(
             (chunk.notFound ?? []).compactMap(UserID.init)
@@ -152,10 +176,6 @@ extension DiscordRESTProvider {
             // not expand message-search UserStore beyond Discord's live
             // source set.
             cacheLiveSearchUsers(chunk.members.map(\.user))
-        } else {
-            for member in chunk.members {
-                cacheGatewayUser(member.user, messageSearchEligible: false)
-            }
         }
         let joinedUserIDs = Set<UserID>(chunk.members.compactMap { member -> UserID? in
             guard member.joinedAt != nil, member.pending != true else { return nil }
@@ -294,6 +314,15 @@ extension DiscordRESTProvider {
             }
             return
         }
+        if let userID = UserID(update.user.id),
+           cachedRelationships[userID] != nil || cachedPrivateMembersByID[userID] != nil
+            || cachedChannels[nil]?.contains(where: { $0.recipients.contains(where: { $0.id == userID }) }) == true {
+            var privateUpdate = update
+            privateUpdate.guildID = nil
+            cachePrivatePresence(privateUpdate)
+            continuation?.yield(.privateMembersChanged(privateMembersInChannelOrder()))
+            publishRelationshipPresences(complete: false, userIDs: [userID])
+        }
         guard let guildID = update.guildID.flatMap(GuildID.init),
               let userID = UserID(update.user.id),
               let status = PresenceStatus(rawValue: update.status),
@@ -304,16 +333,9 @@ extension DiscordRESTProvider {
         if let clientStatus = update.clientStatus {
             members[index].isMobileOnly = clientStatus.isMobileOnly
         }
-        if let activities = update.activities {
-            let primaryActivity = activities.memberListActivity
-            members[index].customStatus = activities.first(where: { $0.type == 4 })?.displayText
-            members[index].activityText =
-                primaryActivity?.displayText
-                    ?? members[index].customStatus
-            members[index].isListeningToMusic = primaryActivity?.type == 2
-            members[index].richActivity = primaryActivity?.asRichActivity
-        }
+        if let activities = update.activities { members[index].applyActivities(activities) }
         cachedMembers[guildID] = members
+        cachedMembersByID.removeValue(forKey: guildID)
         if guildID == pendingMemberGuildID {
             publishMembers(
                 guildID: guildID,

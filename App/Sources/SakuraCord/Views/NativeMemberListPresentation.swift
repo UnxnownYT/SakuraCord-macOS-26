@@ -4,6 +4,11 @@ import OSLog
 import SakuraCordModels
 import SwiftUI
 
+nonisolated enum MemberActivityIconType: Sendable {
+    case game
+    case music
+}
+
 extension Member {
     nonisolated var isListedOnline: Bool {
         isOnline || user.usesHTTPInteractions
@@ -13,15 +18,81 @@ extension Member {
         user.usesHTTPInteractions ? nil : status
     }
 
-    nonisolated var memberListActivityText: String? {
-        if isListeningToMusic, let customStatus, !customStatus.isEmpty {
-            return customStatus
+    nonisolated var isPlayingGame: Bool {
+        if isListeningToMusic { return false }
+        if let richActivity {
+            return richActivity.type == 0
         }
-        return activityText
+        if let activityText {
+            return activityText.lowercased().hasPrefix("playing ")
+        }
+        return false
+    }
+
+    nonisolated var gameName: String? {
+        if let richActivity, richActivity.type == 0 {
+            return richActivity.name
+        }
+        if let activityText, activityText.lowercased().hasPrefix("playing ") {
+            return String(activityText.dropFirst("playing ".count)).trimmingCharacters(in: .whitespaces)
+        }
+        return nil
+    }
+
+    nonisolated var memberListActivityIconType: MemberActivityIconType? {
+        if isListeningToMusic {
+            return .music
+        }
+        if isPlayingGame {
+            return .game
+        }
+        return nil
+    }
+
+    nonisolated var memberListActivityContent: NativeMemberActivityPresentation.Content {
+        guard isListeningToMusic,
+              let customStatus, !customStatus.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return .init(text: memberListActivityText) }
+        if NativeMemberActivityPresentation.isEmojiOnly(customStatus) {
+            if let activityText, !activityText.isEmpty, activityText != customStatus {
+                return .init(text: activityText, trailingEmoji: customStatus)
+            }
+            return .init(text: customStatus)
+        }
+        return .init(text: customStatus, separatesMusicIcon: true)
+    }
+
+    nonisolated var memberListActivityText: String? {
+        if isListeningToMusic {
+            if let customStatus, !customStatus.isEmpty {
+                return customStatus
+            }
+            if let richActivity {
+                return richActivity.details ?? richActivity.state ?? richActivity.name
+            }
+            if let activityText {
+                if activityText.lowercased().hasPrefix("listening to ") {
+                    return String(activityText.dropFirst("listening to ".count)).trimmingCharacters(in: .whitespaces)
+                }
+                return activityText
+            }
+            return nil
+        }
+        if isPlayingGame {
+            return gameName ?? activityText
+        }
+        return customStatus ?? activityText
     }
 
     nonisolated var memberListShowsMusicSeparator: Bool {
         isListeningToMusic && customStatus?.isEmpty == false
+    }
+
+    /// Keeps the full activity, such as the track a custom status replaces
+    /// in the row, with custom emoji named rather than as raw tokens.
+    nonisolated var memberListTooltip: String {
+        [user.username, activityText.map(NativeMemberActivityPresentation.accessibilityText)]
+            .compactMap { $0 }.joined(separator: "\n")
     }
 }
 
@@ -51,8 +122,6 @@ nonisolated struct NativeMemberListPresentation: Equatable, Sendable {
     var presenceHiddenUserIDs: Set<UserID> = []
     /// Space reserved for hover controls on wider people lists.
     var trailingAccessoryWidth: CGFloat = 0
-    /// Overrides the usual activity gray for lists displaying secondary names.
-    var activityTextPrimaryOpacity: CGFloat?
 
     func opacity(for member: Member) -> CGFloat {
         dimsOfflineMembers && !member.isListedOnline ? 0.55 : 1

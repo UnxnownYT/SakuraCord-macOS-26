@@ -24,12 +24,7 @@ struct GuildDTO: Decodable {
         guard let id = GuildID(id) else {
             throw ChatProviderError.invalidRequest("Discord returned an invalid guild identifier.")
         }
-        let iconURL = icon.flatMap { hash in
-            URL(
-                string:
-                "https://cdn.discordapp.com/icons/\(id)/\(hash).webp?size=128&animated=\(hash.hasPrefix("a_") ? "true" : "false")"
-            )
-        }
+        let iconURL = icon.flatMap { DiscordCDN.guildIcon(id, hash: $0) }
         return Guild(
             id: id,
             name: name,
@@ -38,7 +33,7 @@ struct GuildDTO: Decodable {
             currentUserPermissions: permissions.flatMap(UInt64.init),
             rulesChannelID: rulesChannelID.flatMap(ChannelID.init),
             features: features ?? [],
-            guideHeaderURL: homeHeader.flatMap { URL(string: "https://cdn.discordapp.com/home-headers/\(id)/\($0).png?size=2048") },
+            guideHeaderURL: homeHeader.flatMap { DiscordCDN.guildHomeHeader(id, hash: $0) },
             profileTag: profile?.domain(guildID: id),
             defaultMessageNotifications:
                 defaultMessageNotifications.flatMap(MessageNotificationLevel.init(rawValue:))
@@ -143,7 +138,20 @@ struct GuildActivityDTO: Decodable {
 
 extension [GuildActivityDTO] {
     var memberListActivity: GuildActivityDTO? {
-        first(where: { $0.type == 2 }) ?? first(where: { $0.type != 4 })
+        first(where: { $0.type == 2 }) ?? first(where: {
+            guard let type = $0.type else { return false }
+            return type != 4 && type != 6
+        })
+    }
+}
+
+extension Member {
+    mutating func applyActivities(_ activities: [GuildActivityDTO]) {
+        let primaryActivity = activities.memberListActivity
+        customStatus = activities.first(where: { $0.type == 4 })?.displayText
+        activityText = primaryActivity?.displayText ?? customStatus
+        isListeningToMusic = primaryActivity?.type == 2
+        richActivity = primaryActivity?.asRichActivity
     }
 }
 
@@ -151,6 +159,16 @@ struct GuildPresenceDTO: Decodable {
     var status: String?
     var activities: [GuildActivityDTO]?
     var clientStatus: ClientStatusDTO?
+
+    init(
+        status: String? = nil,
+        activities: [GuildActivityDTO]? = nil,
+        clientStatus: ClientStatusDTO? = nil
+    ) {
+        self.status = status
+        self.activities = activities
+        self.clientStatus = clientStatus
+    }
 
     enum CodingKeys: String, CodingKey {
         case status, activities
@@ -253,10 +271,7 @@ struct GuildMemberDTO: Decodable {
                 .sorted { $0.position > $1.position }
                 .compactMap(\.domain)
         }
-        let activities = (overridePresence ?? presence)?.activities ?? []
-        let customStatus = activities.first(where: { $0.type == 4 })?.displayText
-        let primaryActivity = activities.memberListActivity
-        return Member(
+        var member = Member(
             user: domainUser,
             roleName: categoryRole?.name ?? "Member",
             status: status,
@@ -269,25 +284,20 @@ struct GuildMemberDTO: Decodable {
             globalDisplayName: globalDisplayName,
             guildNickname: nick,
             guildProfileCosmetics: cosmetics,
-            activityText: primaryActivity?.displayText ?? customStatus,
-            customStatus: customStatus,
-            isListeningToMusic: primaryActivity?.type == 2,
             isMobileOnly: (overridePresence ?? presence)?.clientStatus?.isMobileOnly ?? false,
             isPending: pending,
             flags: flags,
             communicationDisabledUntil: includesCommunicationDisabledUntil
                 ? communicationDisabledUntil.flatMap(DiscordDate.parse) : previousCommunicationDisabledUntil,
-            joinedAt: joinedAt.flatMap(DiscordDate.parse),
-            richActivity: primaryActivity?.asRichActivity
+            joinedAt: joinedAt.flatMap(DiscordDate.parse)
         )
+        member.applyActivities((overridePresence ?? presence)?.activities ?? [])
+        return member
     }
 
     private func guildAvatarURL(guildID: GuildID?, userID: UserID) -> URL? {
         guard let avatar, let guildID else { return nil }
-        return URL(
-            string:
-            "https://cdn.discordapp.com/guilds/\(guildID)/users/\(userID)/avatars/\(avatar).webp?size=128&animated=\(avatar.hasPrefix("a_") ? "true" : "false")"
-        )
+        return DiscordCDN.guildMemberAvatar(guildID, userID: userID, hash: avatar)
     }
 }
 
@@ -397,6 +407,7 @@ struct GatewayGuildMembersChunkDTO: Decodable {
     var chunkIndex: Int
     var chunkCount: Int
     var notFound: [String]?
+    var presences: [PresenceUpdateDTO]?
 
     enum CodingKeys: String, CodingKey {
         case guildID = "guild_id"
@@ -404,5 +415,6 @@ struct GatewayGuildMembersChunkDTO: Decodable {
         case chunkIndex = "chunk_index"
         case chunkCount = "chunk_count"
         case notFound = "not_found"
+        case presences
     }
 }

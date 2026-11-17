@@ -102,6 +102,8 @@ struct ActivityMarqueeText: View {
             .foregroundStyle(foregroundStyle)
             .lineLimit(1)
             .fixedSize(horizontal: true, vertical: false)
+            .id(text)
+            .transition(.opacity)
             .background {
                 GeometryReader { textGeo in
                     Color.clear
@@ -186,6 +188,21 @@ struct ProfileActivitySection: View {
         activityType == 2 || member.isListeningToMusic
     }
 
+    private var isSpotifyMusicActivity: Bool {
+        if let name = effectiveActivity?.name {
+            if name.caseInsensitiveCompare("Spotify") == .orderedSame {
+                return true
+            }
+            if name.caseInsensitiveCompare("Apple Music") == .orderedSame {
+                return false
+            }
+        }
+        if let largeImage = effectiveActivity?.largeImage, largeImage.hasPrefix("spotify:") {
+            return true
+        }
+        return false
+    }
+
     private var cardCornerRadius: CGFloat {
         InterfaceScale.metric(18)
     }
@@ -198,16 +215,16 @@ struct ProfileActivitySection: View {
                 return "Listening to \(name.isEmpty ? "Music" : name)"
             case 1:
                 let name = activity.name.trimmingCharacters(in: .whitespacesAndNewlines)
-                return name.isEmpty ? "Streaming" : "Streaming \(name)"
+                return "Streaming \(name.isEmpty ? "Content" : name)"
             case 3:
                 let name = activity.name.trimmingCharacters(in: .whitespacesAndNewlines)
-                return name.isEmpty ? "Watching" : "Watching \(name)"
+                return "Watching \(name.isEmpty ? "Content" : name)"
             case 5:
                 let name = activity.name.trimmingCharacters(in: .whitespacesAndNewlines)
-                return "Competing in \(name.isEmpty ? "Game" : name)"
+                return "Competing in \(name.isEmpty ? "Event" : name)"
             default:
                 let name = activity.name.trimmingCharacters(in: .whitespacesAndNewlines)
-                return name.isEmpty ? "Playing a game" : "Playing \(name)"
+                return "Playing \(name.isEmpty ? "Game" : name)"
             }
         }
         if member.isListeningToMusic {
@@ -216,15 +233,22 @@ struct ProfileActivitySection: View {
         return "Activity"
     }
 
+    private var nonStatusActivityText: String? {
+        guard let text = member.activityText, !text.isEmpty else { return nil }
+        if let custom = member.customStatus, text == custom { return nil }
+        if text.contains("<:") || text.contains("<a:") { return nil }
+        return text
+    }
+
     private var primaryText: String {
         if isMusic {
             return effectiveActivity?.details
                 ?? effectiveActivity?.name
-                ?? member.activityText
+                ?? nonStatusActivityText
                 ?? "Music"
         }
         return effectiveActivity?.name
-            ?? member.activityText
+            ?? nonStatusActivityText
             ?? "Game"
     }
 
@@ -233,16 +257,28 @@ struct ProfileActivitySection: View {
             if let state = effectiveActivity?.state, !state.isEmpty {
                 return "by \(state)"
             }
-            if let text = member.activityText, text != primaryText {
+            if let text = nonStatusActivityText, text != primaryText {
                 return "by \(text)"
             }
             return nil
         }
-        if let details = effectiveActivity?.details, !details.isEmpty, details != primaryText {
-            return details
+        if let details = effectiveActivity?.details, !details.isEmpty {
+            let trimmed = details.trimmingCharacters(in: .whitespacesAndNewlines)
+            let isRedundantWithPrimary = trimmed.caseInsensitiveCompare(primaryText) == .orderedSame
+                || trimmed.caseInsensitiveCompare("Playing \(primaryText)") == .orderedSame
+                || trimmed.caseInsensitiveCompare("Listening to \(primaryText)") == .orderedSame
+            if !isRedundantWithPrimary {
+                return trimmed
+            }
         }
-        if let state = effectiveActivity?.state, !state.isEmpty, state != primaryText {
-            return state
+        if let state = effectiveActivity?.state, !state.isEmpty {
+            let trimmed = state.trimmingCharacters(in: .whitespacesAndNewlines)
+            let isRedundantWithPrimary = trimmed.caseInsensitiveCompare(primaryText) == .orderedSame
+                || trimmed.caseInsensitiveCompare("Playing \(primaryText)") == .orderedSame
+                || trimmed.caseInsensitiveCompare("Listening to \(primaryText)") == .orderedSame
+            if !isRedundantWithPrimary {
+                return trimmed
+            }
         }
         return nil
     }
@@ -254,9 +290,15 @@ struct ProfileActivitySection: View {
             }
             return nil
         }
-        if let state = effectiveActivity?.state, !state.isEmpty,
-           state != primaryText, state != secondaryText {
-            return state
+        if let state = effectiveActivity?.state, !state.isEmpty {
+            let trimmed = state.trimmingCharacters(in: .whitespacesAndNewlines)
+            let isRedundant = trimmed.caseInsensitiveCompare(primaryText) == .orderedSame
+                || trimmed.caseInsensitiveCompare("Playing \(primaryText)") == .orderedSame
+                || trimmed.caseInsensitiveCompare("Listening to \(primaryText)") == .orderedSame
+                || (secondaryText != nil && trimmed.caseInsensitiveCompare(secondaryText!) == .orderedSame)
+            if !isRedundant {
+                return trimmed
+            }
         }
         return nil
     }
@@ -290,44 +332,72 @@ struct ProfileActivitySection: View {
             }
         }
         if isMusic, isCurrentUser {
-            if let data = AppleMusicPresenceMonitor.currentArtworkData, let img = NSImage(data: data) {
+            if let data = AppleMusicPresenceMonitor.currentArtworkData(
+                for: primaryText,
+                artist: effectiveActivity?.state,
+                album: effectiveActivity?.largeText
+            ), let img = NSImage(data: data) {
                 return img
             }
         }
-        if let lowerName = effectiveActivity?.name.lowercased(), lowerName.contains("roblox") {
-            if let data = GamePresenceMonitor.currentRobloxIconData, let img = NSImage(data: data) {
+        let lowerName = (effectiveActivity?.name ?? "").lowercased()
+        if lowerName.contains("athas") {
+            if let data = GamePresenceMonitor.currentAthasIconData, let img = NSImage(data: data) {
                 return img
             }
+        }
+        if lowerName.contains("roblox") {
+            // For Roblox, consistently use the official high-resolution Roblox icon asset
+            return nil
         }
         return nil
     }
 
     private var resolvedRemoteArtworkURL: URL? {
+        if let largeImage = effectiveActivity?.largeImage {
+            if largeImage.hasPrefix("spotify:") {
+                let hash = String(largeImage.dropFirst("spotify:".count))
+                return URL(string: "https://i.scdn.co/image/\(hash)")
+            }
+            if largeImage.hasPrefix("mp:external/") {
+                let path = String(largeImage.dropFirst("mp:external/".count))
+                return URL(string: "https://media.discordapp.net/external/\(path)")
+            }
+            if largeImage.hasPrefix("external/") {
+                return URL(string: "https://media.discordapp.net/\(largeImage)")
+            }
+            if largeImage.hasPrefix("mp:attachments/") {
+                let path = String(largeImage.dropFirst("mp:attachments/".count))
+                return URL(string: "https://media.discordapp.net/attachments/\(path)")
+            }
+            if largeImage.hasPrefix("attachments/") {
+                return URL(string: "https://cdn.discordapp.com/\(largeImage)")
+            }
+            if largeImage.hasPrefix("http://") || largeImage.hasPrefix("https://") {
+                if largeImage.contains("393590f736eaf7d08120700c39b259d7"), let override = remoteArtworkOverride {
+                    return override
+                }
+                return URL(string: largeImage)
+            }
+            if let appID = effectiveActivity?.applicationID, !appID.isEmpty, largeImage.allSatisfy(\.isNumber) {
+                return URL(string: "https://cdn.discordapp.com/app-assets/\(appID)/\(largeImage).png")
+            }
+        }
         if let override = remoteArtworkOverride { return override }
-        guard let largeImage = effectiveActivity?.largeImage else { return nil }
-        if largeImage.hasPrefix("spotify:") {
-            let hash = String(largeImage.dropFirst("spotify:".count))
-            return URL(string: "https://i.scdn.co/image/\(hash)")
-        }
-        if largeImage.hasPrefix("mp:external/") {
-            let path = String(largeImage.dropFirst("mp:external/".count))
-            return URL(string: "https://media.discordapp.net/external/\(path)")
-        }
-        if largeImage.hasPrefix("external/") {
-            return URL(string: "https://media.discordapp.net/\(largeImage)")
-        }
-        if largeImage.hasPrefix("mp:attachments/") {
-            let path = String(largeImage.dropFirst("mp:attachments/".count))
-            return URL(string: "https://media.discordapp.net/attachments/\(path)")
-        }
-        if largeImage.hasPrefix("attachments/") {
-            return URL(string: "https://cdn.discordapp.com/\(largeImage)")
-        }
-        if largeImage.hasPrefix("http://") || largeImage.hasPrefix("https://") {
-            return URL(string: largeImage)
-        }
         if let appID = effectiveActivity?.applicationID, !appID.isEmpty {
-            return URL(string: "https://cdn.discordapp.com/app-assets/\(appID)/\(largeImage).png")
+            if appID == GamePresenceMonitor.robloxAppID {
+                return URL(string: GamePresenceMonitor.robloxIconURL)
+            }
+            if effectiveActivity?.largeImage == nil, let iconHash = DiscordIPCServer.cachedAppIcon(for: appID) {
+                return URL(string: "https://cdn.discordapp.com/app-icons/\(appID)/\(iconHash).png")
+            }
+        } else if let lowerName = effectiveActivity?.name.lowercased() {
+            if lowerName.contains("roblox") {
+                return URL(string: GamePresenceMonitor.robloxIconURL)
+            }
+            if lowerName.contains("athas") {
+                return URL(string: "https://github.com/athasdev.png")
+            }
         }
         return nil
     }
@@ -340,8 +410,7 @@ struct ProfileActivitySection: View {
             if let resolved = resolvedTrackURL {
                 return resolved
             }
-            let appName = effectiveActivity?.name ?? ""
-            let isSpotify = appName.caseInsensitiveCompare("Spotify") == .orderedSame
+            let isSpotify = isSpotifyMusicActivity
             let query = [primaryText, secondaryText].compactMap { $0 }.joined(separator: " ")
             let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
             if isSpotify {
@@ -358,6 +427,9 @@ struct ProfileActivitySection: View {
         }
         let lowerName = (effectiveActivity?.name ?? "").lowercased()
         let lowerDetails = (effectiveActivity?.details ?? "").lowercased()
+        if lowerName.contains("athas") || lowerDetails.contains("athas") {
+            return URL(string: "https://github.com/athasdev/athas")
+        }
         if lowerName.contains("roblox") || lowerDetails.contains("roblox") {
             return URL(string: "https://www.roblox.com")
         }
@@ -370,12 +442,21 @@ struct ProfileActivitySection: View {
         return nil
     }
 
+    private var artworkIdentity: String {
+        let localArtKey = (dynamicArtwork ?? resolvedArtworkImage) != nil ? "local" : "none"
+        let remoteArtKey = resolvedRemoteArtworkURL?.absoluteString ?? "none"
+        return "\(primaryText)|\(secondaryText ?? "")|\(localArtKey)|\(remoteArtKey)"
+    }
+
     private var destinationHelpText: String {
         if isMusic {
-            let appName = effectiveActivity?.name ?? (member.isListeningToMusic ? "Spotify" : "Apple Music")
+            let appName = effectiveActivity?.name ?? (isSpotifyMusicActivity ? "Spotify" : "Apple Music")
             return "Play in \(appName)"
         }
         let lowerName = (effectiveActivity?.name ?? "").lowercased()
+        if lowerName.contains("athas") {
+            return "Open Athas"
+        }
         if lowerName.contains("roblox") {
             return "Open Roblox"
         }
@@ -395,9 +476,12 @@ struct ProfileActivitySection: View {
             HStack(alignment: .center, spacing: InterfaceScale.metric(12)) {
                 artworkView(size: rightColumnHeight)
                     .frame(width: rightColumnHeight, height: rightColumnHeight)
+                    .id(artworkIdentity)
+                    .transition(.opacity)
 
                 rightDetailsColumn
             }
+            .animation(.easeInOut(duration: 0.28), value: artworkIdentity)
         }
         .padding(InterfaceScale.metric(12))
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -410,20 +494,19 @@ struct ProfileActivitySection: View {
                 .stroke(Color.primary.opacity(isCardHovered ? 0.14 : 0.08), lineWidth: 1)
         }
         .contentShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+        .pointerStyle(activityDestinationURL != nil ? .link : .default)
         .onHover { hovering in
             isCardHovered = hovering
-            if hovering, activityDestinationURL != nil {
-                NSCursor.pointingHand.push()
-            } else {
-                NSCursor.pop()
-            }
         }
         .onTapGesture {
             if isMusic, isCurrentUser {
-                let appName = effectiveActivity?.name ?? ""
-                if appName.caseInsensitiveCompare("Apple Music") == .orderedSame || appName.isEmpty {
+                if !isSpotifyMusicActivity {
                     if let musicApp = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.Music" }) {
-                        musicApp.activate(options: .activateIgnoringOtherApps)
+                        musicApp.activate()
+                    }
+                } else {
+                    if let spotifyApp = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.spotify.client" }) {
+                        spotifyApp.activate()
                     }
                 }
             }
@@ -435,11 +518,52 @@ struct ProfileActivitySection: View {
         .onAppear {
             refreshArtwork()
         }
+        .onReceive(NotificationCenter.default.publisher(for: AppleMusicPresenceMonitor.artworkDidChangeNotification)) { _ in
+            withAnimation(.easeInOut(duration: 0.28)) {
+                refreshArtwork()
+            }
+        }
+        .animation(.spring(response: 0.38, dampingFraction: 0.84), value: primaryText)
+        .animation(.spring(response: 0.38, dampingFraction: 0.84), value: secondaryText)
+        .animation(.spring(response: 0.36, dampingFraction: 0.82), value: rightColumnHeight)
         .task(id: effectiveActivity) {
-            remoteArtworkOverride = nil
-            resolvedTrackURL = nil
-            refreshArtwork()
-            await resolveMissingMusicArtwork()
+            withAnimation(.easeInOut(duration: 0.2)) {
+                remoteArtworkOverride = nil
+                resolvedTrackURL = nil
+                refreshArtwork()
+            }
+            guard !Task.isCancelled else { return }
+            if isMusic {
+                await resolveMissingMusicArtwork()
+            } else if let appID = effectiveActivity?.applicationID, !appID.isEmpty {
+                let hasDirectArtwork = if let largeImage = effectiveActivity?.largeImage {
+                    largeImage.hasPrefix("http://") || largeImage.hasPrefix("https://") ||
+                    largeImage.hasPrefix("spotify:") || largeImage.hasPrefix("mp:") ||
+                    largeImage.hasPrefix("external/") || largeImage.hasPrefix("attachments/")
+                } else {
+                    false
+                }
+                if !hasDirectArtwork {
+                    let largeKey = effectiveActivity?.largeImage
+                    if let largeKey, !largeKey.allSatisfy(\.isNumber) {
+                        guard !Task.isCancelled else { return }
+                        if let url = await DiscordApplicationMetadataResolver.shared.resolveArtworkURL(
+                            applicationID: appID,
+                            assetKey: largeKey
+                        ) {
+                            guard !Task.isCancelled else { return }
+                            remoteArtworkOverride = url
+                        }
+                    }
+                    if remoteArtworkOverride == nil, resolvedRemoteArtworkURL == nil {
+                        guard !Task.isCancelled else { return }
+                        if let iconURL = await DiscordApplicationMetadataResolver.shared.resolveIconURL(for: appID) {
+                            guard !Task.isCancelled else { return }
+                            remoteArtworkOverride = iconURL
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -494,7 +618,9 @@ struct ProfileActivitySection: View {
             if newHeight > 0 {
                 let clamped = max(InterfaceScale.metric(56), newHeight)
                 if abs(rightColumnHeight - clamped) > 1 {
-                    rightColumnHeight = clamped
+                    withAnimation(.spring(response: 0.36, dampingFraction: 0.82)) {
+                        rightColumnHeight = clamped
+                    }
                 }
             }
         }
@@ -506,8 +632,7 @@ struct ProfileActivitySection: View {
 
     private func resolveMissingMusicArtwork() async {
         guard isMusic else { return }
-        let appName = effectiveActivity?.name ?? ""
-        let service = appName.caseInsensitiveCompare("Spotify") == .orderedSame ? "Spotify" : "Apple Music"
+        let service = isSpotifyMusicActivity ? "Spotify" : "Apple Music"
         let spotifyID = service == "Spotify" ? effectiveActivity?.largeText : nil
         let resolved = await MusicArtworkResolver.shared.resolveMusic(
             service: service,
@@ -517,34 +642,41 @@ struct ProfileActivitySection: View {
             spotifyTrackID: spotifyID
         )
         guard !Task.isCancelled else { return }
-        if resolvedRemoteArtworkURL == nil || effectiveActivity?.largeImage == "apple_music" {
+        let hasRealArtwork = if let largeImage = effectiveActivity?.largeImage {
+            !largeImage.isEmpty && !largeImage.contains("393590f736eaf7d08120700c39b259d7") && largeImage != "apple_music"
+        } else {
+            false
+        }
+        if !hasRealArtwork {
             if let artwork = resolved.artworkURL, let url = URL(string: artwork) {
-                remoteArtworkOverride = url
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    remoteArtworkOverride = url
+                }
             }
         }
         if let track = resolved.trackURL, let url = URL(string: track) {
-            resolvedTrackURL = url
+            withAnimation(.easeInOut(duration: 0.28)) {
+                resolvedTrackURL = url
+            }
         }
     }
 
     @ViewBuilder
     private func artworkView(size: CGFloat) -> some View {
         let cornerRadius = InterfaceScale.metric(14)
-        if let remoteURL = resolvedRemoteArtworkURL {
-            AsyncImage(url: remoteURL) { phase in
+        if isMusic, isCurrentUser, let local = dynamicArtwork ?? resolvedArtworkImage {
+            Image(nsImage: local)
+                .resizable()
+                .scaledToFill()
+                .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        } else if let url = resolvedRemoteArtworkURL {
+            AsyncImage(url: url) { phase in
                 switch phase {
-                case .success(let image):
+                case let .success(image):
                     image
                         .resizable()
                         .scaledToFill()
-                case .failure:
-                    if let local = dynamicArtwork ?? resolvedArtworkImage {
-                        Image(nsImage: local)
-                            .resizable()
-                            .scaledToFill()
-                    } else {
-                        fallbackArtIcon(size: size)
-                    }
                 default:
                     if let local = dynamicArtwork ?? resolvedArtworkImage {
                         Image(nsImage: local)
@@ -612,15 +744,20 @@ struct ProfileActivitySection: View {
             let hours = totalSeconds / 3600
             let minutes = (totalSeconds % 3600) / 60
             let seconds = totalSeconds % 60
-            let formattedTime: String = if hours > 0 {
-                String(format: "%d:%02d:%02d elapsed", hours, minutes, seconds)
+            let formattedDigits: String = if hours > 0 {
+                String(format: "%02d:%02d:%02d", hours, minutes, seconds)
             } else {
-                String(format: "%02d:%02d elapsed", minutes, seconds)
+                String(format: "%02d:%02d", minutes, seconds)
             }
 
-            Text(formattedTime)
-                .font(.interfaceSystem(size: 11))
-                .foregroundStyle(.secondary)
+            HStack(spacing: InterfaceScale.metric(4)) {
+                Text(formattedDigits)
+                    .font(.interfaceSystem(size: 11, design: .monospaced))
+                    .monospacedDigit()
+                Text("elapsed")
+                    .font(.interfaceSystem(size: 11))
+            }
+            .foregroundStyle(.secondary)
         }
     }
 
@@ -648,17 +785,20 @@ struct ProfileActivitySection: View {
                             Capsule()
                                 .fill(Color.primary.opacity(0.8))
                                 .frame(width: max(0, min(geo.size.width, geo.size.width * CGFloat(progress))), height: InterfaceScale.metric(4))
+                                .animation(.linear(duration: 0.2), value: progress)
                         }
                     }
                     .frame(height: InterfaceScale.metric(4))
 
                     HStack {
-                        Text(String(format: "%d:%02d", elapsedSec / 60, elapsedSec % 60))
+                        Text(String(format: "%02d:%02d", elapsedSec / 60, elapsedSec % 60))
                             .font(.interfaceSystem(size: 11, design: .monospaced))
+                            .monospacedDigit()
                             .foregroundStyle(.secondary)
                         Spacer()
-                        Text(String(format: "-%d:%02d", remainingSec / 60, remainingSec % 60))
+                        Text(String(format: "-%02d:%02d", remainingSec / 60, remainingSec % 60))
                             .font(.interfaceSystem(size: 11, design: .monospaced))
+                            .monospacedDigit()
                             .foregroundStyle(.secondary)
                     }
                 }
