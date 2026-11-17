@@ -857,6 +857,9 @@ extension NSGlassEffectView {
     /// The glass of an inspector split item, or nil once its private variant
     /// is no longer settable: plain glass would not look like an inspector.
     static func inspector() -> NSGlassEffectView? {
+        // Port: macOS 26 maps this private variant to a refracting glass that
+        // smears the sidebar, so use the plain fallback until macOS 27.
+        guard ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27 else { return nil }
         let glass = NSGlassEffectView()
         guard glass.responds(to: NSSelectorFromString("set_variant:")),
               glass.responds(to: NSSelectorFromString("set_adaptiveAppearance:"))
