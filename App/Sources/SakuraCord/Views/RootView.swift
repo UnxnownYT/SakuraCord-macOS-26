@@ -337,6 +337,8 @@ private struct ChatRootView: View {
         .toolbar {
             rootToolbar
         }
+        // Port: macOS 26 draws an opaque toolbar over the custom timeline; keep it clear like macOS 27.
+        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
         .environment(\.composerDropInteraction, composerDropInteraction)
     }
 
