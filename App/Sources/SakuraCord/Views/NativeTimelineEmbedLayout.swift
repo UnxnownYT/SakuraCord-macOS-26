@@ -179,7 +179,7 @@ enum NativeTimelineEmbedLayout {
                 let naturalTopWidth = naturalTextWidth + thumbnailAllowance
                 let mainMedia = self.mainMedia
                 let naturalMediaSize = mainMedia.map {
-                    mediaSize($0, maximumWidth: maximumContentWidth)
+                    self.mediaSize($0, maximumWidth: maximumContentWidth)
                 }
                 let naturalFooterWidth = footer.map {
                     NativeTimelineEmbedLayout.idealWidth($0)
@@ -265,7 +265,7 @@ enum NativeTimelineEmbedLayout {
                             .init(
                                 frame: CGRect(
                                     x: contentX + InterfaceScale.metric(28),
-                                    y: textY + (lineHeight - authorHeight) / 2,
+                                    y: textY + (CGFloat(lineHeight) - CGFloat(authorHeight)) / 2,
                                     width: authorWidth,
                                     height: authorHeight
                                 ),
@@ -380,7 +380,7 @@ enum NativeTimelineEmbedLayout {
                         .init(
                             frame: CGRect(
                                 x: footerTextX,
-                                y: bottomY + (footerHeight - footerTextHeight) / 2,
+                                y: bottomY + (CGFloat(footerHeight) - CGFloat(footerTextHeight)) / 2,
                                 width: footerTextWidth,
                                 height: footerTextHeight
                             ),

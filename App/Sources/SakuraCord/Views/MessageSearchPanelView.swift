@@ -64,7 +64,7 @@ private struct MessageSearchResultsHeader: View {
             .help("Filters")
 
             Menu {
-                Picker("Sort", selection: Binding(get: { search.sort }, set: model.updateMessageSearchSort)) {
+                Picker("Sort", selection: Binding(get: { search.sort }, set: { model.updateMessageSearchSort($0) })) {
                     ForEach(MessageSearchSort.allCases, id: \.self) { sort in
                         Text(sort.title).tag(sort)
                     }
