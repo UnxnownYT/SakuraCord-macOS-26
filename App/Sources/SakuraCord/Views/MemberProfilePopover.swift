@@ -65,6 +65,7 @@ struct ProfilePresentationContent<Footer: View>: View {
                     maximumPopoverHeight: maximumPopoverHeight,
                     showsRoles: showsRoles,
                     bottomPadding: showsQuickMessage ? ProfileQuickMessageMetrics.cardInset : InterfaceScale.metric(14),
+                    guild: presentation.guildID.flatMap { model?.serverRailGuildsByID[$0] },
                     footer: VStack(alignment: .leading, spacing: InterfaceScale.metric(12)) {
                         footer
                         if showsQuickMessage, let sendMessage {
@@ -147,8 +148,7 @@ private struct CompactIdentityProfilePopover: View {
         .task(id: user.avatarURL) {
             guard !isClyde else { return }
             accent = nil
-            guard let url = user.avatarURL else { return }
-            let palette = try? await ProfileAvatarPaletteLoader.shared.colors(url)
+            let palette = try? await ProfileAvatarPaletteLoader.shared.colors(user.avatarURL)
             guard !Task.isCancelled else { return }
             accent = palette?.first
         }
@@ -168,6 +168,7 @@ struct MemberProfilePopover<Footer: View>: View {
     var maximumPopoverHeight: CGFloat = InterfaceScale.metric(560)
     var showsRoles = true
     var bottomPadding: CGFloat = InterfaceScale.metric(14)
+    var guild: Guild?
     let footer: Footer
     var openProfile: (() -> Void)?
     var userMenu: (() -> NSMenu?)?
@@ -359,20 +360,8 @@ struct MemberProfilePopover<Footer: View>: View {
                     }
                 }
 
-                if hasActiveActivity, editor == nil {
-                    ProfileActivitySection(member: member, richActivity: effectiveRichActivity, isCurrentUser: isCurrentUser)
-                        .padding(.horizontal, InterfaceScale.metric(16))
-                        .transition(
-                            .asymmetric(
-                                insertion: .opacity
-                                    .combined(with: .scale(scale: 0.96, anchor: .top))
-                                    .combined(with: .offset(y: -4)),
-                                removal: .opacity
-                                    .combined(with: .scale(scale: 0.98, anchor: .top))
-                                    .combined(with: .offset(y: -2))
-                            )
-                        )
-                        .clipped()
+                if profile == nil || !showsDetails {
+                    activitySectionView
                 }
 
                 if isLoading {
@@ -420,6 +409,25 @@ struct MemberProfilePopover<Footer: View>: View {
     }
 
     @ViewBuilder
+    private var activitySectionView: some View {
+        if hasActiveActivity, editor == nil {
+            ProfileActivitySection(member: member, richActivity: effectiveRichActivity, isCurrentUser: isCurrentUser)
+                .padding(.horizontal, InterfaceScale.metric(16))
+                .transition(
+                    .asymmetric(
+                        insertion: .opacity
+                            .combined(with: .scale(scale: 0.96, anchor: .top))
+                            .combined(with: .offset(y: -4)),
+                        removal: .opacity
+                            .combined(with: .scale(scale: 0.98, anchor: .top))
+                            .combined(with: .offset(y: -2))
+                    )
+                )
+                .clipped()
+        }
+    }
+
+    @ViewBuilder
     private func profileDetailsSections(_ profile: UserProfile) -> some View {
         if let editor, editor.scope == .main || editor.isNitro {
             ProfileInlineBioEditor(value: Binding(get: { editor.bio }, set: { editor.bio = $0 }), displayValue: profile.bio, model: editor.model)
@@ -434,7 +442,8 @@ struct MemberProfilePopover<Footer: View>: View {
             CompactProfileWidgets(widgets: widgets, resources: profile.widgetResources, animates: animatesRemoteMedia, open: expandProfile)
                 .padding(.horizontal, InterfaceScale.metric(16))
         }
-        ProfileMembershipSection(createdAt: profile.id.createdAt)
+        activitySectionView
+        ProfileMembershipSection(createdAt: profile.id.createdAt, guild: guild, guildJoinedAt: member.joinedAt)
         if showsRoles, !profile.roles.isEmpty {
             ProfileRolesSection(roles: profile.roles, keepsExpanded: layout == .expanded)
                 .id(profile.id)
@@ -590,9 +599,8 @@ private struct ProfileHeroSection: View {
 
     private var defaultAvatarBannerSource: URL? {
         guard let profile, profile.bannerURL == nil, profile.accentHex == nil,
-              let url = profile.defaultAvatarURL,
-              (profile.avatarURL ?? profile.user.avatarURL ?? url) == url else { return nil }
-        return url
+              profile.avatarURL == profile.user.defaultAvatarURL else { return nil }
+        return profile.avatarURL
     }
 
     private var avatarSize: CGFloat { InterfaceScale.metric(70) }
@@ -637,7 +645,7 @@ private struct ProfileHeroSection: View {
                 ) {
                     DecoratedAvatarView(
                         name: profile?.displayName ?? member.user.displayName,
-                        avatarURL: profile?.avatarURL ?? member.guildAvatarURL ?? member.user.avatarURL,
+                        avatarURL: profile?.avatarURL ?? member.avatarURL,
                         decorationURL: cosmeticPolicy.disables(.avatarDecoration, for: member.id) ? nil : (profile?.user.avatarDecorationURL ?? member.user.avatarDecorationURL),
                         size: avatarSize,
                         playback: animatesRemoteMedia ? .continuous : .paused
@@ -770,8 +778,7 @@ struct ProfileStatusBubble: View {
             source: text,
             font: .interfaceSystemFont(ofSize: fontSize),
             color: .labelColor,
-            emojiImages: [:],
-            stylesLinks: false
+            emojiImages: [:]
         )
         return ceil(attributedText.size().width) + 2
     }
@@ -1198,7 +1205,7 @@ private struct ProfileAboutSection: View {
 
     var body: some View {
         if let bio, !bio.isEmpty {
-            ProfileRichTextView(source: bio)
+            ProfileBioText(source: bio)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }

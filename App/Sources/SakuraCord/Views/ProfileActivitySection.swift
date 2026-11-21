@@ -207,6 +207,26 @@ struct ProfileActivitySection: View {
         InterfaceScale.metric(18)
     }
 
+    private var platformBrand: String? {
+        guard let platform = effectiveActivity?.platform?.lowercased() else { return nil }
+        if platform.contains("ps") || platform.contains("playstation") {
+            return "playstation"
+        }
+        if platform.contains("xbox") {
+            return "xbox"
+        }
+        return nil
+    }
+
+    private var platformDisplayName: String? {
+        guard let brand = platformBrand else { return nil }
+        switch brand {
+        case "playstation": return "PlayStation"
+        case "xbox": return "Xbox"
+        default: return brand.capitalized
+        }
+    }
+
     private var headerText: String {
         if let activity = effectiveActivity {
             switch activity.type {
@@ -223,8 +243,10 @@ struct ProfileActivitySection: View {
                 let name = activity.name.trimmingCharacters(in: .whitespacesAndNewlines)
                 return "Competing in \(name.isEmpty ? "Event" : name)"
             default:
-                let name = activity.name.trimmingCharacters(in: .whitespacesAndNewlines)
-                return "Playing \(name.isEmpty ? "Game" : name)"
+                if let platformDisplayName {
+                    return "Playing on \(platformDisplayName)"
+                }
+                return "Playing a game"
             }
         }
         if member.isListeningToMusic {
@@ -332,17 +354,17 @@ struct ProfileActivitySection: View {
             }
         }
         if isMusic, isCurrentUser {
-            if let data = AppleMusicPresenceMonitor.currentArtworkData(
+            if let img = AppleMusicPresenceMonitor.currentArtworkImage(
                 for: primaryText,
                 artist: effectiveActivity?.state,
                 album: effectiveActivity?.largeText
-            ), let img = NSImage(data: data) {
+            ) {
                 return img
             }
         }
         let lowerName = (effectiveActivity?.name ?? "").lowercased()
         if lowerName.contains("athas") {
-            if let data = GamePresenceMonitor.currentAthasIconData, let img = NSImage(data: data) {
+            if let img = GamePresenceMonitor.currentAthasIconImage {
                 return img
             }
         }
@@ -468,10 +490,20 @@ struct ProfileActivitySection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: InterfaceScale.metric(8)) {
-            Text(headerText)
-                .font(.interfaceSystem(size: 11, weight: .bold))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+            HStack(spacing: InterfaceScale.metric(4)) {
+                Text(headerText)
+                    .font(.interfaceSystem(size: 11, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if let platformBrand, let image = ConnectionBrand.image(for: platformBrand, colorScheme: colorScheme) {
+                    Image(nsImage: image)
+                        .renderingMode(.template)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: InterfaceScale.metric(13), height: InterfaceScale.metric(13))
+                        .foregroundStyle(.secondary)
+                }
+            }
 
             HStack(alignment: .center, spacing: InterfaceScale.metric(12)) {
                 artworkView(size: rightColumnHeight)
@@ -664,7 +696,8 @@ struct ProfileActivitySection: View {
     @ViewBuilder
     private func artworkView(size: CGFloat) -> some View {
         let cornerRadius = InterfaceScale.metric(14)
-        if isMusic, isCurrentUser, let local = dynamicArtwork ?? resolvedArtworkImage {
+        let localArt = dynamicArtwork ?? resolvedArtworkImage
+        if isMusic, isCurrentUser, let local = localArt {
             Image(nsImage: local)
                 .resizable()
                 .scaledToFill()
@@ -678,7 +711,7 @@ struct ProfileActivitySection: View {
                         .resizable()
                         .scaledToFill()
                 default:
-                    if let local = dynamicArtwork ?? resolvedArtworkImage {
+                    if let local = localArt {
                         Image(nsImage: local)
                             .resizable()
                             .scaledToFill()
@@ -689,7 +722,7 @@ struct ProfileActivitySection: View {
             }
             .frame(width: size, height: size)
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-        } else if let image = dynamicArtwork ?? resolvedArtworkImage {
+        } else if let image = localArt {
             Image(nsImage: image)
                 .resizable()
                 .scaledToFill()
@@ -734,30 +767,32 @@ struct ProfileActivitySection: View {
             }
     }
 
+    private func formattedElapsedTime(start: Int64, now: Date) -> String {
+        let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+        let (rawElapsed, elapsedOverflow) = nowMs.subtractingReportingOverflow(start)
+        let elapsedMs = elapsedOverflow || rawElapsed < 0 ? 0 : rawElapsed
+        let totalSeconds = Int(elapsedMs / 1000)
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        } else {
+            return String(format: "%02d:%02d", minutes, seconds)
+        }
+    }
+
     @ViewBuilder
     private func elapsedTimeLabel(start: Int64) -> some View {
         TimelineView(.periodic(from: .now, by: 1.0)) { timeline in
-            let nowMs = Int64(timeline.date.timeIntervalSince1970 * 1000)
-            let (rawElapsed, elapsedOverflow) = nowMs.subtractingReportingOverflow(start)
-            let elapsedMs = elapsedOverflow || rawElapsed < 0 ? 0 : rawElapsed
-            let totalSeconds = Int(elapsedMs / 1000)
-            let hours = totalSeconds / 3600
-            let minutes = (totalSeconds % 3600) / 60
-            let seconds = totalSeconds % 60
-            let formattedDigits: String = if hours > 0 {
-                String(format: "%02d:%02d:%02d", hours, minutes, seconds)
-            } else {
-                String(format: "%02d:%02d", minutes, seconds)
-            }
-
             HStack(spacing: InterfaceScale.metric(4)) {
-                Text(formattedDigits)
-                    .font(.interfaceSystem(size: 11, design: .monospaced))
-                    .monospacedDigit()
-                Text("elapsed")
+                Image(systemName: "gamecontroller.fill")
+                    .font(.interfaceSystem(size: 10))
+                Text(formattedElapsedTime(start: start, now: timeline.date))
                     .font(.interfaceSystem(size: 11))
+                    .monospacedDigit()
             }
-            .foregroundStyle(.secondary)
+            .foregroundStyle(Color(red: 35 / 255.0, green: 165 / 255.0, blue: 90 / 255.0))
         }
     }
 

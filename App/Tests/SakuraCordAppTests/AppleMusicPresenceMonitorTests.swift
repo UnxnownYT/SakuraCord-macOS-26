@@ -1,10 +1,11 @@
+@testable import DiscordProtocolTestSupport
 import DiscordProtocol
 import Foundation
 import SakuraCordModels
 @testable import SakuraCord
 import Testing
 
-@Suite("AppleMusicPresenceMonitorTests")
+@Suite("AppleMusicPresenceMonitorTests", .serialized)
 struct AppleMusicPresenceMonitorTests {
     private final class TimeBox: @unchecked Sendable {
         var date: Date
@@ -33,7 +34,7 @@ struct AppleMusicPresenceMonitorTests {
         let activity = await monitor.handlePlayerInfo(payload)
         #expect(activity != nil)
         #expect(activity?.name == "Apple Music")
-        #expect(activity?.type == .listening)
+        #expect(activity?.type == ActivityType.listening)
         #expect(activity?.details == "Blinding Lights")
         #expect(activity?.state == "The Weeknd")
         #expect(activity?.assets?.largeImage == "apple_music" || activity?.assets?.largeImage?.hasPrefix("https://") == true)
@@ -295,7 +296,7 @@ struct AppleMusicPresenceMonitorTests {
     @Test("Current user activity is properly injected into member list rows and cached stores")
     @MainActor
     func testCurrentUserActivityInMemberList() async {
-        let model = AppModel(launchMode: .offlineTesting)
+        let model = AppModel(isEphemeral: true, provider: MockChatProvider())
         await model.start()
         guard model.currentUser?.id != nil else {
             #expect(Bool(false), "Current user must be present in offline testing")
@@ -353,7 +354,7 @@ struct AppleMusicPresenceMonitorTests {
     @Test("Game rich presence displays game name in member list instead of party state")
     @MainActor
     func testGameRichPresenceDisplayTextPrioritizesGameName() async {
-        let model = AppModel(launchMode: .offlineTesting)
+        let model = AppModel(isEphemeral: true, provider: MockChatProvider())
         await model.start()
         guard model.currentUser != nil else { return }
 
@@ -375,6 +376,53 @@ struct AppleMusicPresenceMonitorTests {
         #expect(decorated.activityText == "Playing Essential Mod")
         #expect(decorated.memberListActivityText == "Essential Mod")
         #expect(decorated.memberListActivityIconType == .game)
+    }
+
+    @Test("Current user account subtitle and short activity text match Discord client presentation")
+    @MainActor
+    func testCurrentUserAccountSubtitleAndShortActivity() async {
+        let model = AppModel(isEphemeral: true, provider: MockChatProvider())
+        await model.start()
+        guard model.currentUser != nil else { return }
+
+        // 1. No activity, no custom status -> presence status
+        #expect(model.currentUserShortActivityText == nil)
+        #expect(model.currentUserAccountSubtitle(currentStatus: .online) == "Online")
+        #expect(model.currentUserAccountSubtitle(currentStatus: .idle) == "Idle")
+
+        // 2. Game activity -> short title without Playing prefix
+        let roblox = OutgoingActivityPayload(
+            name: "Roblox",
+            type: .playing
+        )
+        model.applyCurrentUserActivity(roblox)
+        #expect(model.currentUserShortActivityText == "Roblox")
+        #expect(model.currentUserAccountSubtitle(currentStatus: .online) == "Roblox")
+
+        // 3. Game activity with multiple activities -> appends +N count
+        model.currentUserPermittedActivitiesCount = 2
+        #expect(model.currentUserAccountSubtitle(currentStatus: .online) == "Roblox +1")
+
+        model.currentUserPermittedActivitiesCount = 1
+
+        // 4. Listening activity -> prioritizes artist / state then details
+        let spotify = OutgoingActivityPayload(
+            name: "Spotify",
+            type: .listening,
+            details: "TRUE ADVENTURE",
+            state: "Xizt, TRUE ADAM"
+        )
+        model.applyCurrentUserActivity(spotify)
+        #expect(model.currentUserShortActivityText == "Xizt, TRUE ADAM")
+        #expect(model.currentUserAccountSubtitle(currentStatus: .online) == "Xizt, TRUE ADAM")
+
+        // 5. Custom status takes precedence over activity text
+        model.profileCustomStatus = ProfileCustomStatus(text: "Chilling")
+        #expect(model.currentUserAccountSubtitle(currentStatus: .online) == "Chilling")
+
+        // 6. Custom status cleared -> returns to activity
+        model.profileCustomStatus = nil
+        #expect(model.currentUserAccountSubtitle(currentStatus: .online) == "Xizt, TRUE ADAM")
     }
 
     @Test("Extreme or non-finite duration does not cause integer overflow or crash")
@@ -436,6 +484,8 @@ struct AppleMusicPresenceMonitorTests {
                 "Artist": "Some Artist"
             ])
         }
+
+        try? await Task.sleep(nanoseconds: 50_000_000)
 
         let pauseTask = Task {
             await monitor.handlePlayerInfo([

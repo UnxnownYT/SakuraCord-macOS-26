@@ -277,6 +277,8 @@ final class AppModel {
 
     var membersByID: [UserID: Member] = [:]
     @ObservationIgnored var membersByGuildID: [GuildID: [UserID: Member]] = [:]
+    /// Users who left each server this session; `membersByGuildID` keeps them for message history.
+    var removedMemberIDsByGuildID: [GuildID: Set<UserID>] = [:]
     var profileCustomStatus: ProfileCustomStatus?
     var profileCustomStatusUserID: UserID?
     var profileWidgetConnectionsRevision = UUID()
@@ -308,7 +310,6 @@ final class AppModel {
     @ObservationIgnored var guildRolesByGuildID: [GuildID: [GuildRole]] = [:] {
         didSet { if oldValue != guildRolesByGuildID { emojiEligibilityRevision &+= 1 } }
     }
-    var mentionMemberResults: [Member] = []
     var mentionAutocompleteMembers: [Member] = []
     var knownMentionMembers: [UserID: Member] = [:] {
         didSet {
@@ -338,8 +339,11 @@ final class AppModel {
     var activeAccountID: String?
     @ObservationIgnored var diagnosticsShareInFlight = false
     var sessionState: SessionState
-    var hasPendingLaunchWelcome: Bool
-    let launchMode: AppLaunchMode
+    var hasPendingLaunchWelcome = false
+    /// Keeps nothing beyond the model's lifetime and reaches Discord only
+    /// through the injected provider: an in-memory database, no shared
+    /// preferences or saved credentials, and no session restore. Tests use it.
+    let isEphemeral: Bool
     let typingState: TypingStateModel
     let commandComposer = ApplicationCommandComposerModel()
     let translation: TranslationState
@@ -392,7 +396,7 @@ final class AppModel {
     var forumSortOrder: ForumSortOrder = .latestActivity
     var forumLayout: ForumLayout = .list
     var forumTagMatch: ForumTagMatch = .matchSome
-    @ObservationIgnored lazy var forumViewMemory = ForumViewMemory(defaults: launchMode == .normal ? UserDefaults.standard : nil)
+    @ObservationIgnored lazy var forumViewMemory = ForumViewMemory(defaults: isEphemeral ? nil : UserDefaults.standard)
     var interactionModalForm: InteractionModalFormState?
     /// The open side chats: the single source of truth for threads, voice
     /// chat, Guide resources and channel previews beside the primary
@@ -789,7 +793,8 @@ final class AppModel {
             smallImage: current.assets?.smallImage,
             smallText: current.assets?.smallText,
             applicationID: current.applicationId,
-            url: current.url
+            url: current.url,
+            platform: current.platform
         )
     }
 
@@ -817,6 +822,48 @@ final class AppModel {
 
     var isCurrentUserListeningToMusic: Bool {
         currentUserActivity?.type == .listening
+    }
+
+    var currentUserShortActivityText: String? {
+        guard let activity = currentUserActivity else { return nil }
+        if activity.type == .listening {
+            let state = activity.state?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let details = activity.details?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = (state?.isEmpty == false ? state : nil)
+                ?? (details?.isEmpty == false ? details : nil)
+                ?? activity.name
+            if value.lowercased().hasPrefix("listening to ") {
+                return String(value.dropFirst("listening to ".count)).trimmingCharacters(in: .whitespaces)
+            }
+            return value
+        } else {
+            let name = activity.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let prefixes = ["playing ", "streaming ", "watching ", "competing in "]
+            var stripped = name
+            for prefix in prefixes where stripped.lowercased().hasPrefix(prefix) {
+                stripped = String(stripped.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+                break
+            }
+            if !stripped.isEmpty {
+                return stripped
+            }
+            return activity.details ?? activity.state ?? activity.name
+        }
+    }
+
+    func currentUserAccountSubtitle(currentStatus: PresenceStatus? = nil) -> String {
+        let status = currentStatus ?? self.currentStatus
+        let customStatus = profileCustomStatus?.displayText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let customStatus, !customStatus.isEmpty {
+            return customStatus
+        }
+        if let activityText = currentUserShortActivityText {
+            if currentUserPermittedActivitiesCount >= 2 {
+                return "\(activityText) +\(currentUserPermittedActivitiesCount - 1)"
+            }
+            return activityText
+        }
+        return status.label
     }
 
     @ObservationIgnored var provider: any ChatProvider
@@ -1029,12 +1076,8 @@ final class AppModel {
     @ObservationIgnored var promisedAttachmentFilesInFlight: Set<URL> = []
     @ObservationIgnored var externalAttachmentUploadFileURL: URL?
 
-    let includesOfflineSignIn: Bool
-    var awaitsOfflineSignIn: Bool
-
     init(
-        launchMode: AppLaunchMode,
-        awaitsOfflineSignIn: Bool = false,
+        isEphemeral: Bool = false,
         hasSavedAccountsAtLaunch: Bool = false,
         provider: (any ChatProvider)? = nil,
         discordNetworkDisabledOverride: Bool? = nil,
@@ -1066,11 +1109,9 @@ final class AppModel {
         ipcServer: DiscordIPCServer? = nil,
         appleMusicMonitor: AppleMusicPresenceMonitor? = nil
     ) {
-        self.launchMode = launchMode
-        includesOfflineSignIn = launchMode == .offlineTesting && awaitsOfflineSignIn
-        self.awaitsOfflineSignIn = includesOfflineSignIn
+        self.isEphemeral = isEphemeral
         composer = MessageComposerState(
-            preferences: composerPreferences ?? (launchMode == .normal ? .shared : nil)
+            preferences: composerPreferences ?? (isEphemeral ? nil : .shared)
         )
         let appearanceSettings = AppearanceSettingsStore.shared.load()
         InterfaceTypographyMetrics.updateMessageTextSize(appearanceSettings.messageTextSize)
@@ -1094,14 +1135,12 @@ final class AppModel {
         self.accessibilityMessageAnnouncer = accessibilityMessageAnnouncer ?? AccessibilityMessageAnnouncer()
         selectedCameraUID = resolvedVoicePreferences.remembersCamera && !resolvedVoicePreferences.cameraUID.isEmpty ? resolvedVoicePreferences.cameraUID : nil
         screenShareSettings = resolvedVoicePreferences.screenShareDefaults
-        let resolvedProvider =
-            provider
-                ?? (launchMode == .offlineTesting ? MockChatProvider() : SignedOutChatProvider())
+        let resolvedProvider = provider ?? SignedOutChatProvider()
         self.provider = resolvedProvider
         let resolvedPrivacyStore = privacySafetySettingsStore ?? .shared
         self.privacySafetySettingsStore = resolvedPrivacyStore
         let activityServices = Self.makeActivityServices(
-            launchMode: launchMode,
+            isEphemeral: isEphemeral,
             privacyStore: resolvedPrivacyStore,
             provider: resolvedProvider,
             coordinator: activityCoordinator,
@@ -1112,7 +1151,6 @@ final class AppModel {
         self.ipcServer = activityServices.ipcServer
         self.appleMusicMonitor = activityServices.monitor
         self.gameMonitor = activityServices.gameMonitor
-        hasPendingLaunchWelcome = includesOfflineSignIn
         typingState = TypingStateModel()
         self.localTypingTiming = localTypingTiming
         self.reactionMutationTiming = reactionMutationTiming
@@ -1122,19 +1160,19 @@ final class AppModel {
                 ?? AppLaunchConfiguration.current.runsAnyReadOnlyPerformanceBenchmark
         discordNetworkDisabled =
             discordNetworkDisabledOverride
-                ?? (launchMode == .offlineTesting
+                ?? (isEphemeral
                     || ProcessInfo.processInfo.environment["SAKURACORD_DISABLE_DISCORD_NETWORK"] == "1")
-        sessionState = includesOfflineSignIn ? .signedOut
-            : (launchMode == .offlineTesting || (hasSavedAccountsAtLaunch && restoresStoredSession && !discordNetworkDisabled) ? .connecting : .restoring)
+        sessionState = isEphemeral || (hasSavedAccountsAtLaunch && restoresStoredSession && !discordNetworkDisabled)
+            ? .connecting : .restoring
         self.restoresStoredSession = restoresStoredSession
         usesInsecureDebugCredentials =
             usesInsecureDebugCredentialsOverride
-                ?? (launchMode == .normal
+                ?? (!isEphemeral
                     && Bundle.main.object(
                         forInfoDictionaryKey: "SakuraCordInsecureDebugCredentialsEnabled"
                     ) as? Bool == true)
         let uploadAndProviderServices = Self.makeUploadAndProviderServices(
-            launchMode: launchMode,
+            isEphemeral: isEphemeral,
             usesInsecureDebugCredentials: usesInsecureDebugCredentials,
             privacyStore: resolvedPrivacyStore,
             uploadPrivacyPreparation: uploadPrivacyPreparation,
@@ -1148,15 +1186,16 @@ final class AppModel {
         self.pendingAuthenticatedProviderFactory = pendingAuthenticatedProviderFactory ?? uploadAndProviderServices.pendingAuthenticatedProviderFactory
         self.savedAccountStore = savedAccountStore ?? UserDefaultsSavedAccountStore.shared
         self.accountDatabaseFactory = accountDatabaseFactory ?? { accountID in
-            try? SakuraCordDatabase(accountID: accountID)
+            try? SakuraCordDatabase(accountID: accountID, directory: SimulatorAccountStorage.databaseDirectory)
         }
-        persistsEmojiPreferences = launchMode == .normal
+        persistsEmojiPreferences = !isEphemeral
         // A normal launch does not know the account yet. Opening the historical
         // account-1 fallback here only to replace it during credential restore
         // duplicates filesystem and SQLite work on every startup.
-        database = launchMode == .offlineTesting
-            ? try? SakuraCordDatabase(inMemory: true)
-            : nil
+        database = isEphemeral ? try? SakuraCordDatabase(inMemory: true) : nil
+        commandComposer.configureFrecencyScope(signedOutScope)
+        configureEmojiFrecency(scope: signedOutScope)
+        readState.reset(accountID: ephemeralAccountID)
         mediaDeviceMonitor = MediaDeviceMonitor { [weak self] snapshot in
             Task { @MainActor [weak self] in
                 await self?.installMediaDeviceSnapshot(snapshot)
@@ -1198,14 +1237,32 @@ final class AppModel {
     }
 }
 
+/// An ephemeral model's credentials: none are stored or read.
+private actor EphemeralCredentialStore: CredentialStore {
+    func store(_ credential: Data, accountID: String) async throws -> CredentialHandle {
+        throw ChatProviderError.invalidRequest("An ephemeral session does not store credentials.")
+    }
+
+    func credential(for handle: CredentialHandle) async throws -> Data {
+        throw ChatProviderError.invalidRequest("An ephemeral session has no stored credentials.")
+    }
+
+    func remove(_ handle: CredentialHandle) async throws {}
+
+    func handles() async throws -> [CredentialHandle] { [] }
+}
+
 extension AppModel {
     static let messageSendLogger = Logger(
         subsystem: "dev.sakuracord.SakuraCord",
         category: "MessageSend"
     )
 
-    static func defaultCredentialStore(launchMode: AppLaunchMode, usesInsecureDebugCredentials: Bool) -> any CredentialStore {
-        if launchMode == .offlineTesting { return OfflineCredentialStore() }
+    static func defaultCredentialStore(isEphemeral: Bool, usesInsecureDebugCredentials: Bool) -> any CredentialStore {
+        if isEphemeral { return EphemeralCredentialStore() }
+        #if DEBUG
+        if DiscordNetworkRedirect.isActive { return SimulatorAccountStorage.credentialStore }
+        #endif
         if usesInsecureDebugCredentials { return InsecureDebugMigratingCredentialStore() }
         return KeychainCredentialStore()
     }

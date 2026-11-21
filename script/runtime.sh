@@ -105,6 +105,25 @@ sakuracord_launch_scoped_app() {
   # Check again at launch time, and let LaunchServices reuse an instance if
   # another launcher races this final check instead of forcing a duplicate.
   sakuracord_stop_scoped_app || return
+  local argument previous="" simulator_port=""
+  # The first simulator flag decides, as in DiscordNetworkRedirect.basePort: its
+  # numeric port, or 47100 when it has none.
+  for argument in "$@"; do
+    if [[ "$previous" == --discord-simulator ]]; then
+      [[ "$argument" =~ ^[+]?[0-9]+$ ]] && simulator_port="$argument"
+      break
+    elif [[ "$argument" =~ ^--discord-simulator=([+]?[0-9]+)$ ]]; then
+      simulator_port="${BASH_REMATCH[1]}"
+      break
+    elif [[ "$argument" == --discord-simulator=* ]]; then
+      simulator_port=47100
+      break
+    elif [[ "$argument" == --discord-simulator ]]; then
+      simulator_port=47100
+    fi
+    previous="$argument"
+  done
+  sakuracord_record_simulator_launch "$SAKURACORD_APP_BUNDLE" "$simulator_port" || return
   /usr/bin/open "$SAKURACORD_APP_BUNDLE" "$@" || return
   sakuracord_wait_for_scoped_app || return
 
@@ -115,6 +134,15 @@ sakuracord_launch_scoped_app() {
     echo "Expected one $SAKURACORD_APP_NAME instance, from this checkout, after launch (PIDs: $pids)." >&2
     return 1
   fi
+}
+
+# Signs the app out of the Discord simulator for a first-run sign-in: stops it
+# and clears its simulator accounts, data and session defaults (never the real ones).
+sakuracord_reset_simulator_account() {
+  sakuracord_stop_scoped_app || return
+  local container="$HOME/Library/Containers/$SAKURACORD_BUNDLE_ID/Data/Library"
+  rm -rf "$container/Application Support/SakuraCord/DiscordSimulator"
+  defaults delete "$container/Preferences/$SAKURACORD_BUNDLE_ID.discord-simulator" >/dev/null 2>&1 || true
 }
 
 sakuracord_release_operation_lock() {

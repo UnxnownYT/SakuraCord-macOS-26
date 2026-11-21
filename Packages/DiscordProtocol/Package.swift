@@ -2,15 +2,14 @@
 import Foundation
 import PackageDescription
 
-// Set with the app package's `SAKURACORD_MOTION_BENCHMARK=1` build.
-let motionBenchmarkSettings: [SwiftSetting] =
-    ProcessInfo.processInfo.environment["SAKURACORD_MOTION_BENCHMARK"] == "1"
-    ? [.define("SAKURACORD_MOTION_BENCHMARK")] : []
-
 let package = Package(
     name: "DiscordProtocol",
     platforms: [.macOS(.v26)],
-    products: [.library(name: "DiscordProtocol", targets: ["DiscordProtocol"])],
+    products: [
+        .library(name: "DiscordProtocol", targets: ["DiscordProtocol"]),
+        // A fictional account behind the provider contract, for test targets only.
+        .library(name: "DiscordProtocolTestSupport", targets: ["DiscordProtocolTestSupport"]),
+    ],
     dependencies: [
         .package(path: "../SakuraCordModels"),
         .package(url: "https://github.com/facebook/zstd.git", from: "1.5.7"),
@@ -22,9 +21,9 @@ let package = Package(
                 "SakuraCordModels",
                 .product(name: "libzstd", package: "zstd"),
             ],
-            resources: [.process("Resources")],
-            swiftSettings: motionBenchmarkSettings
+            resources: [.process("Resources")]
         ),
-        .testTarget(name: "DiscordProtocolTests", dependencies: ["DiscordProtocol"])
+        .target(name: "DiscordProtocolTestSupport", dependencies: ["DiscordProtocol", "SakuraCordModels"]),
+        .testTarget(name: "DiscordProtocolTests", dependencies: ["DiscordProtocol", "DiscordProtocolTestSupport"])
     ]
 )

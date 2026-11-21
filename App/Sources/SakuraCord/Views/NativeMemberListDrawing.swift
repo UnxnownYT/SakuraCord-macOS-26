@@ -342,36 +342,59 @@ extension NativeMemberListCanvasView {
                 maximumPixelDimension: 32
             )
         }
-        if let activity = prepared.activity,
-           let truncationToken = prepared.activityTruncationToken
+        drawMemberActivity(prepared: prepared, row: row, textX: textX, index: index, context: context)
+    }
+
+    private func drawMemberActivity(
+        prepared: PreparedText,
+        row: CGRect,
+        textX: CGFloat,
+        index: Int,
+        context: CGContext
+    ) {
+        guard let activity = prepared.activity,
+              let truncationToken = prepared.activityTruncationToken
+        else { return }
+
+        if let iconType = prepared.activityIconType,
+           let iconData = MemberActivityIconCache.shared.icon(for: iconType)
         {
-            let activityFrame = activityTextFrame(at: index)
-            let visibleActivity = cachedFittedTextLine(
-                activity,
-                token: truncationToken,
-                maximumWidth: activityFrame.width
+            let iconWidth = InterfaceScale.metric(iconData.size.width)
+            let iconHeight = InterfaceScale.metric(iconData.size.height)
+            let iconRect = CGRect(
+                x: textX,
+                y: row.minY + InterfaceScale.metric(24) + (InterfaceScale.metric(14) - iconHeight) / 2,
+                width: iconWidth,
+                height: iconHeight
             )
-            let origin = activityFrame.origin
-            Self.draw(line: visibleActivity, at: origin, context: context)
-            for region in NativeMemberActivityPresentation.emojiRegions(
-                in: visibleActivity,
-                origin: origin
-            ) {
-                guard let url = region.reference.imageURL(in: customEmojiURLsByID) else { continue }
-                if let image = images[url] {
-                    Self.draw(
-                        image: image,
-                        aspectFitIn: region.frame,
-                        context: context
-                    )
-                } else {
-                    requestImageIfNeeded(
-                        url: url,
-                        index: index,
-                        priority: .visible,
-                        maximumPixelDimension: 64
-                    )
-                }
+            Self.draw(image: iconData.image, in: iconRect, context: context, fills: false)
+        }
+        let activityFrame = activityTextFrame(at: index)
+        let visibleActivity = cachedFittedTextLine(
+            activity,
+            token: truncationToken,
+            maximumWidth: activityFrame.width
+        )
+        let origin = activityFrame.origin
+        Self.draw(line: visibleActivity, at: origin, context: context)
+        for region in NativeMemberActivityPresentation.emojiRegions(
+            in: visibleActivity,
+            origin: origin
+        ) {
+            guard let url = region.reference.imageURL(in: customEmojiURLsByID) else { continue }
+            if let image = images[url] {
+                Self.draw(
+                    image: image,
+                    aspectFitIn: region.frame,
+                    context: context
+                )
+            } else {
+                requestImageIfNeeded(
+                    url: url,
+                    index: index,
+                    priority: .visible,
+                    maximumPixelDimension: 64
+                )
             }
         }
     }
@@ -408,11 +431,11 @@ extension NativeMemberListCanvasView {
             context.clip(using: .evenOdd)
         }
 
-        let avatarURL = member.guildAvatarURL ?? member.user.avatarURL
+        let avatarURL = member.avatarURL
         context.saveGState()
         context.addEllipse(in: avatar)
         context.clip()
-        if let avatarURL, let image = images[avatarURL] {
+        if let image = images[avatarURL] {
             Self.draw(
                 image: image,
                 in: avatar,
@@ -420,11 +443,8 @@ extension NativeMemberListCanvasView {
                 fills: true
             )
         } else {
-            drawAvatarFallback(
-                name: member.user.displayName,
-                in: avatar,
-                context: context
-            )
+            context.setFillColor(UserAvatarPresentation.placeholderColor.cgColor)
+            context.fill(avatar)
         }
         context.restoreGState()
         requestImageIfNeeded(
@@ -466,58 +486,6 @@ extension NativeMemberListCanvasView {
                 context: context
             )
         }
-    }
-
-    func drawAvatarFallback(
-        name: String,
-        in rect: CGRect,
-        context: CGContext
-    ) {
-        let accent = SakuraCordAccentColor.nsColor
-        let gradient = CGGradient(
-            colorsSpace: CGColorSpaceCreateDeviceRGB(),
-            colors: [
-                accent.blended(withFraction: 0.18, of: .white)?.cgColor
-                    ?? accent.cgColor,
-                accent.blended(withFraction: 0.16, of: .black)?.cgColor
-                    ?? accent.cgColor,
-            ] as CFArray,
-            locations: [0, 1]
-        )
-        if let gradient {
-            context.drawLinearGradient(
-                gradient,
-                start: CGPoint(x: rect.minX, y: rect.minY),
-                end: CGPoint(x: rect.maxX, y: rect.maxY),
-                options: []
-            )
-        } else {
-            context.setFillColor(accent.cgColor)
-            context.fill(rect)
-        }
-        guard let initial = name.first.map({ String($0).uppercased() }) else {
-            return
-        }
-        let line = Self.line(
-            initial,
-            font: .systemFont(
-                ofSize: NativeMemberListMetrics.avatarSize * 0.42,
-                weight: .semibold
-            ),
-            color: .sakuraCordLabelOnAccentColor
-        )
-        let bounds = CTLineGetBoundsWithOptions(line, [.useGlyphPathBounds])
-        var ascent: CGFloat = 0
-        CTLineGetTypographicBounds(line, &ascent, nil, nil)
-        // draw(line:) adds ascent and flips Core Text's baseline coordinates.
-        Self.draw(
-            line: line,
-            at: CGPoint(
-                x: rect.midX - bounds.width / 2 - bounds.minX,
-                y: rect.midY + bounds.midY - ascent
-            ),
-            context: context
-        )
     }
 
     func drawPresenceIndicator(

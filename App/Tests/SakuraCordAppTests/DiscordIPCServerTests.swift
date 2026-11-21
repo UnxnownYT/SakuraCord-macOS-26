@@ -1,3 +1,4 @@
+@testable import DiscordProtocolTestSupport
 import AppKit
 import Darwin
 @testable import DiscordProtocol
@@ -6,6 +7,7 @@ import Foundation
 import SakuraCordModels
 import Testing
 
+@Suite("DiscordIPCServerTests", .serialized)
 struct DiscordIPCServerTests {
     private func makeTestSocketPath() -> String {
         "/tmp/sakuracord-ipc-test-\(UUID().uuidString).sock"
@@ -559,7 +561,7 @@ struct DiscordIPCServerTests {
         try await Task.sleep(nanoseconds: 100_000_000)
         let primary = await coordinator.currentPrimaryActivity()
         #expect(primary?.name == "Sonora")
-        #expect(primary?.type == .listening)
+        #expect(primary?.type == ActivityType.listening)
         #expect(primary?.details == "Starboy")
         #expect(primary?.state == "The Weeknd")
     }
