@@ -1,0 +1,55 @@
+<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
+--><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>SakuraCord</title>
+        <item>
+            <title>0.1.7</title>
+            <pubDate>Sun, 22 Nov 2026 11:22:09 +0800</pubDate>
+            <link>https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/tag/v0.1.7</link>
+            <sparkle:fullReleaseNotesLink>https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/tag/v0.1.7</sparkle:fullReleaseNotesLink>
+            <sparkle:version>202611220311</sparkle:version>
+            <sparkle:shortVersionString>0.1.7</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.4</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description sparkle:format="markdown"><![CDATA[# SakuraCord v0.1.7
+
+# SakuraCord v0.1.7 for macOS 26 (unofficial port)
+
+The official SakuraCord v0.1.7, ported to build and run on macOS 26.5 (Xcode 26.6 / Swift 6.3).
+
+## Highlights from upstream v0.1.7
+
+- Discord Activities like Wordle from calls, text channels and DMs
+- Friends view with Online, All, Pending and Add Friend, plus Message Requests
+- Discord's Favorites server, synced both ways
+- In-place message editing with live Markdown previews
+- Voice messages with waveforms, seeking and playback speed
+- Scheduled and @silent messages, and an @time picker for Discord timestamps
+- Create Thread from any message, and a rebuilt forum browser
+- Apply to Join for servers that review new members
+- File cards with Quick Look previews, and inline video and audio
+- Role icons and gradient role colours
+- Profile bios with Markdown, custom emoji and live timestamps
+- `:name:` emoji shortcodes, and embeds at Discord’s own sizes
+- Default and Bubbles message styles, and a message font size setting
+- Better unread tracking, drafts that stay put, and parallel uploads
+- Removed Show hidden channels
+
+## Port additions
+
+- **Rich Presence** (PR #528 by DinanathDash): shows what you're playing in Spotify or Apple Music, and activity from apps that use Discord's RPC. macOS will ask once for permission to read Music and Spotify.
+- Fixed missing icons (GIF button, Discord and GitHub symbols, About logo and badges)
+- Fixed glitchy, rainbow-smeared side panels on macOS 26
+- Fixed the solid toolbar, which is now transparent like the rest of the window
+- Updates still use Sparkle 2.9.6
+
+**Upstream changelog:** https://github.com/SakuraCordApp/SakuraCord/compare/v0.1.6...v0.1.7
+]]></description>
+            <enclosure url="https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/download/v0.1.7/SakuraCord.v0.1.7.dmg" length="45417975" type="application/octet-stream" sparkle:edSignature="AZWBCxThhSUZy+aG+YZrS9+6DXe4eUgcrrl7/yTocKneIFltk7pEMat/NEmsXyX/FMgBtnWa9nb1ODiLdeKsAw=="></enclosure>
+        </item>
+    </channel>
+</rss><!-- sparkle-signatures:
+edSignature: W9p5BRztW4u0mmS1R1zeccdHCs0n4GgbrXcjTgq8qlVssskCUzTVzCwMZ61wK1GOe3OeNrSuMBfWo6Xq5aqgCg==
+length: 3150
+-->
