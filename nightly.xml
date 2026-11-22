@@ -4,34 +4,42 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>SakuraCord Nightly</title>
         <item>
-            <title>0.1.7 Beta 10.1</title>
-            <pubDate>Tue, 17 Nov 2026 20:43:17 +0800</pubDate>
-            <link>https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/tag/v0.1.7-Beta-10.1</link>
-            <sparkle:fullReleaseNotesLink>https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/tag/v0.1.7-Beta-10.1</sparkle:fullReleaseNotesLink>
-            <sparkle:version>202611171234</sparkle:version>
-            <sparkle:shortVersionString>0.1.7 Beta 10.1</sparkle:shortVersionString>
+            <title>0.1.7 Beta 11</title>
+            <pubDate>Sun, 22 Nov 2026 10:53:23 +0800</pubDate>
+            <link>https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/tag/v0.1.7-Beta-11</link>
+            <sparkle:fullReleaseNotesLink>https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/tag/v0.1.7-Beta-11</sparkle:fullReleaseNotesLink>
+            <sparkle:version>202611220239</sparkle:version>
+            <sparkle:shortVersionString>0.1.7 Beta 11</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.4</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description sparkle:format="markdown"><![CDATA[# SakuraCord v0.1.7-Beta-10.1
+            <description sparkle:format="markdown"><![CDATA[# SakuraCord v0.1.7-Beta-11
 
-## SakuraCord v0.1.7 Beta 10.1 (macOS 26 port)
+# SakuraCord v0.1.7 Beta 11 for macOS 26 (unofficial port)
 
-Unofficial macOS 26.5 build of SakuraCord nightly, put together by @UnxnownYT.
+Upstream Beta 11, ported to build and run on macOS 26.5 (Xcode 26.6 / Swift 6.3). Still includes PR #528 (Rich Presence by DinanathDash).
 
-### Fixed
-- The toolbar at the top of the window is now transparent like the rest of the app, instead of a solid grey bar. This had been there since the first macOS 26 build.
+## From upstream Beta 11
 
-Everything else is the same as Beta 10. (Previous Update)
+- Profile bios now show Discord Markdown, spoilers, code, custom emoji and live timestamps
+- `:name:` emoji shortcodes, with aliases, skin tones and jumbo emoji
+- Embeds use Discord's own sizes and spacing, and their titles show Markdown and custom emoji
+- Server profiles show when someone joined the server
+- Voice encryption keeps working when someone leaves a call and rejoins (libdave 1.3.0)
+- Role mentions stay highlighted after you send them, and tall images no longer show dark lines
+- Removed Show hidden channels, since Discord now sends channels you can't view as nameless placeholders
 
-### Notes
-- Ad-hoc signed. On first launch, right-click → Open (or allow it in System Settings → Privacy & Security).
-- Updates: Check for Updates… uses the nightly feed.
-- Will try to make the next nightly or newest update as fast as possible.
+## Port changes
+
+- Rich Presence (PR #528) updated to the PR's latest version
+- Updates still use Sparkle 2.9.6 (upstream switched to its own Sparkle build)
+- Swift 6.3 fixes for the new embed layout
+
+**Upstream changelog:** https://github.com/SakuraCordApp/SakuraCord/compare/v0.1.7-Beta-10...v0.1.7-Beta-11
 ]]></description>
-            <enclosure url="https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/download/v0.1.7-Beta-10.1/SakuraCord-v0.1.7-Beta-10.1.dmg" length="45751587" type="application/octet-stream" sparkle:edSignature="UWAN+dcG29x9I3KOzOtC+YIJMXWak7ZWgSm4CZIqA7QVMdBxu2YjKdNUNZOQPmiSXae3pGPzm8REQMJMGykuDQ=="></enclosure>
+            <enclosure url="https://github.com/UnxnownYT/SakuraCord-macOS-26/releases/download/v0.1.7-Beta-11/SakuraCord-v0.1.7-Beta-11.dmg" length="45316462" type="application/octet-stream" sparkle:edSignature="RlKk1liY7LUgpCtD3l+NMO4U9r+jfSt4UhnHY3RnVKt7ml8IPbjsRtjhIUYJCQYC+DKfonugaGIznP7otHd/AA=="></enclosure>
         </item>
     </channel>
 </rss><!-- sparkle-signatures:
-edSignature: V+2hCEU5o+hufWaHFXqV/XvVPCDI06vK4bzWsRWxrjE/fAUMkpRUTO49CBgfJOfpOvc5ViFHqSNJN1FwFuyECw==
-length: 2176
+edSignature: j2H3RPzaYGW0LbZAVAUo2VbFbU0QwI+fh3AtRUMln9QxdKyiYBy5dTjjDcY1IgFJARcaUpU9UOtksGhxHmqUCg==
+length: 2681
 -->
